@@ -4756,7 +4756,7 @@ async function fetchRailway(
   }
 
   const railwayUrl =
-    (env.RAILWAY_URL || "https://elotro-futbol-api-production-e57c.up.railway.app") +
+    (env.RAILWAY_URL || "https://elotro-futbol-api-production.up.railway.app") +
     path +
     new URL(request.url).search;
 
@@ -9680,14 +9680,41 @@ async function handlePrimary(request, env, ctx) {
           await iniciarCronometroPartido(env, id, minutosDesdeHoraProgramada(body.fecha_partido || estadoAnterior?.fecha_partido));
         } else if (body.estado === "en_juego" && estadoAnterior?.estado !== "en_juego") {
           // El partido ya tenía un cronómetro arrancado de una vida
-          // anterior (p. ej. estaba "colgado" o se anuló/finalizó y ahora
-          // se reabre a mano sin pasar por "Iniciar partido" de nuevo) y
-          // por eso no entra en la rama de arriba. No se toca el
-          // cronómetro en sí, pero si no se limpia aviso_desatendido_mitad
-          // aquí, el partido reabierto puede arrastrar mitades ya
-          // "gastadas" de antes y revisarPartidosDesatendidos() se queda
-          // callado aunque este nuevo tramo sí esté desatendido.
-          await env.DB.prepare("UPDATE results SET aviso_desatendido_mitad = NULL WHERE id = ?").bind(id).run();
+          // anterior (p. ej. estaba "colgado", o se anuló/finalizó y ahora
+          // se reabre a "en_juego" sin pasar por "Iniciar partido" de
+          // nuevo -- este es justo el caso de la Importación rápida
+          // cuando el texto pegado todavía trae "2ª parte"/"Descanso" en
+          // vez de "Fin" para un partido que el cron ya había cerrado
+          // solo: ver ESTADOS_COMPACTO_A_BACKEND en
+          // admin/js/importacion-rapida.js).
+          //
+          // ANTES aquí NO se tocaba el cronómetro en sí, solo se limpiaba
+          // aviso_desatendido_mitad -- pero inicio_cronometro_at se
+          // quedaba con el valor VIEJO de esa vida anterior. Si ese
+          // partido llevaba ya más de MINUTO_FIN_PARTIDO_AUTOMATICO (150)
+          // minutos corriendo desde entonces (típicamente porque fue el
+          // propio cron quien lo cerró automáticamente, ver
+          // crearFinPartidoAutomaticoAlMinuto90, que NUNCA toca
+          // inicio_cronometro_at/cronometro_pausado_en al cerrar), el
+          // resultado quedaba "en_juego" con un cronómetro que YA marcaba
+          // más de 150' desde el primer segundo: en la siguiente pasada
+          // del cron (como mucho 1 minuto después) crearFinPartido-
+          // AutomaticoAlMinuto90 lo volvía a cerrar solo, marcando de
+          // nuevo finalizado_no_cubierto = 1 -- deshaciendo justo lo que
+          // este PUT acababa de limpiar más abajo. Ese era el bug real
+          // detrás de "la Importación rápida deja el marcador bien pero
+          // el partido sigue saliendo como FINALIZADO NO CUBIERTO": no es
+          // que este PUT no limpiara el aviso, es que el cron lo volvía a
+          // poner él solo justo después, sin que se notara ninguna otra
+          // escritura entre medias.
+          //
+          // Se reinicia aquí el cronómetro desde AHORA (igual que en la
+          // rama de arriba, pero sin el cálculo de minutos desde la hora
+          // programada -- ese cálculo es para partidos que arrancan por
+          // primera vez, no para reaperturas), para que el partido quede
+          // con un cronómetro fresco y no vuelva a activar el cierre
+          // automático hasta pasados otros 150 minutos de verdad.
+          await iniciarCronometroPartido(env, id, 0);
         }
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "editar_resultado", entidad: "resultado", entidad_id: id,

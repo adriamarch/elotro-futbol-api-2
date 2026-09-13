@@ -55,7 +55,7 @@ const env = {
   // necesita para construir enlaces absolutos.
   RAILWAY_URL:
     process.env.RAILWAY_URL ||
-    "https://elotro-futbol-api-production-e57c.up.railway.app",
+    "https://elotro-futbol-api-production.up.railway.app",
   // Solo para el endpoint temporal /api/debug/migrar-jornadas-calendario
   // (ver src/index.js): permite ejecutar SQL multi-statement directo.
   // BORRAR esta línea junto con ese endpoint una vez usado.

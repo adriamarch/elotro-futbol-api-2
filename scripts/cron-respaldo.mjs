@@ -12,7 +12,7 @@
 // Railway → tu proyecto → este servicio → Variables):
 //   CRON_RESPALDO_URL       URL pública del servicio server-railway.js +
 //                           "/api/internal/cron-respaldo"
-//                           (ej: https://elotro-futbol-api-production-e57c.up.railway.app/api/internal/cron-respaldo)
+//                           (ej: https://elotro-futbol-api-production.up.railway.app/api/internal/cron-respaldo)
 //   INTERNAL_CRON_SECRET    el MISMO valor puesto en el servicio
 //                           server-railway.js (ver server-railway.js, env.INTERNAL_CRON_SECRET)
 
