@@ -1,5 +1,5 @@
 // ElOtroFútbol - Worker API
-// Rutas: /api/login, /api/me, /api/me/sesiones, /api/articles, /api/results, /api/media, /api/custom-clubs, /api/articles/:id/comments, /api/comments/:id/vote, /api/comments/:id/report, /api/admin/comments, /api/admin/comments/reported, /api/club-info, /api/admin/club-info, /api/track/view, /api/track/reading, /api/track/result-view, /api/admin/analiticas/* (resumen, mas-leidas, fuentes, autores, tiempo-lectura, idiomas, partidos-seguidos, gsc), /sitemap-noticias.xml, /sitemap-news.xml, /rss.xml
+// Rutas: /api/login, /api/me, /api/me/sesiones, /api/articles, /api/results, /api/porras, /api/porras/resumen, /api/porras/ranking, /api/media, /api/custom-clubs, /api/articles/:id/comments, /api/comments/:id/vote, /api/comments/:id/report, /api/admin/comments, /api/admin/comments/reported, /api/club-info, /api/admin/club-info, /api/track/view, /api/track/reading, /api/track/result-view, /api/admin/analiticas/* (resumen, mas-leidas, fuentes, autores, tiempo-lectura, idiomas, partidos-seguidos, gsc), /sitemap-noticias.xml, /sitemap-news.xml, /rss.xml
 
 // Escapa los caracteres especiales de XML para que un título o slug con
 // "&", "<", ">", comillas, etc. no rompa el XML del sitemap.
@@ -9500,6 +9500,167 @@ async function handlePrimary(request, env, ctx) {
         return json({ results });
       }
 
+      // ---------- Detección de partidos duplicados ----------
+      // Antes solo se avisaba cuando el partido nuevo era EXACTAMENTE
+      // igual a uno existente: misma competición, misma fecha Y HORA al
+      // minuto, y mismo marcador. Bastaba un minuto de diferencia en la
+      // hora, un acento distinto en el nombre del equipo o un marcador
+      // todavía sin rellenar para que el duplicado pasara sin aviso, que
+      // es justo como se cuelan en la práctica (misma jornada tecleada
+      // dos veces, o importada y luego metida a mano).
+      //
+      // Ahora se comparan los equipos NORMALIZADOS y se contemplan
+      // cuatro casos, en orden de gravedad. El primero bloquea; los
+      // otros tres solo avisan y se pueden confirmar con
+      // "confirmar_duplicado: true", igual que antes.
+      function normalizarEquipoDuplicado(nombre) {
+        let n = String(nombre || "")
+          .normalize("NFD").replace(/[\u0300-\u036f]/g, "")  // quita acentos
+          .toLowerCase()
+          .replace(/[.\-_'"`]/g, " ")                          // puntuación como separador
+          .replace(/\s+/g, " ")
+          .trim();
+        // Prefijos/sufijos societarios que unos redactores escriben y
+        // otros no ("CD Lugo" vs "Lugo", "Real Zaragoza SAD"). OJO: no
+        // se toca la "B" ni la "C" final, que SÍ distinguen equipos
+        // reales (Castellón y Castellón B son dos equipos distintos).
+        const societarios = ["cf", "cd", "ud", "sd", "ad", "ue", "ce", "rc", "rcd", "fc", "sad", "club", "cp", "ca"];
+        let partes = n.split(" ");
+        // Iniciales sueltas al principio ("R.C. Deportivo" -> "r c
+        // deportivo") : se quitan igual que los prefijos societarios.
+        // Solo al PRINCIPIO: una letra suelta al final sí significa algo
+        // ("Real Madrid C" es el filial, no el primer equipo).
+        while (partes.length > 1 && (societarios.includes(partes[0]) || partes[0].length === 1)) partes.shift();
+        while (partes.length > 1 && societarios.includes(partes[partes.length - 1])) partes.pop();
+        return partes.join(" ");
+      }
+
+      // Día (sin hora) de una fecha "YYYY-MM-DDTHH:MM" o "YYYY-MM-DD".
+      function diaDeFecha(fecha) {
+        return fecha ? String(fecha).slice(0, 10) : null;
+      }
+      function sumarDias(dia, n) {
+        const d = new Date(`${dia}T12:00:00Z`);
+        d.setUTCDate(d.getUTCDate() + n);
+        return d.toISOString().slice(0, 10);
+      }
+
+      // Devuelve null si no hay conflicto, o { bloqueante, motivo,
+      // mensaje, partido } con el partido ya existente que choca.
+      // "excluirId" evita que un partido se detecte a sí mismo al editar.
+      async function detectarPartidoDuplicado(env, datos, excluirId = null) {
+        const localNorm = normalizarEquipoDuplicado(datos.equipo_local);
+        const visitanteNorm = normalizarEquipoDuplicado(datos.equipo_visitante);
+        if (!localNorm || !visitanteNorm || !datos.competicion) return null;
+        const dia = diaDeFecha(datos.fecha_partido);
+        const jornada = (datos.jornada === undefined || datos.jornada === null || datos.jornada === "")
+          ? null : parseInt(datos.jornada, 10);
+
+        // Candidatos: mismos equipos posibles dentro de la misma
+        // competición, acotado a la misma jornada o a una ventana de
+        // +-3 días alrededor de la fecha. Es un filtro amplio a
+        // propósito: el criterio fino se aplica luego en JS, donde sí se
+        // pueden comparar nombres normalizados.
+        const condiciones = [];
+        const binds = [datos.competicion];
+        if (jornada !== null && Number.isInteger(jornada)) { condiciones.push("jornada = ?"); binds.push(jornada); }
+        if (dia) {
+          condiciones.push("substr(fecha_partido, 1, 10) BETWEEN ? AND ?");
+          binds.push(sumarDias(dia, -3), sumarDias(dia, 3));
+        }
+        if (!condiciones.length) return null;
+        let query = `SELECT id, competicion, grupo, jornada, equipo_local, equipo_visitante,
+                            goles_local, goles_visitante, fecha_partido, estado
+                     FROM results
+                     WHERE competicion = ? AND (${condiciones.join(" OR ")})`;
+        if (excluirId) { query += " AND id != ?"; binds.push(excluirId); }
+        query += " LIMIT 400";
+        const { results: candidatos } = await env.DB.prepare(query).bind(...binds).all();
+        if (!candidatos || !candidatos.length) return null;
+
+        const mismosEquipos = (c) => {
+          const cl = normalizarEquipoDuplicado(c.equipo_local);
+          const cv = normalizarEquipoDuplicado(c.equipo_visitante);
+          // En cualquier orden: si alguien metió local y visitante al
+          // revés sigue siendo el mismo partido duplicado.
+          return (cl === localNorm && cv === visitanteNorm) || (cl === visitanteNorm && cv === localNorm);
+        };
+        const descripcion = (c) =>
+          `${c.equipo_local} vs ${c.equipo_visitante} (J${c.jornada ?? "-"}${c.fecha_partido ? `, ${c.fecha_partido.replace("T", " ")}` : ""})`;
+
+        // 1) BLOQUEANTE: el mismo enfrentamiento ya existe en la MISMA
+        // jornada de la misma competición y grupo. En liga eso no puede
+        // pasar nunca: dos equipos se enfrentan una sola vez por
+        // jornada. No se deja confirmar, porque no hay ningún caso real
+        // en el que crearlo sea correcto (si la fecha u hora cambió, lo
+        // que toca es editar el partido existente, no crear otro).
+        // Los amistosos quedan fuera: no tienen jornada de verdad.
+        if (datos.competicion !== "amistoso" && jornada !== null && Number.isInteger(jornada)) {
+          const mismoGrupo = (c) => !datos.grupo || !c.grupo || c.grupo === datos.grupo;
+          const choque = candidatos.find((c) => c.jornada === jornada && mismosEquipos(c) && mismoGrupo(c));
+          if (choque) {
+            return {
+              bloqueante: true,
+              motivo: "duplicado_jornada",
+              mensaje: `Este partido ya existe en la jornada ${jornada}: ${descripcion(choque)}. Edita el partido existente (#${choque.id}) en vez de crear otro.`,
+              partido: choque,
+            };
+          }
+        }
+
+        // 2) AVISO: mismos equipos el MISMO DÍA, aunque cambie la hora,
+        // la jornada o el marcador. Es el caso típico de "lo metí a mano
+        // y además lo importé".
+        if (dia) {
+          const mismoDia = candidatos.find((c) => diaDeFecha(c.fecha_partido) === dia && mismosEquipos(c));
+          if (mismoDia) {
+            return {
+              bloqueante: false,
+              motivo: "mismo_dia",
+              mensaje: `Ya hay un partido de estos mismos equipos ese día: ${descripcion(mismoDia)}.`,
+              partido: mismoDia,
+            };
+          }
+        }
+
+        // 3) AVISO: uno de los dos equipos ya tiene OTRO partido a la
+        // misma fecha y hora exactas. Un equipo no puede jugar dos
+        // partidos a la vez, así que casi siempre significa que uno de
+        // los dos está mal tecleado.
+        if (datos.fecha_partido) {
+          const solapado = candidatos.find((c) => {
+            if (c.fecha_partido !== datos.fecha_partido) return false;
+            const cl = normalizarEquipoDuplicado(c.equipo_local);
+            const cv = normalizarEquipoDuplicado(c.equipo_visitante);
+            return [cl, cv].includes(localNorm) || [cl, cv].includes(visitanteNorm);
+          });
+          if (solapado) {
+            return {
+              bloqueante: false,
+              motivo: "equipo_ocupado",
+              mensaje: `A esa misma hora ya hay otro partido con uno de estos equipos: ${descripcion(solapado)}. Un equipo no puede jugar dos partidos a la vez.`,
+              partido: solapado,
+            };
+          }
+        }
+
+        // 4) AVISO: mismos equipos en la misma competición dentro de
+        // +-3 días. Puede ser legítimo (partido aplazado recolocado),
+        // por eso solo avisa.
+        if (dia) {
+          const cercano = candidatos.find((c) => mismosEquipos(c) && c.fecha_partido);
+          if (cercano) {
+            return {
+              bloqueante: false,
+              motivo: "fechas_cercanas",
+              mensaje: `Hay un partido muy parecido a menos de 3 días: ${descripcion(cercano)}. ¿Es un aplazamiento del mismo partido?`,
+              partido: cercano,
+            };
+          }
+        }
+        return null;
+      }
+
       if (path === "/api/results" && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
@@ -9530,36 +9691,21 @@ async function handlePrimary(request, env, ctx) {
             (body.goles_local === undefined || body.goles_local === null || body.goles_visitante === undefined || body.goles_visitante === null)) {
           return json({ error: "Falta el marcador (goles de ambos equipos)" }, 400);
         }
-        // Aviso de posible duplicado: mismo partido (mismos equipos, en
-        // cualquier orden -por si se han metido al revés local/visitante-,
-        // misma competición, misma fecha/hora Y MISMO MARCADOR) ya
-        // existente. Solo se avisa cuando es EXACTAMENTE igual -si el
-        // marcador es distinto no tiene sentido el aviso, ya que
-        // claramente no es el mismo resultado tecleado dos veces-. No se
-        // bloquea la creación -puede ser un caso real, como un derbi que
-        // efectivamente se repite en amistoso el mismo día con el mismo
-        // resultado-, solo se avisa una vez: si el frontend reenvía la
-        // petición con "confirmar_duplicado: true" (tras que el redactor
-        // confirme), se crea igualmente sin volver a comprobar.
-        if (!body.confirmar_duplicado && body.equipo_local && body.equipo_visitante && body.fecha_partido) {
-          const golesLocalBody = body.goles_local ?? null;
-          const golesVisitanteBody = body.goles_visitante ?? null;
-          const posibleDuplicado = await env.DB.prepare(
-            `SELECT id, competicion, grupo, jornada, equipo_local, equipo_visitante, goles_local, goles_visitante, fecha_partido, estado
-             FROM results
-             WHERE competicion = ? AND fecha_partido = ?
-               AND goles_local IS ? AND goles_visitante IS ?
-               AND ((equipo_local = ? AND equipo_visitante = ?) OR (equipo_local = ? AND equipo_visitante = ?))
-             LIMIT 1`
-          ).bind(
-            body.competicion, body.fecha_partido,
-            golesLocalBody, golesVisitanteBody,
-            body.equipo_local, body.equipo_visitante,
-            body.equipo_visitante, body.equipo_local
-          ).first();
-          if (posibleDuplicado) {
-            return json({ posible_duplicado: true, partido_existente: posibleDuplicado }, 409);
-          }
+        // Comprobación de duplicados (ver detectarPartidoDuplicado).
+        // El caso bloqueante (mismo enfrentamiento en la misma jornada)
+        // NO se puede saltar con "confirmar_duplicado": ese flag solo
+        // vale para los avisos, que sí pueden corresponder a un caso
+        // real (un aplazamiento recolocado, por ejemplo).
+        const duplicado = await detectarPartidoDuplicado(env, body);
+        if (duplicado && (duplicado.bloqueante || !body.confirmar_duplicado)) {
+          return json({
+            error: duplicado.mensaje,
+            posible_duplicado: !duplicado.bloqueante,
+            duplicado_bloqueante: duplicado.bloqueante,
+            motivo: duplicado.motivo,
+            mensaje: duplicado.mensaje,
+            partido_existente: duplicado.partido,
+          }, 409);
         }
         const flashscoreUrl = flashscoreUrlValido(body.competicion, body.estado, body.flashscore_url);
         // El grupo de Segunda Federación se rellena automáticamente (ver
@@ -9644,6 +9790,22 @@ async function handlePrimary(request, env, ctx) {
           return json({ error: "Estado no válido" }, 400);
         }
         const estadoAnterior = await env.DB.prepare("SELECT estado, inicio_cronometro_at, fecha_partido FROM results WHERE id = ?").bind(id).first();
+        // La edición también pasa por el detector de duplicados: hasta
+        // ahora solo se comprobaba al crear, así que se podía convertir
+        // un partido en copia exacta de otro simplemente cambiándole la
+        // jornada o los equipos al editarlo. Se excluye el propio id
+        // para que no se detecte a sí mismo.
+        const duplicadoEdicion = await detectarPartidoDuplicado(env, body, id);
+        if (duplicadoEdicion && (duplicadoEdicion.bloqueante || !body.confirmar_duplicado)) {
+          return json({
+            error: duplicadoEdicion.mensaje,
+            posible_duplicado: !duplicadoEdicion.bloqueante,
+            duplicado_bloqueante: duplicadoEdicion.bloqueante,
+            motivo: duplicadoEdicion.motivo,
+            mensaje: duplicadoEdicion.mensaje,
+            partido_existente: duplicadoEdicion.partido,
+          }, 409);
+        }
         const flashscoreUrl = flashscoreUrlValido(body.competicion, body.estado, body.flashscore_url);
         // Si viene "retrasado" y se manda una nueva hora, se conserva la
         // fecha_partido original y se guarda la nueva en un campo aparte
@@ -10008,6 +10170,349 @@ async function handlePrimary(request, env, ctx) {
         // que recalcular a mano el instante de inicio del cronómetro.
         const actualizado = await env.DB.prepare("SELECT * FROM results WHERE id = ?").bind(resultadoId).first();
         return json({ ok: true, resultado: actualizado });
+      }
+
+      // ---------- PORRAS (predicciones de lectores) ----------
+      // Baremo de puntos. Constantes (no en BD) para poder ajustar el
+      // criterio sin migración; ver migracion_porras.sql para más
+      // contexto de por qué el resultado ya calculado SÍ se congela por
+      // fila aunque el baremo cambie más adelante.
+      const PUNTOS_ACIERTO_EXACTO = 3;
+      const PUNTOS_ACIERTO_SIGNO = 1;
+
+      // Sentido de un marcador: 'local' | 'empate' | 'visitante'.
+      function signoResultado(golesLocal, golesVisitante) {
+        if (golesLocal > golesVisitante) return "local";
+        if (golesLocal < golesVisitante) return "visitante";
+        return "empate";
+      }
+
+      // Resuelve (calcula puntos + tipo de acierto) todas las porras
+      // "pendiente" cuyo partido ya está "finalizado", entre las que se
+      // acaban de pedir. Se llama desde dentro de GET /api/porras, no
+      // desde un cron aparte: así no hace falta engancharse a los 3
+      // sitios del código donde un partido puede terminar en
+      // "finalizado" (panel normal, Minuto a Minuto, cierre automático
+      // al minuto 90) para no olvidar ninguno. El primer GET que pase
+      // por una porra ya jugada la deja resuelta para siempre; los
+      // siguientes GET la encuentran ya con puntos y no hacen nada.
+      async function resolverPorrasPendientes(env, porrasConPartido) {
+        const pendientesDeResolver = porrasConPartido.filter(
+          (p) => p.resultado_acierto === "pendiente" && p.estado === "finalizado" &&
+                 p.goles_local !== null && p.goles_local !== undefined &&
+                 p.goles_visitante !== null && p.goles_visitante !== undefined
+        );
+        if (!pendientesDeResolver.length) return;
+        for (const p of pendientesDeResolver) {
+          const signoReal = signoResultado(p.goles_local, p.goles_visitante);
+          const signoPredicho = signoResultado(p.goles_local_predicho, p.goles_visitante_predicho);
+          let puntos = 0;
+          let tipo = "fallo";
+          if (p.goles_local_predicho === p.goles_local && p.goles_visitante_predicho === p.goles_visitante) {
+            puntos = PUNTOS_ACIERTO_EXACTO;
+            tipo = "exacto";
+          } else if (signoPredicho === signoReal) {
+            puntos = PUNTOS_ACIERTO_SIGNO;
+            tipo = "acierto";
+          }
+          await env.DB.prepare(
+            `UPDATE porras SET puntos_obtenidos = ?, resultado_acierto = ?, updated_at = datetime('now') WHERE id = ?`
+          ).bind(puntos, tipo, p.id).run();
+          // Se refleja también en el objeto en memoria para que la
+          // respuesta de ESTE mismo GET ya salga resuelta, sin obligar
+          // a quien llama a repetir la petición para ver sus puntos.
+          p.puntos_obtenidos = puntos;
+          p.resultado_acierto = tipo;
+        }
+      }
+
+      // Resuelve las porras pendientes de TODOS los lectores para una
+      // jornada concreta, no solo las del lector que consulta. Hace
+      // falta para el ranking: antes, una porra solo se resolvía cuando
+      // su propio autor abría /api/porras, así que quien no volvía a
+      // entrar después del partido se quedaba en 'pendiente' para
+      // siempre y DESAPARECÍA del ranking (o aparecía con menos puntos
+      // de los suyos). El ranking llama a esto antes de agregar, de
+      // modo que la tabla siempre sale completa y con todo el mundo.
+      async function resolverPorrasDeJornada(env, { competicion, grupo, jornada }) {
+        let query = `
+          SELECT po.id, po.goles_local_predicho, po.goles_visitante_predicho,
+                 po.resultado_acierto, r.estado, r.goles_local, r.goles_visitante
+          FROM porras po
+          JOIN results r ON r.id = po.resultado_id
+          WHERE po.resultado_acierto = 'pendiente' AND r.estado = 'finalizado'
+            AND r.jornada = ?`;
+        const binds = [jornada];
+        if (competicion) { query += " AND r.competicion = ?"; binds.push(competicion); }
+        if (grupo) { query += " AND r.grupo = ?"; binds.push(grupo); }
+        const { results: pendientes } = await env.DB.prepare(query).bind(...binds).all();
+        if (pendientes && pendientes.length) {
+          await resolverPorrasPendientes(env, pendientes);
+        }
+      }
+
+      // GET /api/porras?competicion=&grupo=&jornada= — porras del lector
+      // autenticado para los partidos de esa categoría/grupo/jornada.
+      // "grupo" es opcional (competiciones sin grupos, como Hypermotion).
+      if (path === "/api/porras" && method === "GET") {
+        const payload = await requireReaderAuth(request, env);
+        if (!payload) return json({ error: "Inicia sesión para ver tu porra" }, 401);
+        const competicion = url.searchParams.get("competicion");
+        const grupo = url.searchParams.get("grupo");
+        const jornada = url.searchParams.get("jornada");
+        if (!competicion || !jornada) {
+          return json({ error: "Faltan competicion y jornada" }, 400);
+        }
+        let query = `
+          SELECT po.id, po.resultado_id, po.goles_local_predicho, po.goles_visitante_predicho,
+                 po.puntos_obtenidos, po.resultado_acierto, po.updated_at,
+                 r.estado, r.goles_local, r.goles_visitante
+          FROM porras po
+          JOIN results r ON r.id = po.resultado_id
+          WHERE po.reader_id = ? AND r.competicion = ? AND r.jornada = ?`;
+        const binds = [payload.rid, competicion, jornada];
+        if (grupo) { query += " AND r.grupo = ?"; binds.push(grupo); }
+        const { results: porrasConPartido } = await env.DB.prepare(query).bind(...binds).all();
+        await resolverPorrasPendientes(env, porrasConPartido);
+        // Se devuelve ya sin los campos de "results" que solo hacían
+        // falta para resolver (el frontend ya tiene esos datos por su
+        // lado, vía /api/results): así la forma de la respuesta es
+        // estable y no depende de detalles internos de resolución.
+        const porras = porrasConPartido.map((p) => ({
+          id: p.id,
+          resultado_id: p.resultado_id,
+          goles_local_predicho: p.goles_local_predicho,
+          goles_visitante_predicho: p.goles_visitante_predicho,
+          puntos_obtenidos: p.puntos_obtenidos,
+          resultado_acierto: p.resultado_acierto,
+          updated_at: p.updated_at,
+        }));
+        return json({ porras });
+      }
+
+      // POST /api/porras — crea o actualiza (upsert) la predicción del
+      // lector autenticado para UN partido. Body: { resultado_id,
+      // goles_local_predicho, goles_visitante_predicho }.
+      if (path === "/api/porras" && method === "POST") {
+        const payload = await requireReaderAuth(request, env);
+        if (!payload) return json({ error: "Inicia sesión para guardar tu porra" }, 401);
+        const body = await request.json();
+        const resultadoId = parseInt(body.resultado_id, 10);
+        const golesLocal = parseInt(body.goles_local_predicho, 10);
+        const golesVisitante = parseInt(body.goles_visitante_predicho, 10);
+        if (!Number.isInteger(resultadoId)) {
+          return json({ error: "Falta el partido" }, 400);
+        }
+        if (!Number.isInteger(golesLocal) || !Number.isInteger(golesVisitante) || golesLocal < 0 || golesVisitante < 0) {
+          return json({ error: "El resultado predicho debe ser un marcador válido (0 o más goles por equipo)" }, 400);
+        }
+        // Tope razonable: evita marcadores absurdos metidos a mano contra
+        // la API directamente (10 goles ya es un resultado extremo real
+        // en fútbol amateur; 999 no aporta nada y solo ensucia datos).
+        if (golesLocal > 20 || golesVisitante > 20) {
+          return json({ error: "El resultado predicho no es válido" }, 400);
+        }
+        const partido = await env.DB.prepare(
+          "SELECT id, estado, fecha_partido FROM results WHERE id = ?"
+        ).bind(resultadoId).first();
+        if (!partido) return json({ error: "El partido no existe" }, 404);
+        // Bloqueo server-side: solo se puede predecir (o corregir la
+        // predicción) mientras el partido sigue "programado". En cuanto
+        // pasa a en_juego/finalizado/retrasado/anulado, ya no se acepta
+        // ni la primera porra ni una edición de la existente. Se repite
+        // aquí aunque el frontend ya oculte el input, porque el frontend
+        // nunca es la última línea de defensa.
+        if (partido.estado !== "programado") {
+          return json({ error: "Este partido ya no admite predicciones" }, 409);
+        }
+        const existente = await env.DB.prepare(
+          "SELECT id FROM porras WHERE reader_id = ? AND resultado_id = ?"
+        ).bind(payload.rid, resultadoId).first();
+        if (existente) {
+          await env.DB.prepare(
+            `UPDATE porras SET goles_local_predicho = ?, goles_visitante_predicho = ?, updated_at = datetime('now')
+             WHERE id = ?`
+          ).bind(golesLocal, golesVisitante, existente.id).run();
+          return json({ ok: true, id: existente.id });
+        }
+        const insertado = await env.DB.prepare(
+          `INSERT INTO porras (reader_id, resultado_id, goles_local_predicho, goles_visitante_predicho)
+           VALUES (?, ?, ?, ?)`
+        ).bind(payload.rid, resultadoId, golesLocal, golesVisitante).run();
+        return json({ ok: true, id: insertado.meta.last_row_id });
+      }
+
+      // GET /api/porras/resumen?competicion= — puntuación TOTAL del lector
+      // autenticado en toda la temporada en curso (no solo la jornada
+      // abierta), para pintar un marcador estable de "cómo llevas la
+      // temporada" en la cabecera de la página. "competicion" es
+      // opcional: sin ella, se suma across TODAS las competiciones en
+      // las que el lector haya jugado (para el resumen general).
+      if (path === "/api/porras/resumen" && method === "GET") {
+        const payload = await requireReaderAuth(request, env);
+        if (!payload) return json({ error: "Inicia sesión para ver tu resumen" }, 401);
+        const competicion = url.searchParams.get("competicion");
+        // "Temporada en curso": mismo criterio de fecha que ya usa el
+        // frontend para clasificación/porras (desde el 1 de julio del
+        // año en que empezó la temporada actual), calculado aquí en el
+        // servidor porque el resumen puede pedirse independientemente
+        // de qué jornada tenga abierta el frontend en ese momento.
+        const ahora = new Date();
+        const mes = ahora.getUTCMonth();
+        const anioInicio = mes >= 6 ? ahora.getUTCFullYear() : ahora.getUTCFullYear() - 1;
+        const desdeFecha = `${anioInicio}-07-01`;
+        let query = `
+          SELECT
+            COUNT(*) AS total_porras,
+            COALESCE(SUM(po.puntos_obtenidos), 0) AS puntos_totales,
+            SUM(CASE WHEN po.resultado_acierto = 'exacto' THEN 1 ELSE 0 END) AS exactos,
+            SUM(CASE WHEN po.resultado_acierto = 'acierto' THEN 1 ELSE 0 END) AS aciertos,
+            SUM(CASE WHEN po.resultado_acierto = 'fallo' THEN 1 ELSE 0 END) AS fallos
+          FROM porras po
+          JOIN results r ON r.id = po.resultado_id
+          WHERE po.reader_id = ? AND po.resultado_acierto != 'pendiente'
+            AND (r.fecha_partido >= ? OR r.fecha_partido IS NULL)`;
+        const binds = [payload.rid, desdeFecha];
+        if (competicion) { query += " AND r.competicion = ?"; binds.push(competicion); }
+        const resumen = await env.DB.prepare(query).bind(...binds).first();
+        return json({
+          puntos_totales: resumen.puntos_totales || 0,
+          porras_resueltas: resumen.total_porras || 0,
+          exactos: resumen.exactos || 0,
+          aciertos: resumen.aciertos || 0,
+          fallos: resumen.fallos || 0,
+        });
+      }
+
+      // GET /api/porras/ranking?competicion=&jornada=&limit= — top
+      // lectores de UNA JORNADA CONCRETA YA TERMINADA (no acumulado de
+      // toda la temporada: cada jornada tiene su propio ranking, para
+      // que "quién acertó más esta jornada" sea una pregunta con
+      // sentido incluso para alguien que se acaba de registrar).
+      // "jornada" es obligatorio -- sin él no hay ranking que calcular.
+      // Público (no requiere sesión: es información agregada, sin datos
+      // personales más allá del nombre que el propio lector eligió al
+      // registrarse), pensado para el gancho social de "quiero ver que
+      // gano yo". Se identifica también la posición del lector actual
+      // si hay sesión, aunque no esté entre los primeros puestos.
+      if (path === "/api/porras/ranking" && method === "GET") {
+        const competicion = url.searchParams.get("competicion");
+        // "grupo" es parte de la identidad de una jornada en Primera y
+        // Segunda Federación: la jornada 5 del Grupo 1 y la del Grupo 2
+        // son partidos distintos. Sin filtrar por grupo, el ranking
+        // mezclaba a gente que había jugado partidos diferentes (unos
+        // con 10 partidos posibles y otros con 9), que era el motivo
+        // principal de que la clasificación "no cuadrase".
+        const grupo = url.searchParams.get("grupo");
+        const jornadaParam = parseInt(url.searchParams.get("jornada"), 10);
+        if (!Number.isInteger(jornadaParam)) {
+          return json({ error: "Falta la jornada" }, 400);
+        }
+        const limitParam = parseInt(url.searchParams.get("limit"), 10);
+        // Sin "limit" se devuelven TODOS los participantes de la jornada
+        // (tope de seguridad en 500): el ranking de una porra tiene
+        // sentido completo, no recortado al top 20.
+        const limit = Number.isInteger(limitParam) && limitParam > 0 && limitParam <= 500 ? limitParam : 500;
+
+        // Estado de la jornada. "Terminada" = todos sus partidos
+        // finalizados o anulados. Si NO lo está, ya no se devuelve una
+        // tabla vacía: se devuelve igualmente la lista de quienes YA han
+        // participado, con sus puntos provisionales (0 mientras no haya
+        // partidos resueltos). El frontend marca la tabla como
+        // provisional. Nunca se exponen los marcadores predichos de
+        // nadie, solo nombres y contadores, así que ver quién ha jugado
+        // antes de tiempo no da ninguna ventaja.
+        let queryPartidosJornada = "SELECT estado FROM results WHERE jornada = ?";
+        const bindsPartidosJornada = [jornadaParam];
+        if (competicion) { queryPartidosJornada += " AND competicion = ?"; bindsPartidosJornada.push(competicion); }
+        if (grupo) { queryPartidosJornada += " AND grupo = ?"; bindsPartidosJornada.push(grupo); }
+        const { results: partidosDeJornada } = await env.DB.prepare(queryPartidosJornada).bind(...bindsPartidosJornada).all();
+        const jornadaTerminada = partidosDeJornada.length > 0
+          && partidosDeJornada.every((p) => p.estado === "finalizado" || p.estado === "anulado");
+        // Partidos de la jornada que ya cuentan puntos, para que el
+        // frontend pueda decir "van 3 de 10 partidos resueltos".
+        const partidosResueltos = partidosDeJornada.filter((p) => p.estado === "finalizado" || p.estado === "anulado").length;
+
+        // Antes de agregar: resolver las porras de esa jornada que
+        // siguiesen "pendiente" por no haberlas abierto su autor. Sin
+        // esto faltaban participantes enteros en la tabla. Con la
+        // jornada a medias resuelve solo las de partidos ya terminados
+        // (la propia función filtra por estado = 'finalizado'), que es
+        // justo lo que hace falta para el marcador provisional.
+        await resolverPorrasDeJornada(env, { competicion, grupo, jornada: jornadaParam });
+
+        // Ojo al WHERE: NO se filtra por resultado_acierto. Se cuenta a
+        // todo el que hizo porra en la jornada, aunque acabase con 0
+        // puntos o con algún partido anulado sin resolver; los que
+        // fallaron también son participantes y tienen que salir.
+        let queryBase = `
+          FROM porras po
+          JOIN results r ON r.id = po.resultado_id
+          JOIN readers rd ON rd.id = po.reader_id
+          WHERE rd.activo = 1 AND r.jornada = ?`;
+        const bindsBase = [jornadaParam];
+        if (competicion) { queryBase += " AND r.competicion = ?"; bindsBase.push(competicion); }
+        if (grupo) { queryBase += " AND r.grupo = ?"; bindsBase.push(grupo); }
+
+        // Se calcula la tabla COMPLETA (sin LIMIT) y se recorta después
+        // en memoria. Así la posición propia y la tabla visible salen
+        // siempre del mismo orden: antes se usaban dos consultas con
+        // ORDER BY distintos y podían contradecirse en los empates.
+        const { results: tablaCompleta } = await env.DB.prepare(`
+          SELECT rd.id AS reader_id, rd.nombre,
+                 COALESCE(SUM(po.puntos_obtenidos), 0) AS puntos_totales,
+                 SUM(CASE WHEN po.resultado_acierto = 'exacto' THEN 1 ELSE 0 END) AS exactos,
+                 SUM(CASE WHEN po.resultado_acierto = 'acierto' THEN 1 ELSE 0 END) AS aciertos,
+                 SUM(CASE WHEN po.resultado_acierto = 'fallo' THEN 1 ELSE 0 END) AS fallos,
+                 SUM(CASE WHEN po.resultado_acierto != 'pendiente' THEN 1 ELSE 0 END) AS porras_resueltas,
+                 SUM(CASE WHEN po.resultado_acierto = 'pendiente' THEN 1 ELSE 0 END) AS porras_pendientes,
+                 COUNT(*) AS porras_jugadas
+          ${queryBase}
+          GROUP BY rd.id, rd.nombre
+          ORDER BY puntos_totales DESC, exactos DESC, aciertos DESC, fallos ASC, porras_jugadas DESC, rd.nombre ASC
+        `).bind(...bindsBase).all();
+
+        // Posición con empates compartidos: dos personas con los mismos
+        // puntos, exactos, aciertos y fallos comparten puesto (1, 1, 3...)
+        // en vez de repartirse un 1 y un 2 arbitrarios por orden alfabético.
+        const claveEmpate = (f) => `${f.puntos_totales}|${f.exactos}|${f.aciertos}|${f.fallos}`;
+        let posicionActual = 0;
+        let claveAnterior = null;
+        const conPosicion = tablaCompleta.map((f, i) => {
+          const clave = claveEmpate(f);
+          if (clave !== claveAnterior) { posicionActual = i + 1; claveAnterior = clave; }
+          return { ...f, posicion: posicionActual };
+        });
+
+        const tabla = conPosicion.slice(0, limit);
+
+        // Posición y estadísticas del lector autenticado (si lo hay),
+        // aunque quede fuera del recorte de arriba.
+        let miPosicion = null;
+        const payload = await requireReaderAuth(request, env);
+        if (payload) {
+          const mia = conPosicion.find((f) => f.reader_id === payload.rid);
+          if (mia) {
+            miPosicion = {
+              posicion: mia.posicion,
+              puntos_totales: mia.puntos_totales,
+              exactos: mia.exactos,
+              aciertos: mia.aciertos,
+              fallos: mia.fallos,
+              porras_jugadas: mia.porras_jugadas,
+              porras_pendientes: mia.porras_pendientes,
+            };
+          }
+        }
+
+        return json({
+          ranking: tabla,
+          mi_posicion: miPosicion,
+          jornada_terminada: jornadaTerminada,
+          total_participantes: conPosicion.length,
+          partidos_totales: partidosDeJornada.length,
+          partidos_resueltos: partidosResueltos,
+        });
       }
 
       // ---------- MATCH EVENTS (goles, tarjetas) ----------
