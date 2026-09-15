@@ -9732,7 +9732,25 @@ async function handlePrimary(request, env, ctx) {
         if (!(await puedeEditar(env, payload, "resultado", id, resultadoBorrado.autor_id))) {
           return json({ error: "No puedes eliminar este resultado porque no es tuyo. Solicita permiso al autor o a un administrador." }, 403);
         }
-        await env.DB.prepare("DELETE FROM results WHERE id = ?").bind(id).run();
+        try {
+          await env.DB.prepare("DELETE FROM results WHERE id = ?").bind(id).run();
+        } catch (err) {
+          // Mismo caso que en worker/src/index.js (ver comentario allí):
+          // articles.resultado_id sin ON DELETE CASCADE/SET NULL hacía
+          // que este DELETE fallara con una violación de foreign key
+          // (en Postgres: código 23503 / "violates foreign key
+          // constraint"), devuelta antes como 500 y confundida con una
+          // caída del servidor. Se detecta aquí también para que el
+          // failover PRIMARY->SECONDARY no reintente en balde un DELETE
+          // que va a fallar igual en ambas bases, y para que el panel no
+          // acabe forzando un logout por un error que no es de sesión.
+          if (err.code === "23503" || /foreign key constraint/i.test(err.message || "")) {
+            return json({
+              error: "No se puede eliminar: hay una noticia o crónica vinculada a este partido. Quita el enlace al partido desde esa noticia (o bórrala) y vuelve a intentarlo.",
+            }, 409);
+          }
+          throw err;
+        }
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "eliminar_resultado", entidad: "resultado", entidad_id: id,
           descripcion: `Ha eliminado el partido con id ${id}`,

@@ -35,6 +35,16 @@ CREATE TABLE users (
   -- "Usuarios"; la propia persona lo ve en "Mis datos" pero no puede
   -- editarlo ahi. Opcional (puede no tener ninguno asignado).
   equipo TEXT,
+  -- Categoría(s) fija(s) para redactores "sin equipo, con categoría
+  -- fija" (p. ej. Arbitraje): array JSON en texto, igual patrón que
+  -- "equipo" (p. ej. '["arbitraje"]' o '["arbitraje","jurisdiccion"]").
+  -- Si tiene valor(es), este redactor no tiene equipo y solo puede
+  -- publicar noticias/crónicas/artículos en alguna de esas categorías
+  -- (se fuerza siempre en el backend, no aplica a resultados). NULL o
+  -- vacío para el caso normal (redactor con equipo, cualquier
+  -- categoría). Solo lo asigna un admin desde "Usuarios", igual que
+  -- el equipo.
+  categorias_fijas TEXT,
   -- Última vez que la persona ha visto las novedades (campana de
   -- notificaciones) del panel, guardado en el servidor para que no se
   -- pierda si se borran las cookies/datos del navegador.
@@ -55,7 +65,12 @@ CREATE TABLE articles (
   contenido TEXT NOT NULL,
   tipo TEXT NOT NULL DEFAULT 'noticia', -- noticia, cronica, opinion, entrevista
   categoria TEXT NOT NULL DEFAULT 'hypermotion', -- hypermotion, primera_federacion, segunda_federacion, general
-  -- Categoría(s) adicional(es) de la noticia (ver worker/schema.sql).
+  -- Categoría(s) adicional(es) de la noticia, aparte de la principal
+  -- ("categoria", que es la que se usa para el link /futbol/[categoria]).
+  -- Son solo etiquetas informativas que se muestran junto a la noticia,
+  -- no afectan al filtrado por categoría ni a la URL. Array JSON en
+  -- texto (p. ej. '["amistoso","general"]'), máximo 4 valores, sin
+  -- repetir la principal. NULL o '[]' si no tiene ninguna adicional.
   categorias_adicionales TEXT,
   club TEXT,
   imagen_url TEXT,
@@ -119,11 +134,21 @@ CREATE TABLE articles (
   -- destructiva sobre datos existentes.
   imagen_post_url TEXT,
   -- Ficha técnica editable a mano por el redactor, solo para crónicas.
-  -- Guardada como JSON (mismo formato que en worker/schema.sql D1).
+  -- Guardada como JSON (competición, jornada, estadio, ciudad,
+  -- fecha/hora, árbitro, asistencia, goleadores, tarjetas, MVP, notas).
+  -- Ver migracion_ficha_tecnica.sql para el detalle de las claves.
+  -- NULL si el artículo no tiene ficha técnica (lo normal salvo en
+  -- crónicas donde el redactor la haya rellenado).
   ficha_tecnica TEXT,
   FOREIGN KEY (autor_id) REFERENCES users(id),
   FOREIGN KEY (coautor_id) REFERENCES users(id),
-  FOREIGN KEY (resultado_id) REFERENCES results(id)
+  -- ON DELETE SET NULL: si se borra el resultado desde el panel, la
+  -- noticia/crónica se queda sin partido vinculado en vez de bloquear el
+  -- DELETE (ver migracion_fk_resultado_id_set_null.sql: sin esto, borrar
+  -- un resultado con una noticia enlazada fallaba con
+  -- SQLITE_CONSTRAINT_FOREIGNKEY, un 500 que además disparaba el
+  -- failover a la secundaria y, mal interpretado como 401, un logout).
+  FOREIGN KEY (resultado_id) REFERENCES results(id) ON DELETE SET NULL
 );
 
 CREATE TABLE results (
@@ -156,12 +181,6 @@ CREATE TABLE results (
   -- se le apruebe una solicitud de edición (ver tabla edit_requests).
   autor_id INTEGER,
   autor_nombre TEXT,
-  -- 'redaccion' (creado por un redactor) o 'auto_api_football' (relleno
-  -- automático de un partido que nadie cubre; ver
-  -- worker/migracion_relleno_automatico.sql y db/migrations/010_relleno_automatico.sql).
-  -- external_id es el id del partido en la API externa.
-  fuente TEXT NOT NULL DEFAULT 'redaccion',
-  external_id TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   -- Instante (UTC) en que se pulsó "Iniciar partido" en el panel de
   -- Minuto a Minuto; sirve para calcular el cronómetro en vivo. NULL si
@@ -201,15 +220,44 @@ CREATE TABLE results (
   -- los dos si todavía no se ha elegido.
   mvp_jugador TEXT,
   mvp_equipo TEXT, -- 'local' | 'visitante'
+  -- 'redaccion' (creado por un redactor, como siempre) o
+  -- 'auto_api_football' (relleno automático de un partido que nadie
+  -- cubre; ver migracion_relleno_automatico.sql). external_id es el id
+  -- del partido en la API externa, para que el cron pueda actualizarlo
+  -- sin duplicarlo.
+  fuente TEXT NOT NULL DEFAULT 'redaccion',
+  external_id TEXT,
   -- Marca si este partido se cerró SOLO por el cron
   -- (crearFinPartidoAutomaticoAlMinuto90) al llegar al minuto
   -- MINUTO_FIN_PARTIDO_AUTOMATICO sin que nadie pulsara "Fin del
   -- partido" antes: 0 = finalizado normal, 1 = cierre automático sin
-  -- cubrir. Se usa para pintar "FINALIZADO NO CUBIERTO" en el panel
-  -- admin (ver migracion_fin_no_cubierto.sql).
+  -- cubrir. Se usa para pintar el aviso "FINALIZADO NO CUBIERTO" en la
+  -- tabla de Resultados del panel admin (ver migracion_fin_no_cubierto.sql).
   finalizado_no_cubierto INTEGER NOT NULL DEFAULT 0,
   FOREIGN KEY (autor_id) REFERENCES users(id)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_results_external_id
+  ON results(external_id) WHERE external_id IS NOT NULL;
+
+-- Alias de nombres de equipo entre la API externa de relleno automático
+-- y el nombre "oficial" del sitio (ver public/js/clubs.js).
+CREATE TABLE IF NOT EXISTS equipo_alias_externo (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  nombre_externo TEXT NOT NULL UNIQUE,
+  nombre_interno TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Control de la última sincronización automática de partidos (relleno
+-- vía API externa). Una única fila fija, igual patrón que
+-- newsletter_envios.
+CREATE TABLE IF NOT EXISTS sync_partidos_auto (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  ultimo_sync_at TEXT,
+  ultimo_sync_ok INTEGER NOT NULL DEFAULT 1,
+  ultimo_error TEXT
+);
+INSERT OR IGNORE INTO sync_partidos_auto (id, ultimo_sync_at) VALUES (1, NULL);
 
 -- Eventos de un partido (goles, tarjetas, cambios, descansos...) que se
 -- muestran en el detalle al clicar un resultado en resultados.html, y
@@ -255,6 +303,25 @@ INSERT INTO settings (key, value) VALUES (
   '0000'
 );
 
+-- Newsletter / boletín semanal: personas suscritas desde el formulario
+-- público (portada/pie de página) y control del último envío automático.
+-- Ver worker/migracion_newsletter.sql para el detalle de columnas.
+CREATE TABLE newsletter_suscriptores (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT UNIQUE NOT NULL,
+  baja_token TEXT NOT NULL,
+  activo INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  baja_at TEXT
+);
+CREATE INDEX idx_newsletter_email ON newsletter_suscriptores(email);
+
+CREATE TABLE newsletter_envios (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  ultimo_envio_at TEXT
+);
+INSERT INTO newsletter_envios (id, ultimo_envio_at) VALUES (1, NULL);
+
 -- Contenido multimedia (fotos y vídeos) que suben los redactores desde
 -- "Subir contenido". El archivo en sí se guarda en R2 (binding MEDIA) tal
 -- cual llega, sin recomprimir; aquí solo se guardan los metadatos y la
@@ -273,11 +340,13 @@ CREATE TABLE media (
   autor_id INTEGER,
   autor_nombre TEXT,
   club TEXT,
+  hash_archivo TEXT, -- SHA-256 del contenido; evita subir el mismo archivo dos veces (ver migracion_media_hash.sql)
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (autor_id) REFERENCES users(id)
 );
 
 CREATE INDEX idx_media_created ON media(created_at);
+CREATE UNIQUE INDEX idx_media_hash_unico ON media(hash_archivo) WHERE hash_archivo IS NOT NULL;
 
 -- Sesiones activas por usuario (ver migracion_sesiones.sql para el
 -- detalle): permite listarlas y cerrarlas en remoto desde el panel,
@@ -296,7 +365,7 @@ CREATE TABLE sessions (
 CREATE INDEX idx_sessions_user ON sessions(user_id);
 
 -- Cuentas de lectores (distintas de "users", solo redactores/admin):
--- ver worker/migracion_readers.sql para la explicación completa.
+-- ver migracion_readers.sql para la explicación completa.
 CREATE TABLE readers (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   nombre TEXT NOT NULL,
@@ -324,6 +393,26 @@ CREATE TABLE reader_sessions (
   FOREIGN KEY (reader_id) REFERENCES readers(id)
 );
 CREATE INDEX idx_reader_sessions_reader ON reader_sessions(reader_id);
+
+-- Sistema de Porras: predicciones de lectores para partidos de
+-- "results". Ver worker/migracion_porras.sql para la explicación
+-- completa del diseño (por qué puntos_obtenidos/resultado_acierto se
+-- persisten en vez de calcularse siempre al vuelo, y el baremo de
+-- puntos usado al resolver).
+CREATE TABLE IF NOT EXISTS porras (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  reader_id INTEGER NOT NULL REFERENCES readers(id) ON DELETE CASCADE,
+  resultado_id INTEGER NOT NULL REFERENCES results(id) ON DELETE CASCADE,
+  goles_local_predicho INTEGER NOT NULL,
+  goles_visitante_predicho INTEGER NOT NULL,
+  puntos_obtenidos INTEGER,
+  resultado_acierto TEXT NOT NULL DEFAULT 'pendiente',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (reader_id, resultado_id)
+);
+CREATE INDEX IF NOT EXISTS idx_porras_reader ON porras(reader_id);
+CREATE INDEX IF NOT EXISTS idx_porras_resultado ON porras(resultado_id);
 
 CREATE INDEX idx_articles_categoria ON articles(categoria);
 CREATE INDEX idx_articles_publicado ON articles(publicado, fecha_publicacion);
@@ -414,7 +503,9 @@ CREATE INDEX idx_alineaciones_article ON alineaciones(article_id);
 CREATE INDEX idx_alineaciones_result ON alineaciones(result_id);
 
 -- Comentarios de lectores dentro de cada noticia/crónica/opinión/
--- entrevista. Ver worker/migracion_comentarios.sql para el detalle.
+-- entrevista. Ver worker/migracion_comentarios.sql para el detalle, y
+-- worker/migracion_votos_denuncias_comentarios.sql para likes/dislikes
+-- y denuncias.
 DROP TABLE IF EXISTS comments;
 CREATE TABLE comments (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -427,12 +518,43 @@ CREATE TABLE comments (
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   moderado_por_id INTEGER,
   moderado_at TEXT,
+  likes INTEGER NOT NULL DEFAULT 0,
+  dislikes INTEGER NOT NULL DEFAULT 0,
+  denuncias INTEGER NOT NULL DEFAULT 0,
+  oculto_por_denuncia INTEGER NOT NULL DEFAULT 0,
+  -- Cuenta de lector que escribió el comentario (si había iniciado
+  -- sesión al enviarlo). NULL si comentó sin registrarse.
   reader_id INTEGER REFERENCES readers(id),
   FOREIGN KEY (moderado_por_id) REFERENCES users(id)
 );
 CREATE INDEX idx_comments_article ON comments(article_id, estado);
 CREATE INDEX idx_comments_estado ON comments(estado, created_at);
 CREATE INDEX idx_comments_reader ON comments(reader_id);
+
+DROP TABLE IF EXISTS comment_votes;
+CREATE TABLE comment_votes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  comment_id INTEGER NOT NULL REFERENCES comments(id) ON DELETE CASCADE,
+  votante_id TEXT NOT NULL,
+  valor INTEGER NOT NULL CHECK (valor IN (1, -1)),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (comment_id, votante_id)
+);
+CREATE INDEX idx_comment_votes_comment ON comment_votes(comment_id);
+
+DROP TABLE IF EXISTS comment_reports;
+CREATE TABLE comment_reports (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  comment_id INTEGER NOT NULL REFERENCES comments(id) ON DELETE CASCADE,
+  denunciante_id TEXT NOT NULL,
+  motivo TEXT,
+  ip TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  revisado INTEGER NOT NULL DEFAULT 0,
+  UNIQUE (comment_id, denunciante_id)
+);
+CREATE INDEX idx_comment_reports_comment ON comment_reports(comment_id);
+CREATE INDEX idx_comment_reports_revisado ON comment_reports(revisado, created_at);
 
 -- Ficha informativa de cada club (entrenador, estadio, fundación...).
 -- Ver worker/migracion_club_info.sql para el detalle.
@@ -472,4 +594,101 @@ CREATE TABLE club_info_solicitudes (
 );
 CREATE INDEX idx_club_info_solicitudes_estado ON club_info_solicitudes(estado);
 CREATE INDEX idx_club_info_solicitudes_club ON club_info_solicitudes(club);
+
+-- Encuestas para lectores. Solo puede votar un lector con cuenta,
+-- logueado y con el email verificado (mismo requisito que comentar).
+-- Ver worker/migracion_encuestas.sql para el detalle.
+DROP TABLE IF EXISTS polls;
+CREATE TABLE polls (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  pregunta TEXT NOT NULL,
+  article_id INTEGER REFERENCES articles(id) ON DELETE SET NULL,
+  en_portada INTEGER NOT NULL DEFAULT 0,
+  orden_portada INTEGER NOT NULL DEFAULT 0,
+  estado TEXT NOT NULL DEFAULT 'abierta',
+  cierra_en TEXT,
+  autor_id INTEGER REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_polls_article ON polls(article_id);
+CREATE INDEX idx_polls_portada ON polls(en_portada, orden_portada);
+CREATE INDEX idx_polls_estado ON polls(estado);
+
+DROP TABLE IF EXISTS poll_options;
+CREATE TABLE poll_options (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  poll_id INTEGER NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
+  texto TEXT NOT NULL,
+  orden INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_poll_options_poll ON poll_options(poll_id);
+
+DROP TABLE IF EXISTS poll_votes;
+CREATE TABLE poll_votes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  poll_id INTEGER NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
+  option_id INTEGER NOT NULL REFERENCES poll_options(id) ON DELETE CASCADE,
+  reader_id INTEGER NOT NULL REFERENCES readers(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(poll_id, reader_id)
+);
+CREATE INDEX idx_poll_votes_poll ON poll_votes(poll_id);
+CREATE INDEX idx_poll_votes_option ON poll_votes(option_id);
+
+-- Tracking propio de vistas y tiempo de lectura, para el panel de
+-- analíticas (ver worker/migracion_analiticas.sql para la versión no
+-- destructiva de estas mismas tablas, pensada para bases ya desplegadas).
+DROP TABLE IF EXISTS article_views;
+CREATE TABLE article_views (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+  visitante_hash TEXT NOT NULL,
+  -- Hash de IP+User-Agent SIN el día (a diferencia de visitante_hash,
+  -- que sí lo incluye a propósito). Solo se usa para "lectores nuevos
+  -- vs. recurrentes" -- ver migracion_analiticas_recurrencia.sql y
+  -- calcularRecurrenciaAnaliticas() en src/index.js.
+  visitante_estable TEXT,
+  fuente TEXT NOT NULL DEFAULT 'directo',
+  referer_dominio TEXT,
+  dispositivo TEXT NOT NULL DEFAULT 'escritorio',
+  -- Idioma en el que se leyó la noticia ('es','eu','ca','gl','en'), ver
+  -- migracion_analiticas_idioma_partidos.sql y el selector de idioma de
+  -- noticia.html.
+  idioma TEXT NOT NULL DEFAULT 'es',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_article_views_article ON article_views(article_id);
+CREATE INDEX idx_article_views_created ON article_views(created_at);
+CREATE INDEX idx_article_views_visitante_dia ON article_views(visitante_hash, article_id, created_at);
+CREATE INDEX idx_article_views_created_article ON article_views(created_at, article_id);
+CREATE INDEX idx_article_views_idioma ON article_views(idioma);
+CREATE INDEX idx_article_views_visitante_estable ON article_views(visitante_estable, created_at);
+
+-- Una fila por cada carga de minuto-a-minuto.html (seguimiento público
+-- de un partido). Alimenta "partidos más seguidos" en el panel de
+-- analíticas -- ver migracion_analiticas_idioma_partidos.sql.
+CREATE TABLE result_views (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  result_id INTEGER NOT NULL REFERENCES results(id) ON DELETE CASCADE,
+  visitante_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_result_views_result ON result_views(result_id);
+CREATE INDEX idx_result_views_created ON result_views(created_at);
+CREATE INDEX idx_result_views_created_result ON result_views(created_at, result_id);
+
+DROP TABLE IF EXISTS article_reading;
+CREATE TABLE article_reading (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  view_id INTEGER NOT NULL REFERENCES article_views(id) ON DELETE CASCADE,
+  article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+  segundos INTEGER NOT NULL,
+  scroll_maximo INTEGER,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_article_reading_article ON article_reading(article_id);
+CREATE INDEX idx_article_reading_created ON article_reading(created_at);
+CREATE INDEX idx_article_reading_view ON article_reading(view_id);
+CREATE INDEX idx_article_reading_created_article ON article_reading(created_at, article_id);
 
