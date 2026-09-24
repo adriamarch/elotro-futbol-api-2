@@ -2763,17 +2763,41 @@ async function crearFinPartidoAutomaticoAlMinuto90(env) {
 //      el último evento de tipo pausa) desde hace más de
 //      UMBRAL_DESCANSO_SIN_REANUDAR minutos: el redactor no ha pulsado
 //      "Iniciar 2ª parte".
-// Se manda como máximo un aviso por email por cada mitad del partido
-// (al autor del partido, con copia a EMAIL_NOTIFICACIONES si no tiene
-// correo): uno para la 1ª parte y otro, independiente, para la 2ª. Se
-// guarda en aviso_desatendido_mitad qué mitades ya han avisado, para no
-// repetirlo cada minuto (el cron pasa cada minuto) ni tampoco varias
-// veces dentro de la misma mitad si hay algún toque suelto de por medio
-// -- así se evita mandar una "petada" de correos seguidos por un solo
-// partido desatendido.
+//
+// AVISOS EN LOTE (digest) -- por qué ya no se manda un email por partido:
+// el plan gratuito de Resend limita a 100 emails al día. Antes se
+// mandaba un correo por partido y mitad (al redactor + copia a admin) y,
+// como este cron corre en los DOS backends (D1 y Postgres), un sábado
+// con ~15 partidos sin cubrir bastaba para agotar el cupo y dejar sin
+// aviso al resto de notificaciones del sitio (recuperar contraseña,
+// comentarios, boletín...). Ahora el cron solo DETECTA: cada partido
+// desatendido (una vez por mitad, igual que antes) se apunta en la
+// tabla avisos_desatendidos_cola, y un único email consolidado a la
+// cuenta de notificaciones se manda cuando se cumple CUALQUIERA de
+// estas dos condiciones:
+//   - la cola llega a AVISOS_DESATENDIDOS_LOTE partidos (por defecto 20), o
+//   - el aviso más antiguo de la cola lleva esperando más de
+//     AVISOS_DESATENDIDOS_ESPERA_MAX_MIN minutos (por defecto 30): así
+//     un único partido abandonado no se queda horas sin avisar solo
+//     porque nadie más se haya descuidado.
+// Con eso, el peor caso pasa de 4 emails por partido (x2 backends) a
+// 1 email por cada 20 partidos (o 1 cada 30 min como mucho).
+//
+// La cola vive en su PROPIA tabla (ver migracion_avisos_desatendidos_cola.sql
+// y db/migrations/026_...) y NO en `settings`: el sincronizador D1 ->
+// PostgreSQL trata `settings` como tabla autoritativa y borraría la cola
+// de Railway en cada pasada (cada 60 s). Cada backend lleva la suya, sin
+// sincronizar, igual que cada uno ejecuta ya su propio cron.
 const UMBRAL_PRIMERA_PARTE_SIN_DESCANSO = 55; // minutos
 const UMBRAL_SEGUNDA_PARTE_SIN_FINAL = 100; // minutos (aprox. 2ª parte + prórroga larga)
 const UMBRAL_DESCANSO_SIN_REANUDAR = 25; // minutos parado en el descanso
+
+const AVISOS_DESATENDIDOS_LOTE = 20; // partidos acumulados que disparan el email
+const AVISOS_DESATENDIDOS_ESPERA_MAX_MIN = 30; // minutos máx. que espera el aviso más antiguo
+// Tope de filas que se listan dentro del email (el resto se resume en
+// una línea "y N más") para que un lote enorme no genere un correo
+// gigante ni se recorte en el cliente de correo.
+const AVISOS_DESATENDIDOS_MAX_FILAS_EMAIL = 40;
 
 // Umbral de partido "colgado": el cronómetro lleva corriendo días sin que
 // nadie lo haya cerrado (bug, redactor que se fue de vacaciones, servidor
@@ -2786,6 +2810,8 @@ const UMBRAL_DESCANSO_SIN_REANUDAR = 25; // minutos parado en el descanso
 // de aparecer como "en directo" en la web sin tocar nada del frontend.
 // Sigue siendo consultable desde el panel de admin (que si no filtra por
 // estado, lo trae igual) para que un admin lo revise y lo corrija a mano.
+// NOTA: este aviso NO va por lotes a propósito: es un caso muy raro y
+// grave (ya se ha ocultado el partido de la web) que no debe esperar.
 const UMBRAL_PARTIDO_COLGADO = 2000; // minutos
 
 async function marcarPartidosColgados(env, ctx) {
@@ -2864,6 +2890,69 @@ function minutoEnVivoServidor(resultado) {
   return Math.max(0, Math.floor((Date.now() - inicioMs) / 60000) + ajuste);
 }
 
+// Lee la cola de avisos pendientes (tabla avisos_desatendidos_cola).
+// Devuelve siempre un array. encolado_ms se pasa por Number(): el driver
+// "pg" devuelve los BIGINT de Postgres como string (no como número, a
+// diferencia de D1), y una comparación o un Math.min sobre strings
+// fallaría en silencio solo en Railway.
+async function leerColaAvisosDesatendidos(env) {
+  const { results } = await env.DB.prepare(
+    "SELECT resultado_id, partido, jornada, redactor, motivo_corto, encolado_ms FROM avisos_desatendidos_cola ORDER BY encolado_ms ASC"
+  ).all();
+  return (results || []).map((f) => ({
+    id: f.resultado_id,
+    partido: f.partido,
+    jornada: f.jornada,
+    redactor: f.redactor,
+    motivoCorto: f.motivo_corto,
+    encoladoMs: Number(f.encolado_ms),
+  }));
+}
+
+// Manda UN solo email con todos los partidos de la cola. Devuelve true
+// si había algo que enviar.
+async function enviarDigestAvisosDesatendidos(env, cola, motivoEnvio) {
+  if (!cola.length) return false;
+
+  const visibles = cola.slice(0, AVISOS_DESATENDIDOS_MAX_FILAS_EMAIL);
+  const ocultos = cola.length - visibles.length;
+  const enlaceLista = `${SITIO_URL}/admin/resultados.html`;
+
+  const filas = visibles.map((a) => ({
+    etiqueta: `Jornada ${a.jornada}`,
+    valor: `${a.partido} — ${a.redactor || "sin asignar"} (${a.motivoCorto})`,
+  }));
+  if (ocultos > 0) filas.push({ etiqueta: "…", valor: `y ${ocultos} partidos más (revisa el panel)` });
+
+  const titulo = cola.length === 1
+    ? "1 partido posiblemente sin cubrir"
+    : `${cola.length} partidos posiblemente sin cubrir`;
+  const parrafo = motivoEnvio === "lote"
+    ? `Se han acumulado ${cola.length} partidos en los que el cronómetro parece desatendido.`
+    : `Estos partidos llevan un rato con el cronómetro desatendido y siguen sin resolverse.`;
+
+  const lineasTexto = visibles
+    .map((a) => `- ${a.partido} (jornada ${a.jornada}) — ${a.redactor || "sin asignar"}: ${a.motivoCorto}\n  ${SITIO_URL}/admin/minuto-a-minuto.html?id=${a.id}`)
+    .join("\n");
+
+  await enviarEmailNotificacion(env, {
+    asunto: `⚠️ ${titulo}`,
+    texto: `${parrafo}\n\n${lineasTexto}${ocultos > 0 ? `\n\n…y ${ocultos} partidos más.` : ""}\n\nRevisa el panel: ${enlaceLista}`,
+    html: plantillaEmail({
+      etiqueta: "Aviso automático",
+      titulo,
+      parrafo,
+      filas,
+      boton: { texto: "Abrir el panel", url: enlaceLista },
+    }),
+  }, { destinatario: EMAIL_NOTIFICACIONES });
+  return true;
+}
+
+// Detecta partidos desatendidos y los apunta en la cola (una vez por
+// mitad, como siempre). El email ya NO sale desde aquí partido a
+// partido: lo manda enviarDigestAvisosDesatendidos cuando toca (ver el
+// bloque de comentarios "AVISOS EN LOTE" más arriba).
 async function revisarPartidosDesatendidos(env, ctx) {
   // Los partidos ya marcados como 'colgado' (ver marcarPartidosColgados,
   // que corre justo antes en el cron) se excluyen aquí para no duplicar
@@ -2875,8 +2964,11 @@ async function revisarPartidosDesatendidos(env, ctx) {
             aviso_desatendido_mitad
      FROM results WHERE estado = 'en_juego'`
   ).all();
-  if (!partidos.length) return;
 
+  // Aunque no haya partidos en juego hay que mirar la cola igualmente:
+  // puede haber avisos pendientes de un partido que ya terminó, y su
+  // temporizador de espera máxima debe seguir corriendo para que se
+  // envíen. Por eso ya no hay un "return" temprano aquí.
   for (const partido of partidos) {
     const corriendo = partido.cronometro_pausado_en === null || partido.cronometro_pausado_en === undefined;
     const minuto = minutoEnVivoServidor(partido);
@@ -2888,9 +2980,11 @@ async function revisarPartidosDesatendidos(env, ctx) {
     // y luego, tras retomarlo, vuelve a quedarse desatendido en la 2ª,
     // puede avisar de nuevo esa segunda vez en lugar de quedarse callado.
     let motivo = null;
+    let motivoCorto = null;
     let mitad = null;
     if (corriendo && minuto >= UMBRAL_SEGUNDA_PARTE_SIN_FINAL) {
       motivo = `El cronómetro sigue corriendo y ya marca el minuto ${minuto} sin que se haya registrado el final del partido.`;
+      motivoCorto = `min. ${minuto} sin final`;
       mitad = "segunda";
     } else if (corriendo && minuto >= UMBRAL_PRIMERA_PARTE_SIN_DESCANSO) {
       const yaHuboDescanso = await env.DB.prepare(
@@ -2898,11 +2992,13 @@ async function revisarPartidosDesatendidos(env, ctx) {
       ).bind(partido.id).first();
       if (!yaHuboDescanso) {
         motivo = `El cronómetro sigue corriendo y ya marca el minuto ${minuto} sin que se haya pitado el descanso.`;
+        motivoCorto = `min. ${minuto} sin descanso`;
         mitad = "primera";
       } else {
         // Ya hubo descanso pero el cronómetro sigue corriendo por encima
         // del umbral de la 1ª parte: en realidad ya estamos en la 2ª.
         motivo = `El cronómetro sigue corriendo y ya marca el minuto ${minuto} sin que se haya registrado el final del partido.`;
+        motivoCorto = `min. ${minuto} sin final`;
         mitad = "segunda";
       }
     } else if (!corriendo) {
@@ -2915,6 +3011,7 @@ async function revisarPartidosDesatendidos(env, ctx) {
         const minutosParado = isNaN(desdeMs) ? 0 : Math.floor((Date.now() - desdeMs) / 60000);
         if (minutosParado >= UMBRAL_DESCANSO_SIN_REANUDAR) {
           motivo = `El partido lleva parado en el descanso ${minutosParado} minutos sin que se haya iniciado la 2ª parte.`;
+          motivoCorto = `${minutosParado} min parado en el descanso`;
           // El descanso es la frontera entre mitades: se cuenta como
           // aviso de la 1ª parte (es el cierre pendiente de esa mitad).
           mitad = "primera";
@@ -2934,51 +3031,70 @@ async function revisarPartidosDesatendidos(env, ctx) {
     }
     if (mitadesAvisadas.includes(mitad)) continue; // ya avisado en esta mitad, no se repite
 
+    // Se marca la mitad como avisada YA (igual que antes, aunque el email
+    // salga más tarde en el lote): así el mismo partido no se vuelve a
+    // apuntar en la cola en el siguiente minuto del cron.
     const nuevoValor = [...new Set([...mitadesAvisadas, mitad])].join("_");
     await env.DB.prepare("UPDATE results SET aviso_desatendido_mitad = ? WHERE id = ?").bind(nuevoValor, partido.id).run();
 
-    let destinatario = EMAIL_NOTIFICACIONES;
-    if (partido.autor_id) {
-      const autor = await env.DB.prepare("SELECT email FROM users WHERE id = ?").bind(partido.autor_id).first();
-      if (autor?.email) destinatario = autor.email;
-    }
-    const nombrePartido = `${partido.equipo_local} - ${partido.equipo_visitante}`;
-    const enlacePanel = `${SITIO_URL}/admin/minuto-a-minuto.html?id=${partido.id}`;
-
-    const enviar = enviarEmailNotificacion(env, {
-      asunto: `⚠️ Partido posiblemente sin cubrir: ${nombrePartido}`,
-      texto: `${motivo}\n\nPartido: ${nombrePartido} (jornada ${partido.jornada})\nRedactor asignado: ${partido.autor_nombre || "sin asignar"}\n\nRevisa el panel de Minuto a Minuto: ${enlacePanel}`,
-      html: plantillaEmail({
-        etiqueta: "Aviso automático",
-        titulo: "Partido posiblemente sin cubrir",
-        parrafo: motivo,
-        filas: [
-          { etiqueta: "Partido", valor: nombrePartido },
-          { etiqueta: "Jornada", valor: String(partido.jornada) },
-          { etiqueta: "Redactor", valor: partido.autor_nombre || "Sin asignar" },
-        ],
-        boton: { texto: "Abrir Minuto a Minuto", url: enlacePanel },
-      }),
-    }, { destinatario });
-
-    // Si el aviso va al autor, se manda también copia a la cuenta
-    // general de notificaciones para que un admin pueda intervenir
-    // aunque el redactor no vea el correo a tiempo.
-    if (destinatario !== EMAIL_NOTIFICACIONES) {
-      ctx.waitUntil(enviar);
-      ctx.waitUntil(enviarEmailNotificacion(env, {
-        asunto: `⚠️ Partido posiblemente sin cubrir: ${nombrePartido}`,
-        texto: `${motivo}\n\nPartido: ${nombrePartido} (jornada ${partido.jornada})\nRedactor asignado: ${partido.autor_nombre || "sin asignar"}\n\nRevisa el panel de Minuto a Minuto: ${enlacePanel}`,
-      }, { destinatario: EMAIL_NOTIFICACIONES }));
-    } else {
-      ctx.waitUntil(enviar);
-    }
+    // INSERT ... ON CONFLICT: si el mismo partido ya estaba en la cola
+    // (p. ej. se reinició y volvió a desatenderse antes de enviarse el
+    // lote), se sustituye su fila en lugar de duplicarla.
+    await env.DB.prepare(
+      `INSERT INTO avisos_desatendidos_cola (resultado_id, partido, jornada, redactor, motivo_corto, encolado_ms)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(resultado_id) DO UPDATE SET partido = excluded.partido, jornada = excluded.jornada,
+         redactor = excluded.redactor, motivo_corto = excluded.motivo_corto, encolado_ms = excluded.encolado_ms`
+    ).bind(
+      partido.id, `${partido.equipo_local} - ${partido.equipo_visitante}`, partido.jornada,
+      partido.autor_nombre || null, motivoCorto, Date.now()
+    ).run();
 
     await registrarActividad(env, null, { uid: null, nombre: "Vigilancia de partidos", rol: "sistema" }, {
       accion: "aviso_partido_desatendido", entidad: "resultado", entidad_id: partido.id,
-      descripcion: `Aviso automático: ${nombrePartido} — ${motivo}`,
+      descripcion: `Aviso automático (en cola para el resumen): ${partido.equipo_local} - ${partido.equipo_visitante} — ${motivo}`,
     });
   }
+
+  const cola = await leerColaAvisosDesatendidos(env);
+  if (!cola.length) return;
+
+  // ¿Toca enviar el resumen? Si ya hay un lote completo, o si el aviso
+  // más antiguo (la cola viene ordenada por encolado_ms ASC) lleva
+  // esperando más de AVISOS_DESATENDIDOS_ESPERA_MAX_MIN. Un encolado_ms
+  // ilegible (NaN) cuenta como "ya lleva mucho": mejor avisar de más una
+  // vez que dejar un aviso atascado para siempre.
+  const esperaMin = Number.isFinite(cola[0].encoladoMs) ? (Date.now() - cola[0].encoladoMs) / 60000 : Infinity;
+  const loteCompleto = cola.length >= AVISOS_DESATENDIDOS_LOTE;
+  const esperaAgotada = esperaMin >= AVISOS_DESATENDIDOS_ESPERA_MAX_MIN;
+  if (!loteCompleto && !esperaAgotada) return;
+
+  // Se vacía la cola ANTES de enviar, y solo las filas que se van a
+  // enviar (por id, no un DELETE global): si el envío falla a medias no
+  // se reenvía el mismo lote cada minuto quemando cuota -el peor
+  // resultado posible aquí sería justo el que se quiere evitar-, y un
+  // partido que se apunte mientras tanto (el cron es concurrente entre
+  // ctx.waitUntil) no se borra sin haberse enviado. Un aviso perdido por
+  // un fallo puntual de Resend es preferible a un bucle de reintentos
+  // que agote el cupo diario.
+  //
+  // Se trocea en lotes de 90 ids: D1/SQLite tiene un límite de 100
+  // parámetros bind por consulta (mismo criterio que
+  // contarPublicacionesPorTipoDeVarios). Con AVISOS_DESATENDIDOS_LOTE = 20
+  // rara vez habrá tantos, pero si la espera máxima acumula más de 100
+  // partidos (una jornada entera sin nadie cubriendo) un DELETE de una
+  // sola vez fallaría con "too many SQL variables" y, al no borrarse la
+  // cola, el mismo aviso se reenviaría CADA MINUTO: justo el bucle de
+  // emails que este sistema existe para evitar.
+  const ids = cola.map((a) => a.id);
+  const LOTE_BORRADO = 90;
+  for (let inicio = 0; inicio < ids.length; inicio += LOTE_BORRADO) {
+    const lote = ids.slice(inicio, inicio + LOTE_BORRADO);
+    await env.DB.prepare(
+      `DELETE FROM avisos_desatendidos_cola WHERE resultado_id IN (${lote.map(() => "?").join(",")})`
+    ).bind(...lote).run();
+  }
+  await enviarDigestAvisosDesatendidos(env, cola, loteCompleto ? "lote" : "espera");
 }
 
 async function publicarArticulosProgramados(env) {

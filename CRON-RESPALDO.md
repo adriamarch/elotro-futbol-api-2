@@ -136,10 +136,29 @@ tarde si en ese momento el tráfico se está sirviendo desde ahí. Es una
 degradación aceptada, no un fallo — sigue siendo mucho mejor que un
 desfase indefinido hasta que alguien note que el primario está caído.
 
+## Avisos de partidos desatendidos: resumen en lote
+
+Resend (plan gratuito) limita a 100 emails al día. Por eso
+`revisarPartidosDesatendidos` **ya no manda un correo por partido**:
+cada partido desatendido (una vez por mitad) se apunta en la tabla
+`avisos_desatendidos_cola` y se envía **un único email resumen** al
+admin cuando la cola llega a `AVISOS_DESATENDIDOS_LOTE` (20) partidos o
+cuando el aviso más antiguo lleva `AVISOS_DESATENDIDOS_ESPERA_MAX_MIN`
+(30) minutos esperando. Ambas constantes están en `src/index.js`.
+
+- Cada backend (D1 y Postgres) tiene **su propia cola**. La tabla **no
+  debe añadirse a `sync/tables.mjs`**: el sincronizador la vaciaría.
+- Migraciones: `worker/migracion_avisos_desatendidos_cola.sql` (D1) y
+  `db/migrations/026_avisos_desatendidos_cola.sql` (Postgres).
+- Si Resend falla al enviar, el lote se descarta (no se reintenta cada
+  minuto, para no agotar el cupo).
+- El aviso 🚨 de partido colgado (`marcarPartidosColgados`) sigue siendo
+  individual e inmediato.
+
 ## Nota sobre el envío duplicado de emails
 
-`revisarPartidosDesatendidos` y `enviarBoletinSemanalSiToca` envían
-correos (Resend). Si algún día ambos crons (principal cada minuto,
+`revisarPartidosDesatendidos` (resumen en lote) y `enviarBoletinSemanalSiToca`
+envían correos (Resend). Si algún día ambos crons (principal cada minuto,
 secundario cada 5 minutos) llegaran a ejecutarse sobre la MISMA fila
 de negocio antes de que la sincronización de datos (FASE 4) propague
 el cambio de un lado a otro, existe una ventana teórica de doble aviso.
