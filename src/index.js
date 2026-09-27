@@ -1559,6 +1559,37 @@ async function requireAuth(request, env, url) {
   return payload;
 }
 
+// ---------- Colaboradores: roles y permisos ----------
+// Espejo exacto de los helpers equivalentes en worker/src/index.js (D1):
+// ver ahí la explicación completa. Se mantienen sincronizados a mano
+// porque este Worker secundario replica la misma lógica de negocio
+// sobre Postgres.
+const ROLES_VALIDOS = ["admin", "redactor", "fotografo"];
+
+function normalizarRolColaborador(rol) {
+  return ROLES_VALIDOS.includes(rol) ? rol : "redactor";
+}
+
+function esAdmin(payload) {
+  return !!payload && payload.rol === "admin";
+}
+
+function esRedactor(payload) {
+  return !!payload && payload.rol === "redactor";
+}
+
+function esFotografo(payload) {
+  return !!payload && payload.rol === "fotografo";
+}
+
+function puedeGestionarContenidoEditorial(payload) {
+  return esAdmin(payload) || esRedactor(payload);
+}
+
+function puedeGestionarGaleria(payload) {
+  return esAdmin(payload) || esFotografo(payload);
+}
+
 // ---------- Sesiones (dispositivos con la sesión iniciada) ----------
 function generarIdSesion() {
   const arr = new Uint8Array(24);
@@ -6527,7 +6558,7 @@ async function handlePrimary(request, env, ctx) {
         const passwordInicial = body.password && body.password.length >= 8 ? body.password : generatePassword();
         const salt = randomSalt();
         const hash = await hashPassword(passwordInicial, salt);
-        const rol = body.rol === "admin" ? "admin" : "redactor";
+        const rol = normalizarRolColaborador(body.rol);
 
         // El equipo es opcional, pero si se manda alguno hay que elegir
         // hasta 3 (ver validarEquipos).
@@ -6594,6 +6625,13 @@ async function handlePrimary(request, env, ctx) {
         // quitarle el rol de administrador.
         if (user.rol === "admin") {
           return json({ error: "Los administradores están siempre en el nivel máximo y no se puede editar su nivel mientras tengan ese rol" }, 400);
+        }
+        // El sistema de niveles mide la confianza para publicar contenido
+        // editorial sin revisión (ver publicarSinRevision): un fotógrafo
+        // no publica noticias ni crónicas, así que no tiene sentido darle
+        // un nivel de redactor.
+        if (esFotografo(user)) {
+          return json({ error: "El nivel de colaborador no aplica a un fotógrafo" }, 400);
         }
 
         const body = await request.json().catch(() => ({}));
@@ -6674,7 +6712,7 @@ async function handlePrimary(request, env, ctx) {
           `UPDATE users SET nombre = ?, rol = ?, activo = ?, email = ?, equipo = ? WHERE id = ?`
         ).bind(
           body.nombre !== undefined ? body.nombre : user.nombre,
-          body.rol === "admin" || body.rol === "redactor" ? body.rol : user.rol,
+          body.rol !== undefined ? normalizarRolColaborador(body.rol) : user.rol,
           body.activo === undefined ? user.activo : (body.activo ? 1 : 0),
           body.email !== undefined ? (body.email ? body.email.trim() : null) : user.email,
           equipoActualizado,
@@ -6747,6 +6785,14 @@ async function handlePrimary(request, env, ctx) {
         const titulo = (form.get("titulo") || "").toString().trim();
         const descripcion = (form.get("descripcion") || "").toString().trim();
         const club = (form.get("club") || "").toString().trim();
+        // portadaSegundo: instante (en segundos) del vídeo elegido en el
+        // navegador como fotograma de portada, si se eligió alguno antes
+        // de subir (ver "Elegir portada" en Subir contenido). Solo tiene
+        // sentido para vídeos; en fotos se ignora.
+        const portadaSegundoRaw = (form.get("portadaSegundo") || "").toString().trim();
+        const portadaSegundo = portadaSegundoRaw !== "" && Number.isFinite(Number(portadaSegundoRaw)) && Number(portadaSegundoRaw) >= 0
+          ? Number(portadaSegundoRaw)
+          : null;
 
         if (!file || typeof file === "string") return json({ error: "Falta el archivo" }, 400);
         if (!titulo) return json({ error: "Falta el título" }, 400);
@@ -6812,18 +6858,40 @@ async function handlePrimary(request, env, ctx) {
         // específicamente porque la columna no existe (mensaje de
         // SQLite o de PostgreSQL, según cuál esté detrás de env.DB aquí),
         // se reintenta sin ella.
+        // portada_segundo/portada_foco son columnas añadidas por una
+        // migración manual (db/migrations/028_media_portada_foco.sql): si
+        // aún no se ha aplicado en esta base de datos, se reintenta el
+        // INSERT sin ellas en vez de perder el archivo ya subido a
+        // Cloudinary. Mismo patrón escalonado que ya existía para
+        // hash_archivo.
         try {
           await env.DB.prepare(
-            `INSERT INTO media (cloudinary_public_id, cloudinary_resource_type, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, hash_archivo)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            `INSERT INTO media (cloudinary_public_id, cloudinary_resource_type, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, hash_archivo, portada_segundo)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           ).bind(
             subida.publicId, subida.resourceType, subida.url,
             titulo, descripcion || null, esFoto ? "foto" : "video",
-            file.name, file.type, file.size, payload.uid, payload.nombre, club || null, hashArchivo
+            file.name, file.type, file.size, payload.uid, payload.nombre, club || null, hashArchivo,
+            esFoto ? null : portadaSegundo
           ).run();
         } catch (err) {
+          const esColumnaPortadaFaltante = /no such column|no column named|column .* does not exist/i.test(err.message || "") && /portada_segundo/i.test(err.message || "");
           const esColumnaFaltante = /no such column|no column named|column .* does not exist/i.test(err.message || "") && /hash_archivo/i.test(err.message || "");
-          if (esColumnaFaltante) {
+          if (esColumnaPortadaFaltante) {
+            try {
+              await env.DB.prepare(
+                `INSERT INTO media (cloudinary_public_id, cloudinary_resource_type, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, hash_archivo)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              ).bind(
+                subida.publicId, subida.resourceType, subida.url,
+                titulo, descripcion || null, esFoto ? "foto" : "video",
+                file.name, file.type, file.size, payload.uid, payload.nombre, club || null, hashArchivo
+              ).run();
+            } catch (err2) {
+              ctx.waitUntil(borrarDeCloudinary(env, subida.publicId, subida.resourceType));
+              return json({ error: "No se pudo guardar el archivo. Inténtalo de nuevo.", detail: err2.message }, 500);
+            }
+          } else if (esColumnaFaltante) {
             try {
               await env.DB.prepare(
                 `INSERT INTO media (cloudinary_public_id, cloudinary_resource_type, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club)
@@ -6903,11 +6971,30 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/media" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        const base = "SELECT id, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, created_at FROM media";
-        const { results } = payload.rol === "admin"
-          ? await env.DB.prepare(`${base} ORDER BY created_at DESC`).all()
-          : await env.DB.prepare(`${base} WHERE autor_id = ? ORDER BY created_at DESC`).bind(payload.uid).all();
-        return json({ media: results });
+        const base = "SELECT id, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, created_at, portada_segundo, portada_foco FROM media";
+        const baseSinFoco = "SELECT id, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, created_at, portada_segundo FROM media";
+        const baseSinPortada = "SELECT id, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, created_at FROM media";
+        let resultadoMedia;
+        try {
+          resultadoMedia = payload.rol === "admin"
+            ? await env.DB.prepare(`${base} ORDER BY created_at DESC`).all()
+            : await env.DB.prepare(`${base} WHERE autor_id = ? ORDER BY created_at DESC`).bind(payload.uid).all();
+        } catch (err) {
+          // portada_segundo / portada_foco son columnas añadidas por una
+          // migración manual (db/migrations/028_media_portada_foco.sql):
+          // si aún no se han aplicado en esta base de datos, se reintenta
+          // sin ellas en vez de romper el listado.
+          try {
+            resultadoMedia = payload.rol === "admin"
+              ? await env.DB.prepare(`${baseSinFoco} ORDER BY created_at DESC`).all()
+              : await env.DB.prepare(`${baseSinFoco} WHERE autor_id = ? ORDER BY created_at DESC`).bind(payload.uid).all();
+          } catch (err2) {
+            resultadoMedia = payload.rol === "admin"
+              ? await env.DB.prepare(`${baseSinPortada} ORDER BY created_at DESC`).all()
+              : await env.DB.prepare(`${baseSinPortada} WHERE autor_id = ? ORDER BY created_at DESC`).bind(payload.uid).all();
+          }
+        }
+        return json({ media: resultadoMedia.results });
       }
 
       // ---------- MEDIA: editar título/club/descripción ----------
@@ -6918,7 +7005,7 @@ async function handlePrimary(request, env, ctx) {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         const id = parseInt(mediaMatch[1]);
-        const registro = await env.DB.prepare("SELECT autor_id FROM media WHERE id = ?").bind(id).first();
+        const registro = await env.DB.prepare("SELECT autor_id, tipo FROM media WHERE id = ?").bind(id).first();
         if (!registro) return json({ error: "No encontrado" }, 404);
         if (registro.autor_id !== payload.uid) {
           return json({ error: "Solo la persona que subió este contenido puede editarlo" }, 403);
@@ -6928,9 +7015,52 @@ async function handlePrimary(request, env, ctx) {
         if (!titulo) return json({ error: "Falta el título" }, 400);
         const descripcion = (body.descripcion || "").toString().trim();
         const club = (body.club || "").toString().trim();
-        await env.DB.prepare(
-          "UPDATE media SET titulo = ?, descripcion = ?, club = ? WHERE id = ?"
-        ).bind(titulo, descripcion || null, club || null, id).run();
+        // portadaSegundo: el instante (en segundos) del vídeo que se usa
+        // como fotograma de portada en la galería de contenido subido.
+        // Solo tiene sentido para vídeos; en fotos se ignora.
+        let portadaSegundo = null;
+        if (registro.tipo === "video" && body.portadaSegundo !== undefined && body.portadaSegundo !== null && body.portadaSegundo !== "") {
+          const num = Number(body.portadaSegundo);
+          if (Number.isFinite(num) && num >= 0) portadaSegundo = num;
+        }
+        // portadaFoco: qué punto de la miniatura no se debe recortar nunca
+        // (mismo formato "50% 50%" que el resto de fotos del sitio). Para
+        // vídeos es el punto del fotograma de portada; para fotos, el
+        // punto de la propia imagen. Se guarda en la misma columna en
+        // ambos casos: el campo llega como "portadaFoco" o "imagenFoco"
+        // según el tipo, pero es el mismo dato.
+        const focoRaw = registro.tipo === "video" ? body.portadaFoco : body.imagenFoco;
+        let portadaFoco = null;
+        if (typeof focoRaw === "string" && /^\d{1,3}%\s\d{1,3}%$/.test(focoRaw.trim())) {
+          portadaFoco = focoRaw.trim();
+        }
+        try {
+          await env.DB.prepare(
+            "UPDATE media SET titulo = ?, descripcion = ?, club = ?, portada_segundo = ?, portada_foco = ? WHERE id = ?"
+          ).bind(titulo, descripcion || null, club || null, portadaSegundo, portadaFoco, id).run();
+        } catch (err) {
+          const esColumnaFocoFaltante = /no such column|no column named|column .* does not exist/i.test(err.message || "") && /portada_foco/i.test(err.message || "");
+          const esColumnaFaltante = /no such column|no column named|column .* does not exist/i.test(err.message || "") && /portada_segundo/i.test(err.message || "");
+          if (esColumnaFocoFaltante) {
+            try {
+              await env.DB.prepare(
+                "UPDATE media SET titulo = ?, descripcion = ?, club = ?, portada_segundo = ? WHERE id = ?"
+              ).bind(titulo, descripcion || null, club || null, portadaSegundo, id).run();
+              console.error("No se pudo guardar portada_foco (falta migración 028_media_portada_foco.sql):", err.message);
+            } catch (err2) {
+              throw err2;
+            }
+          } else if (esColumnaFaltante) {
+            // Columna aún no migrada en esta base de datos: se guarda el
+            // resto de campos igualmente y se avisa del detalle solo por log.
+            await env.DB.prepare(
+              "UPDATE media SET titulo = ?, descripcion = ?, club = ? WHERE id = ?"
+            ).bind(titulo, descripcion || null, club || null, id).run();
+            console.error("No se pudo guardar portada_segundo/portada_foco (falta migración 028_media_portada_foco.sql):", err.message);
+          } else {
+            throw err;
+          }
+        }
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "editar_media", entidad: "media", entidad_id: id,
           descripcion: `Ha editado el contenido "${titulo}"`,
@@ -6979,6 +7109,127 @@ async function handlePrimary(request, env, ctx) {
         return json({ ok: true });
       }
 
+      // ---------- GALERÍA DE PARTIDO (match_gallery) ----------
+      // Espejo exacto de los endpoints equivalentes en worker/src/index.js
+      // (D1): ver ahí la explicación completa de permisos y diseño.
+      // Requiere la tabla creada en Postgres por la migración
+      // db/migrations/027_match_gallery.sql.
+      const galeriaPartidoMatch = path.match(/^\/api\/results\/(\d+)\/galeria$/);
+
+      if (galeriaPartidoMatch && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarGaleria(payload) && !esRedactor(payload)) {
+          return json({ error: "No tienes acceso a la galería de partidos" }, 403);
+        }
+        const resultId = parseInt(galeriaPartidoMatch[1]);
+        const resultado = await env.DB.prepare("SELECT id FROM results WHERE id = ?").bind(resultId).first();
+        if (!resultado) return json({ error: "Partido no encontrado" }, 404);
+        const { results } = await env.DB.prepare(
+          `SELECT mg.id, mg.orden, mg.created_at,
+                  m.id AS media_id, m.cloudinary_url, m.titulo, m.descripcion,
+                  m.tipo, m.autor_id, m.autor_nombre
+           FROM match_gallery mg
+           JOIN media m ON m.id = mg.media_id
+           WHERE mg.result_id = ?
+           ORDER BY mg.orden ASC, mg.created_at ASC`
+        ).bind(resultId).all();
+        return json({ galeria: results });
+      }
+
+      if (galeriaPartidoMatch && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarGaleria(payload)) {
+          return json({ error: "Un redactor no puede gestionar la galería de un partido, solo consultarla" }, 403);
+        }
+        const resultId = parseInt(galeriaPartidoMatch[1]);
+        const resultado = await env.DB.prepare("SELECT id FROM results WHERE id = ?").bind(resultId).first();
+        if (!resultado) return json({ error: "Partido no encontrado" }, 404);
+
+        const body = await request.json().catch(() => ({}));
+        const mediaIds = Array.isArray(body.mediaIds)
+          ? body.mediaIds.map((x) => parseInt(x)).filter((x) => Number.isInteger(x))
+          : (Number.isInteger(parseInt(body.mediaId)) ? [parseInt(body.mediaId)] : []);
+        if (!mediaIds.length) return json({ error: "Falta mediaId o mediaIds" }, 400);
+
+        const maxOrdenFila = await env.DB.prepare(
+          "SELECT COALESCE(MAX(orden), -1) AS max_orden FROM match_gallery WHERE result_id = ?"
+        ).bind(resultId).first();
+        let siguienteOrden = (maxOrdenFila?.max_orden ?? -1) + 1;
+
+        const vinculadas = [];
+        const errores = [];
+        for (const mediaId of mediaIds) {
+          const media = await env.DB.prepare("SELECT id FROM media WHERE id = ?").bind(mediaId).first();
+          if (!media) {
+            errores.push({ mediaId, error: "No encontrado en la mediateca" });
+            continue;
+          }
+          try {
+            await env.DB.prepare(
+              `INSERT INTO match_gallery (result_id, media_id, orden, vinculado_por_id) VALUES (?, ?, ?, ?)`
+            ).bind(resultId, mediaId, siguienteOrden, payload.uid).run();
+            vinculadas.push(mediaId);
+            siguienteOrden++;
+          } catch (err) {
+            if (/unique/i.test(err.message || "")) {
+              errores.push({ mediaId, error: "Ya estaba en la galería de este partido" });
+            } else {
+              errores.push({ mediaId, error: err.message });
+            }
+          }
+        }
+
+        if (vinculadas.length) {
+          ctx.waitUntil(registrarActividad(env, request, payload, {
+            accion: "vincular_galeria_partido", entidad: "resultado", entidad_id: resultId,
+            descripcion: `Ha añadido ${vinculadas.length} imagen${vinculadas.length === 1 ? "" : "es"} a la galería del partido #${resultId}.`,
+            detalle: { media_ids: vinculadas },
+          }));
+        }
+
+        return json({ ok: true, vinculadas, errores });
+      }
+
+      if (galeriaPartidoMatch && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarGaleria(payload)) {
+          return json({ error: "Un redactor no puede reordenar la galería de un partido" }, 403);
+        }
+        const resultId = parseInt(galeriaPartidoMatch[1]);
+        const body = await request.json().catch(() => ({}));
+        const orden = Array.isArray(body.orden) ? body.orden.map((x) => parseInt(x)).filter((x) => Number.isInteger(x)) : [];
+        if (!orden.length) return json({ error: "Falta el nuevo orden (lista de ids)" }, 400);
+
+        for (let i = 0; i < orden.length; i++) {
+          await env.DB.prepare(
+            "UPDATE match_gallery SET orden = ? WHERE id = ? AND result_id = ?"
+          ).bind(i, orden[i], resultId).run();
+        }
+        return json({ ok: true });
+      }
+
+      const galeriaItemMatch = path.match(/^\/api\/match-gallery\/(\d+)$/);
+      if (galeriaItemMatch && method === "DELETE") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const id = parseInt(galeriaItemMatch[1]);
+        const enlace = await env.DB.prepare("SELECT result_id, vinculado_por_id FROM match_gallery WHERE id = ?").bind(id).first();
+        if (!enlace) return json({ error: "No encontrado" }, 404);
+        const puedeQuitar = esAdmin(payload) || enlace.vinculado_por_id === payload.uid;
+        if (!puedeQuitar) {
+          return json({ error: "Solo un administrador o quien vinculó esta imagen puede quitarla de la galería" }, 403);
+        }
+        await env.DB.prepare("DELETE FROM match_gallery WHERE id = ?").bind(id).run();
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "desvincular_galeria_partido", entidad: "resultado", entidad_id: enlace.result_id,
+          descripcion: `Ha quitado una imagen de la galería del partido #${enlace.result_id}.`,
+        }));
+        return json({ ok: true });
+      }
+
       // ---------- ARTICLES: lista pública / creación ----------
       // ---------- Banner flotante de "última hora" (público) ----------
       // Ver el comentario gemelo en worker/src/index.js.
@@ -6999,6 +7250,9 @@ async function handlePrimary(request, env, ctx) {
       if (desactivarBannerMatch && method === "DELETE") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede gestionar el banner de última hora" }, 403);
+        }
         const id = parseInt(desactivarBannerMatch[1], 10);
         const articulo = await env.DB.prepare("SELECT autor_id, coautor_id FROM articles WHERE id = ?").bind(id).first();
         if (!articulo) return json({ error: "Noticia no encontrada" }, 404);
@@ -7042,8 +7296,11 @@ async function handlePrimary(request, env, ctx) {
         if (admin) {
           // La vista "admin" incluye borradores no publicados, así que
           // exige un token válido; si no lo hay, se trata como pública.
+          // Un fotógrafo tampoco tiene acceso a este listado editorial
+          // (no gestiona noticias/crónicas/artículos), así que para él
+          // también se degrada a la vista pública.
           const payload = await requireAuth(request, env);
-          if (!payload) admin = false;
+          if (!payload || !puedeGestionarContenidoEditorial(payload)) admin = false;
         }
 
         // Columnas necesarias para tarjetas/listados. Se mantiene
@@ -7118,6 +7375,9 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/articles" && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede crear noticias, crónicas ni artículos" }, 403);
+        }
         const body = await request.json();
         if (!body.titulo || !body.contenido) return json({ error: "Faltan campos obligatorios" }, 400);
 
@@ -7430,6 +7690,31 @@ async function handlePrimary(request, env, ctx) {
           ? await obtenerAlineaciones(env, "result_id", article.resultado_id)
           : await obtenerAlineaciones(env, "article_id", article.id);
 
+        // Fase 14: galería de fotos del fotógrafo vinculada a esta noticia
+        // (tabla puente article_media). Mismo criterio que en el worker
+        // principal, para que ambos devuelvan la misma respuesta pública.
+        if (article.id) {
+          const { results: mediaArticulo } = await env.DB.prepare(
+            `SELECT am.orden, m.id AS media_id, m.cloudinary_url, m.descripcion,
+                    m.tipo, m.autor_id, m.autor_nombre
+             FROM article_media am
+             JOIN media m ON m.id = am.media_id
+             WHERE am.article_id = ?
+             ORDER BY am.orden ASC`
+          ).bind(article.id).all();
+          article.galeria_fotografo = (mediaArticulo || [])
+            .filter((m) => m.tipo !== "video")
+            .map((m) => ({
+              url: m.cloudinary_url,
+              foco: "50% 50%",
+              credito: m.autor_nombre || null,
+              autor_id: m.autor_id || null,
+              descripcion: m.descripcion || null,
+            }));
+        } else {
+          article.galeria_fotografo = [];
+        }
+
         return json({ article });
       }
 
@@ -7543,6 +7828,9 @@ async function handlePrimary(request, env, ctx) {
       if (articleMatch && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede editar noticias, crónicas ni artículos" }, 403);
+        }
         const id = parseInt(articleMatch[1]);
 
         // Solo el autor (o coautor, o un admin, o alguien con una
@@ -7832,6 +8120,9 @@ async function handlePrimary(request, env, ctx) {
       if (articleMatch && method === "DELETE") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede borrar noticias, crónicas ni artículos" }, 403);
+        }
         const id = parseInt(articleMatch[1]);
         const articuloBorrado = await env.DB.prepare("SELECT titulo, autor_id, coautor_id FROM articles WHERE id = ?").bind(id).first();
         if (!articuloBorrado) return json({ error: "Noticia no encontrada" }, 404);
@@ -7884,6 +8175,9 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/edit-requests" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no gestiona solicitudes de edición de contenido" }, 403);
+        }
         // Sin filtro: un admin ve todas. Un redactor ve solo las que ha
         // hecho él, o las que le tocaría aprobar (porque es el autor
         // original de la entidad en cuestión).
@@ -7976,6 +8270,9 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/edit-requests" && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede solicitar edición de contenido editorial" }, 403);
+        }
         const body = await request.json();
         const tipoEntidad = body.tipo_entidad === "resultado" ? "resultado" : "articulo";
         const entidadId = parseInt(body.entidad_id, 10);
@@ -9780,6 +10077,9 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/results" && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede crear resultados" }, 403);
+        }
         const body = await request.json();
         if (body.estado && !ESTADOS_RESULTADO_VALIDOS.includes(body.estado)) {
           return json({ error: "Estado no válido" }, 400);
@@ -9895,6 +10195,9 @@ async function handlePrimary(request, env, ctx) {
       if (resultMatch && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede editar resultados" }, 403);
+        }
         const id = parseInt(resultMatch[1]);
         const resultadoParaPermiso = await env.DB.prepare("SELECT autor_id FROM results WHERE id = ?").bind(id).first();
         if (!resultadoParaPermiso) return json({ error: "Resultado no encontrado" }, 404);
@@ -10004,6 +10307,9 @@ async function handlePrimary(request, env, ctx) {
       if (resultMatch && method === "DELETE") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede eliminar resultados" }, 403);
+        }
         const id = parseInt(resultMatch[1]);
         const resultadoBorrado = await env.DB.prepare("SELECT autor_id FROM results WHERE id = ?").bind(id).first();
         if (!resultadoBorrado) return json({ error: "Resultado no encontrado" }, 404);
@@ -10046,6 +10352,9 @@ async function handlePrimary(request, env, ctx) {
       if (resultMvpMatch && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede marcar el MVP de un partido" }, 403);
+        }
         const id = parseInt(resultMvpMatch[1]);
         const resultado = await env.DB.prepare("SELECT autor_id, equipo_local, equipo_visitante FROM results WHERE id = ?").bind(id).first();
         if (!resultado) return json({ error: "Resultado no encontrado" }, 404);
@@ -10097,6 +10406,9 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/alineaciones" && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede gestionar alineaciones" }, 403);
+        }
         const body = await request.json();
         const articleId = body.article_id ? parseInt(body.article_id, 10) : null;
         const resultId = body.result_id ? parseInt(body.result_id, 10) : null;
@@ -10142,6 +10454,9 @@ async function handlePrimary(request, env, ctx) {
       if (alineacionMatch && (method === "PUT" || method === "DELETE")) {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede gestionar alineaciones" }, 403);
+        }
         const id = parseInt(alineacionMatch[1]);
         const alineacion = await env.DB.prepare("SELECT * FROM alineaciones WHERE id = ?").bind(id).first();
         if (!alineacion) return json({ error: "Alineación no encontrada" }, 404);
@@ -10203,6 +10518,9 @@ async function handlePrimary(request, env, ctx) {
       if (cronometroMatch && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede gestionar el cronómetro del minuto a minuto" }, 403);
+        }
         const resultadoId = parseInt(cronometroMatch[1]);
         const resultado = await env.DB.prepare("SELECT autor_id, fecha_partido FROM results WHERE id = ?").bind(resultadoId).first();
         if (!resultado) return json({ error: "Resultado no encontrado" }, 404);
@@ -10731,6 +11049,9 @@ async function handlePrimary(request, env, ctx) {
       if (eventosMatch && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede editar los eventos de un partido" }, 403);
+        }
         const resultadoId = parseInt(eventosMatch[1]);
         const resultado = await env.DB.prepare("SELECT autor_id FROM results WHERE id = ?").bind(resultadoId).first();
         if (!resultado) return json({ error: "Resultado no encontrado" }, 404);
@@ -10820,6 +11141,9 @@ async function handlePrimary(request, env, ctx) {
       if (eventoMatch && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede editar los eventos de un partido" }, 403);
+        }
         const resultadoId = parseInt(eventoMatch[1]);
         const eventoId = parseInt(eventoMatch[2]);
         const resultado = await env.DB.prepare("SELECT autor_id FROM results WHERE id = ?").bind(resultadoId).first();
@@ -10857,6 +11181,9 @@ async function handlePrimary(request, env, ctx) {
       if (eventoMatch && method === "DELETE") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede eliminar los eventos de un partido" }, 403);
+        }
         const resultadoId = parseInt(eventoMatch[1]);
         const eventoId = parseInt(eventoMatch[2]);
         const resultado = await env.DB.prepare("SELECT autor_id FROM results WHERE id = ?").bind(resultadoId).first();

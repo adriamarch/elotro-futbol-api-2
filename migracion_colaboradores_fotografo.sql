@@ -1,0 +1,33 @@
+-- Migración: sistema de COLABORADORES (redactor / fotógrafo / admin)
+--
+-- Contexto: hasta ahora "users.rol" solo admitía 'admin' o 'redactor'.
+-- A partir de esta migración se añade un tercer valor posible:
+-- 'fotografo'. Los tres roles pasan a llamarse conjuntamente
+-- "colaboradores" (un colaborador es redactor, fotógrafo o admin).
+--
+-- No hace falta tocar la estructura de la columna: "rol" ya era TEXT
+-- libre sin restricción CHECK, así que el valor 'fotografo' es válido
+-- para SQLite/D1 sin ningún ALTER TABLE. Esta migración documenta el
+-- cambio y sirve de punto de referencia para las fases siguientes
+-- (permisos en el backend, panel de administración, etc.).
+--
+-- Permisos previstos para 'fotografo' (se implementan en fases
+-- posteriores, esta migración NO cambia comportamiento):
+--   - Sin acceso a noticias, crónicas, artículos de opinión,
+--     entrevistas ni resultados (ni lectura de esas rutas de edición).
+--   - Acceso a gestión de galerías/imágenes de partido (tabla "media"
+--     y la futura tabla de galería de partido).
+--
+-- Ejecutar SOLO si la base de datos ya existía antes de este cambio
+-- (si es una base de datos nueva, usa schema.sql directamente, que ya
+-- incluye el comentario actualizado).
+--
+-- Ejemplo de ejecución con wrangler:
+--   wrangler d1 execute elotrofutbol --remote --file=./migracion_colaboradores_fotografo.sql
+
+-- No se modifican filas existentes: todo colaborador actual sigue
+-- siendo 'admin' o 'redactor' exactamente como estaba. Esta migración
+-- es puramente documental / de referencia (no-op en datos), dejada
+-- aquí para que quede registrada en el historial de migraciones igual
+-- que el resto de cambios del proyecto.
+SELECT 1;

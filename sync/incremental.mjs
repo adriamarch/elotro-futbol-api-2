@@ -218,7 +218,16 @@ async function sincronizarTabla(client, tableConfig, { runId }) {
             columnasUtilizables = Object.keys(pagina[0]).filter((c) => columnasPG.includes(c));
             const faltanEnPG = Object.keys(pagina[0]).filter((c) => !columnasPG.includes(c));
             if (faltanEnPG.length > 0) {
-              detalle.errors.push(`Columnas D1 sin equivalente en PG: ${faltanEnPG.join(", ")}`);
+              const motivo = `Columnas D1 sin equivalente en PG: ${faltanEnPG.join(", ")}`;
+              detalle.errors.push(motivo);
+              // Antes esto solo quedaba en detalle.errors (guardado en
+              // sync_runs.detail vía registrarFin) y nunca se imprimía por
+              // consola: en los logs de Railway la tabla desaparecía en
+              // silencio entre "leyendo D1 por páginas..." y la siguiente
+              // tabla, sin ninguna pista de qué había fallado ni de que
+              // había fallado. Ver migración 029_results_slug.sql para un
+              // caso real que costó bastante diagnosticar por este motivo.
+              console.error(`[${name}] ERROR: ${motivo}. Faltan por crear en PostgreSQL (ALTER TABLE ${name} ADD COLUMN ...). Se aborta esta tabla en esta pasada.`);
               erroresColumnas = true;
               return; // ejecutarD1Paginado sigue pidiendo páginas; se corta abajo con el flag
             }
@@ -290,7 +299,10 @@ async function sincronizarTabla(client, tableConfig, { runId }) {
       return detalle;
     }
 
-    if (erroresColumnas) return detalle;
+    if (erroresColumnas) {
+      console.log(`[${name}] fin: insertados=${detalle.inserted} actualizados=${detalle.updated} borrados=${detalle.deleted} errores=${detalle.errors.length} (abortada por columnas faltantes en PG)`);
+      return detalle;
+    }
 
     console.log(`[${name}] D1: ${totalFilas} registros`);
 

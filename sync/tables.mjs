@@ -73,6 +73,25 @@ export const TABLES = [
     deleteDetection: true, // se puede borrar media desde el panel
   },
   {
+    // Galería de partido: vincula "media" con "results" (Bloque B,
+    // Fase 9 del plan de colaboradores/fotógrafo). Es puramente
+    // "insert-only" desde el punto de vista de sus propias columnas
+    // (no tiene updated_at ni se edita una fila existente, solo se
+    // crea o se borra el enlace), así que changeStrategy "immutable"
+    // con created_at como cursor, igual que "media". Puede perder
+    // filas por ON DELETE CASCADE desde DOS padres distintos (results
+    // o media), no solo uno, así que deleteDetection (comparación de
+    // IDs) en vez de cascadeDeleteFrom -mismo caso que "porras" más
+    // abajo-. Requiere la tabla creada en Postgres por la migración
+    // db/migrations/027_match_gallery.sql.
+    name: "match_gallery",
+    pk: ["id"],
+    order: 5.5,
+    changeStrategy: "immutable",
+    cursorColumn: "created_at",
+    deleteDetection: true,
+  },
+  {
     name: "custom_clubs",
     pk: ["id"],
     order: 6,

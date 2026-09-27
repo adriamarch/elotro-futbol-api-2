@@ -12,7 +12,7 @@ CREATE TABLE users (
   password_hash TEXT NOT NULL,
   salt TEXT NOT NULL,
   nombre TEXT NOT NULL,
-  rol TEXT NOT NULL DEFAULT 'redactor', -- 'admin' o 'redactor'
+  rol TEXT NOT NULL DEFAULT 'redactor', -- 'admin', 'redactor' o 'fotografo' (colaborador; ver migracion_colaboradores_fotografo.sql)
   activo INTEGER NOT NULL DEFAULT 1,
   -- Correo electrónico del usuario. Se pide obligatoriamente la primera vez
   -- que inicia sesión (queda NULL hasta entonces) y sirve para poder
@@ -347,6 +347,26 @@ CREATE TABLE media (
 
 CREATE INDEX idx_media_created ON media(created_at);
 CREATE UNIQUE INDEX idx_media_hash_unico ON media(hash_archivo) WHERE hash_archivo IS NOT NULL;
+
+-- Galería de partido (ver migracion_match_gallery.sql / db/migrations/
+-- 027_match_gallery.sql para el contexto completo y el porqué del
+-- diseño como tabla puente en vez de una columna en "media"): vincula
+-- imágenes de "media" con un partido concreto de "results",
+-- permitiendo que una misma imagen pertenezca a varios partidos.
+CREATE TABLE match_gallery (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  result_id INTEGER NOT NULL,
+  media_id INTEGER NOT NULL,
+  orden INTEGER NOT NULL DEFAULT 0,
+  vinculado_por_id INTEGER,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (result_id) REFERENCES results(id) ON DELETE CASCADE,
+  FOREIGN KEY (media_id) REFERENCES media(id) ON DELETE CASCADE,
+  FOREIGN KEY (vinculado_por_id) REFERENCES users(id)
+);
+CREATE UNIQUE INDEX idx_match_gallery_unico ON match_gallery(result_id, media_id);
+CREATE INDEX idx_match_gallery_result ON match_gallery(result_id, orden);
+CREATE INDEX idx_match_gallery_media ON match_gallery(media_id);
 
 -- Sesiones activas por usuario (ver migracion_sesiones.sql para el
 -- detalle): permite listarlas y cerrarlas en remoto desde el panel,

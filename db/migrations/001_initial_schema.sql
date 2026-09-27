@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash TEXT NOT NULL,
   salt TEXT NOT NULL,
   nombre TEXT NOT NULL,
-  rol TEXT NOT NULL DEFAULT 'redactor', -- 'admin' o 'redactor'
+  rol TEXT NOT NULL DEFAULT 'redactor', -- 'admin', 'redactor' o 'fotografo' (colaborador; ver migracion_colaboradores_fotografo.sql)
   activo INTEGER NOT NULL DEFAULT 1,
   -- Correo electrónico del usuario. Se pide obligatoriamente la primera vez
   -- que inicia sesión (queda NULL hasta entonces) y sirve para poder
