@@ -6910,6 +6910,9 @@ async function handlePrimary(request, env, ctx) {
         const titulo = (form.get("titulo") || "").toString().trim();
         const descripcion = (form.get("descripcion") || "").toString().trim();
         const club = (form.get("club") || "").toString().trim();
+        // avisoLote=1: esta subida forma parte de una tanda; el correo se manda
+        // UNA vez al final (POST /api/media/aviso-lote), no uno por archivo.
+        const avisoEnLote = (form.get("avisoLote") || "").toString() === "1";
         // portadaSegundo: instante (en segundos) del vídeo elegido en el
         // navegador como fotograma de portada, si se eligió alguno antes
         // de subir (ver "Elegir portada" en Subir contenido). Solo tiene
@@ -7044,20 +7047,22 @@ async function handlePrimary(request, env, ctx) {
           }
         }
 
-        ctx.waitUntil(enviarEmailNotificacion(env, {
-          asunto: `Nuevo ${esFoto ? "foto" : "vídeo"} subido: ${titulo}`,
-          texto: `${payload.nombre} ha subido "${titulo}" (${esFoto ? "foto" : "vídeo"}) a ELOTROFÚTBOLTV.${club ? `\nClub: ${club}` : ""}${descripcion ? `\nDescripción: ${descripcion}` : ""}\n\nEntra en el panel de administración para verlo y descargarlo.`,
-          html: plantillaEmail({
-            etiqueta: `Nuevo ${esFoto ? "foto" : "vídeo"}`,
-            titulo,
-            parrafo: descripcion || null,
-            filas: [
-              { etiqueta: "Subido por", valor: payload.nombre },
-              { etiqueta: "Club", valor: club },
-            ],
-            boton: { texto: "Ver en el panel", url: `${SITIO_URL}/admin/panel.html` },
-          }),
-        }));
+        if (!avisoEnLote) {
+          ctx.waitUntil(enviarEmailNotificacion(env, {
+            asunto: `Nuevo ${esFoto ? "foto" : "vídeo"} subido: ${titulo}`,
+            texto: `${payload.nombre} ha subido "${titulo}" (${esFoto ? "foto" : "vídeo"}) a ELOTROFÚTBOLTV.${club ? `\nClub: ${club}` : ""}${descripcion ? `\nDescripción: ${descripcion}` : ""}\n\nEntra en el panel de administración para verlo y descargarlo.`,
+            html: plantillaEmail({
+              etiqueta: `Nuevo ${esFoto ? "foto" : "vídeo"}`,
+              titulo,
+              parrafo: descripcion || null,
+              filas: [
+                { etiqueta: "Subido por", valor: payload.nombre },
+                { etiqueta: "Club", valor: club },
+              ],
+              boton: { texto: "Ver en el panel", url: `${SITIO_URL}/admin/panel.html` },
+            }),
+          }));
+        }
 
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "subir_media", entidad: "media", entidad_id: subida.publicId,
@@ -7086,6 +7091,50 @@ async function handlePrimary(request, env, ctx) {
           if (err.esValidacion) return json({ error: err.message }, 400);
           return json({ error: "No se pudo subir la imagen", detail: err.message }, 502);
         }
+      }
+
+      // ---------- AVISO POR CORREO DE UNA TANDA DE SUBIDAS ----------
+      // Cuando se suben varios archivos a la vez, el panel marca cada subida
+      // con avisoLote=1 (ver POST /api/media: en ese caso NO manda correo por
+      // archivo) y, al terminar la tanda, llama aquí UNA sola vez con el
+      // resumen. Así 80 fotos = 1 correo de Resend, no 80. Los datos del
+      // resumen los manda el panel (quien llama ya está autenticado como
+      // colaborador): se limitan y se escapan al pintar el correo.
+      if (path === "/api/media/aviso-lote" && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+
+        let datos;
+        try { datos = await request.json(); } catch { return json({ error: "Cuerpo inválido" }, 400); }
+        const aEntero = (v) => Math.max(0, Math.min(1000, parseInt(v, 10) || 0));
+        const fotos = aEntero(datos?.fotos);
+        const videos = aEntero(datos?.videos);
+        if (fotos + videos === 0) return json({ ok: true, enviado: false });
+        const tituloLote = String(datos?.titulo || "").trim().slice(0, 150);
+        const clubLote = String(datos?.club || "").trim().slice(0, 100);
+        const descripcionLote = String(datos?.descripcion || "").trim().slice(0, 300);
+
+        const partes = [];
+        if (fotos) partes.push(`${fotos} ${fotos === 1 ? "foto" : "fotos"}`);
+        if (videos) partes.push(`${videos} ${videos === 1 ? "vídeo" : "vídeos"}`);
+        const resumen = partes.join(" y ");
+
+        ctx.waitUntil(enviarEmailNotificacion(env, {
+          asunto: `Nuevas subidas: ${resumen}${tituloLote ? ` (${tituloLote})` : ""}`,
+          texto: `${payload.nombre} ha subido ${resumen} a ELOTROFÚTBOLTV.${tituloLote ? `\nTítulo: ${tituloLote}` : ""}${clubLote ? `\nClub: ${clubLote}` : ""}${descripcionLote ? `\nDescripción: ${descripcionLote}` : ""}\n\nEntra en el panel de administración para verlos y descargarlos.`,
+          html: plantillaEmail({
+            etiqueta: "Nuevas subidas",
+            titulo: `${resumen} subidas`,
+            parrafo: descripcionLote || null,
+            filas: [
+              { etiqueta: "Subido por", valor: payload.nombre },
+              { etiqueta: "Título", valor: tituloLote },
+              { etiqueta: "Club", valor: clubLote },
+            ],
+            boton: { texto: "Ver en el panel", url: `${SITIO_URL}/admin/panel.html` },
+          }),
+        }));
+        return json({ ok: true, enviado: true });
       }
 
       const mediaMatch = path.match(/^\/api\/media\/(\d+)$/);

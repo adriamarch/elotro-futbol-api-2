@@ -47,6 +47,9 @@ const RUTAS_EXCLUIDAS = new Set([
   // escrituras SQL. No tiene body de negocio reproducible: encolarlo
   // solo generaría entradas basura en pending_writes.
   "/api/internal/cron-respaldo",
+  // Solo manda un correo resumen de una tanda de subidas: reproducirlo
+  // contra D1 al recuperarse enviaría el mismo correo por segunda vez.
+  "/api/media/aviso-lote",
 ]);
 
 export function debeEncolarse(method, path) {
