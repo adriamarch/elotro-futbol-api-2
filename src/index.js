@@ -1017,12 +1017,78 @@ function urlNoticia(categoria, slug) {
   return `${SITIO_URL}/futbol/${categoriaUrlSlug(categoria)}/${encodeURIComponent(slug)}`;
 }
 
+// ---------- Cuentas de Resend: principal + secundaria (respaldo) ----------
+// El plan gratis de Resend tiene un tope diario/mensual de correos. Cuando
+// la cuenta principal se queda sin cupo (o falla), los envíos pasan solos a
+// una segunda cuenta de Resend. La secundaria es OPCIONAL: sin
+// RESEND_API_KEY_2 todo funciona exactamente como antes.
+//   Principal:   RESEND_API_KEY    (+ RESEND_FROM   opcional)
+//   Secundaria:  RESEND_API_KEY_2  (+ RESEND_FROM_2 opcional)
+// OJO: un dominio solo puede estar activo en UNA cuenta de Resend a la vez,
+// así que el remitente de la secundaria (RESEND_FROM_2) tiene que usar otro
+// dominio/subdominio verificado en esa cuenta (p. ej. mail2.elotrofutbol.media).
+const REMITENTE_RESEND_POR_DEFECTO = "ELOTROFÚTBOLTV <notificaciones@elotrofutbol.media>";
+// Si la principal responde "cupo agotado", durante un rato se salta directamente
+// a la secundaria (en vez de probar la principal en cada correo, p. ej. en el
+// boletín con muchos suscriptores). Solo vive mientras dure este isolate.
+let RESEND_PRINCIPAL_AGOTADA_HASTA = 0;
+
+function cuentasResend(env) {
+  const cuentas = [];
+  if (env.RESEND_API_KEY) {
+    cuentas.push({ clave: env.RESEND_API_KEY, from: env.RESEND_FROM || REMITENTE_RESEND_POR_DEFECTO });
+  }
+  if (env.RESEND_API_KEY_2) {
+    cuentas.push({ clave: env.RESEND_API_KEY_2, from: env.RESEND_FROM_2 || env.RESEND_FROM || REMITENTE_RESEND_POR_DEFECTO });
+  }
+  return cuentas;
+}
+
+// ¿El fallo es de LA CUENTA (sin cupo, límite de ritmo, clave rechazada,
+// dominio no verificado en esa cuenta o caída del servicio)? Entonces
+// merece la pena probar con la otra. Si el problema es el propio correo
+// (400/422: destinatario o datos inválidos) fallaría igual en la otra.
+function esFalloDeCuentaResend(status) {
+  return status === 401 || status === 403 || status === 429 || status >= 500;
+}
+
+// Envía un correo por Resend con respaldo automático. `payload` lleva
+// to/subject/text/html (el "from" lo pone cada cuenta). Devuelve la Response
+// de Resend (la de la última cuenta probada) o null si no hay ninguna cuenta
+// configurada; lanza el error de red solo si fallan todas las cuentas.
+async function enviarConResend(env, payload) {
+  const cuentas = cuentasResend(env);
+  if (!cuentas.length) return null;
+  const ahora = Date.now();
+  const candidatas = cuentas.length > 1 && ahora < RESEND_PRINCIPAL_AGOTADA_HASTA ? cuentas.slice(1) : cuentas;
+  for (let i = 0; i < candidatas.length; i++) {
+    const cuenta = candidatas[i];
+    const hayOtra = i < candidatas.length - 1;
+    try {
+      const resp = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${cuenta.clave}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ from: cuenta.from, ...payload }),
+      });
+      if (resp.ok || !hayOtra || !esFalloDeCuentaResend(resp.status)) return resp;
+      const cuerpo = await resp.clone().text();
+      if (cuenta === cuentas[0] && /quota_exceeded/i.test(cuerpo)) {
+        RESEND_PRINCIPAL_AGOTADA_HASTA = ahora + 30 * 60 * 1000; // 30 min
+      }
+      console.warn(`Resend: la cuenta con remitente "${cuenta.from}" no puede enviar (${resp.status}); se prueba con la siguiente. ${cuerpo}`);
+    } catch (err) {
+      if (!hayOtra) throw err;
+      console.warn(`Resend: error de red con la cuenta "${cuenta.from}" (${err.message}); se prueba con la siguiente`);
+    }
+  }
+}
+
 // Envía el boletín a todos los suscriptores activos vía Resend, en
 // lotes (la API de Resend admite varios destinatarios por llamada, pero
 // se agrupan en lotes moderados para no depender de un límite exacto
 // que pueda cambiar). Un fallo enviando un lote no interrumpe el resto.
 async function enviarBoletinALista(env, { destinatarios, articulos, clasificaciones = [], resultadosDestacados = [], encuestas = [] }) {
-  if (!env.RESEND_API_KEY) {
+  if (!cuentasResend(env).length) {
     console.log("RESEND_API_KEY no configurado: boletín semanal omitido");
     return;
   }
@@ -1037,18 +1103,10 @@ async function enviarBoletinALista(env, { destinatarios, articulos, clasificacio
       lote.map(async (s) => {
         const bajaUrl = `${API_URL}/api/newsletter/baja?token=${encodeURIComponent(s.baja_token)}`;
         try {
-          const resp = await fetch("https://api.resend.com/emails", {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${env.RESEND_API_KEY}`,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              from: env.RESEND_FROM || "ELOTROFÚTBOLTV <notificaciones@elotrofutbol.media>",
-              to: [s.email],
-              subject: "Tu resumen semanal de ELOTROFÚTBOLTV",
-              html: plantillaNewsletter({ articulos, bajaUrl, clasificaciones, resultadosDestacados, encuestas }),
-            }),
+          const resp = await enviarConResend(env, {
+            to: [s.email],
+            subject: "Tu resumen semanal de ELOTROFÚTBOLTV",
+            html: plantillaNewsletter({ articulos, bajaUrl, clasificaciones, resultadosDestacados, encuestas }),
           });
           if (!resp.ok) {
             console.log("Error enviando boletín a", s.email, resp.status, await resp.text());
@@ -1128,24 +1186,16 @@ async function enviarBoletinSemanalSiToca(env) {
 }
 
 async function enviarEmailNotificacion(env, { asunto, texto, html }, { destinatario } = {}) {
-  if (!env.RESEND_API_KEY) {
+  if (!cuentasResend(env).length) {
     console.log("RESEND_API_KEY no configurado: aviso por email omitido ->", asunto);
     return;
   }
   try {
-    const resp = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${env.RESEND_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        from: env.RESEND_FROM || "ELOTROFÚTBOLTV <notificaciones@elotrofutbol.media>",
-        to: [destinatario || EMAIL_NOTIFICACIONES],
-        subject: asunto,
-        text: texto,
-        html: html || undefined,
-      }),
+    const resp = await enviarConResend(env, {
+      to: [destinatario || EMAIL_NOTIFICACIONES],
+      subject: asunto,
+      text: texto,
+      html: html || undefined,
     });
     if (!resp.ok) {
       console.log("Error al enviar email de notificación:", resp.status, await resp.text());
@@ -1930,26 +1980,71 @@ function esUserAgentBot(userAgent) {
   return PATRONES_USER_AGENT_BOT.some((p) => ua.includes(p));
 }
 
-// Sube un archivo a Cloudinary sin ninguna transformación (se conserva la
-// calidad original). Devuelve { publicId, resourceType, url }.
-async function subirACloudinary(env, fileBytes, mimeType, nombreArchivo) {
+// ---------- Cuentas de Cloudinary: principal + secundaria (respaldo) ----------
+// El plan gratis de Cloudinary tiene un tope de créditos (almacenamiento +
+// ancho de banda + transformaciones). Cuando la cuenta principal se queda
+// sin cupo, las subidas nuevas pasan solas a una segunda cuenta de
+// Cloudinary. La secundaria es OPCIONAL: si no están sus tres variables,
+// todo funciona exactamente como antes con una sola cuenta.
+//   Principal:   CLOUDINARY_CLOUD_NAME   / CLOUDINARY_API_KEY   / CLOUDINARY_API_SECRET
+//   Secundaria:  CLOUDINARY_CLOUD_NAME_2 / CLOUDINARY_API_KEY_2 / CLOUDINARY_API_SECRET_2
+// Los archivos ya subidos NO se mueven: su URL guarda el cloud name de la
+// cuenta donde viven, así que se siguen viendo igual, y al borrar se
+// elige la cuenta correcta a partir de esa URL.
+function cuentasCloudinary(env) {
+  const cuentas = [];
+  if (env.CLOUDINARY_CLOUD_NAME && env.CLOUDINARY_API_KEY && env.CLOUDINARY_API_SECRET) {
+    cuentas.push({ cloudName: env.CLOUDINARY_CLOUD_NAME, apiKey: env.CLOUDINARY_API_KEY, apiSecret: env.CLOUDINARY_API_SECRET });
+  }
+  if (env.CLOUDINARY_CLOUD_NAME_2 && env.CLOUDINARY_API_KEY_2 && env.CLOUDINARY_API_SECRET_2) {
+    cuentas.push({ cloudName: env.CLOUDINARY_CLOUD_NAME_2, apiKey: env.CLOUDINARY_API_KEY_2, apiSecret: env.CLOUDINARY_API_SECRET_2 });
+  }
+  return cuentas;
+}
+
+// "https://res.cloudinary.com/<cloud_name>/image/upload/..." -> "<cloud_name>"
+function cloudNameDeUrlCloudinary(url) {
+  const m = /res\.cloudinary\.com\/([^\/]+)\//.exec(url || "");
+  return m ? m[1] : null;
+}
+
+// ¿Este fallo de Cloudinary se debe a que ESA CUENTA no puede aceptar más
+// (sin cupo, desactivada, credenciales rechazadas, límite de peticiones o
+// caída del servicio)? Si es así merece la pena probar con la otra cuenta.
+// Si el problema es el propio archivo (demasiado pesado, demasiados
+// megapíxeles, formato dañado...) NO: fallaría igual en la otra cuenta.
+function esFalloDeCuentaCloudinary(status, mensaje) {
+  if (status === undefined) return true; // error de red: no llegó a responder
+  if (status === 401 || status === 403 || status === 420 || status === 429 || status >= 500) return true;
+  const m = (mensaje || "").toLowerCase();
+  if (/file size|megapixel|pixel|dimension|resolution|maximum|too large|invalid|unsupported|corrupt/.test(m)) return false;
+  return /quota|credit|storage|disabled|blocked|suspended|usage|exceed|limit/.test(m);
+}
+
+// Sube un archivo a UNA cuenta concreta de Cloudinary sin ninguna
+// transformación (se conserva la calidad original).
+async function subirACloudinaryEnCuenta(cuenta, fileBytes, mimeType, nombreArchivo) {
   const timestamp = Math.floor(Date.now() / 1000);
-  const signature = await sha1Hex(`timestamp=${timestamp}${env.CLOUDINARY_API_SECRET}`);
+  const signature = await sha1Hex(`timestamp=${timestamp}${cuenta.apiSecret}`);
 
   const form = new FormData();
   form.append("file", new Blob([fileBytes], { type: mimeType }));
-  form.append("api_key", env.CLOUDINARY_API_KEY);
+  form.append("api_key", cuenta.apiKey);
   form.append("timestamp", timestamp.toString());
   form.append("signature", signature);
 
-  const resp = await fetch(`https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/auto/upload`, {
+  const resp = await fetch(`https://api.cloudinary.com/v1_1/${cuenta.cloudName}/auto/upload`, {
     method: "POST",
     body: form,
   });
   if (!resp.ok) {
     const cuerpoError = await resp.text();
-    console.error(`Cloudinary respondió ${resp.status} al subir "${nombreArchivo || "(sin nombre)"}" (${mimeType || "tipo desconocido"}): ${cuerpoError}`);
-    throw new Error(`Cloudinary (${resp.status}): ${cuerpoError}`);
+    console.error(`Cloudinary (${cuenta.cloudName}) respondió ${resp.status} al subir "${nombreArchivo || "(sin nombre)"}" (${mimeType || "tipo desconocido"}): ${cuerpoError}`);
+    const errCloudinary = new Error(`Cloudinary (${resp.status}): ${cuerpoError}`);
+    errCloudinary.cloudinaryStatus = resp.status;
+    // Mensaje legible que da Cloudinary (viene como {"error":{"message":"..."}}).
+    try { errCloudinary.cloudinaryMensaje = JSON.parse(cuerpoError)?.error?.message || null; } catch {}
+    throw errCloudinary;
   }
   const data = await resp.json();
   // HEIC/HEIF (formato por defecto de las fotos de iPhone) no lo renderiza
@@ -1968,7 +2063,28 @@ async function subirACloudinary(env, fileBytes, mimeType, nombreArchivo) {
     const i = url.indexOf(marca);
     if (i !== -1) url = url.slice(0, i + marca.length) + "f_auto,q_auto/" + url.slice(i + marca.length);
   }
-  return { publicId: data.public_id, resourceType: data.resource_type, url };
+  return { publicId: data.public_id, resourceType: data.resource_type, url, cloudName: cuenta.cloudName };
+}
+
+// Sube un archivo a Cloudinary. Prueba primero la cuenta principal y, si
+// esta no puede aceptarlo (sin espacio, desactivada, etc.), reintenta
+// automáticamente con la secundaria. Devuelve
+// { publicId, resourceType, url, cloudName }.
+async function subirACloudinary(env, fileBytes, mimeType, nombreArchivo) {
+  const cuentas = cuentasCloudinary(env);
+  if (!cuentas.length) throw new Error("Cloudinary no está configurado (faltan CLOUDINARY_CLOUD_NAME / API_KEY / API_SECRET)");
+  let ultimoError;
+  for (let i = 0; i < cuentas.length; i++) {
+    try {
+      return await subirACloudinaryEnCuenta(cuentas[i], fileBytes, mimeType, nombreArchivo);
+    } catch (err) {
+      ultimoError = err;
+      const hayOtraCuenta = i < cuentas.length - 1;
+      if (!hayOtraCuenta || !esFalloDeCuentaCloudinary(err.cloudinaryStatus, err.cloudinaryMensaje)) throw err;
+      console.warn(`Cloudinary: la cuenta "${cuentas[i].cloudName}" no puede aceptar la subida (${err.cloudinaryStatus ?? "sin respuesta"}); se prueba con la cuenta "${cuentas[i + 1].cloudName}"`);
+    }
+  }
+  throw ultimoError;
 }
 
 // ---------- Validación de archivos subidos (imágenes y vídeos) ----------
@@ -2064,20 +2180,29 @@ async function sha256Hex(arrayBuffer) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-async function borrarDeCloudinary(env, publicId, resourceType) {
-  const timestamp = Math.floor(Date.now() / 1000);
-  const signature = await sha1Hex(`public_id=${publicId}&timestamp=${timestamp}${env.CLOUDINARY_API_SECRET}`);
+async function borrarDeCloudinary(env, publicId, resourceType, cloudName) {
+  // Se borra en la cuenta donde vive el archivo (cloudName, sacado de su
+  // URL o de la propia subida). Si no se sabe cuál es, se prueba en todas:
+  // destroy en una cuenta que no lo tiene responde "not found" sin más.
+  const cuentas = cuentasCloudinary(env);
+  const candidatas = cloudName ? cuentas.filter((c) => c.cloudName === cloudName) : cuentas;
+  let respuesta = null;
+  for (const cuenta of candidatas) {
+    const timestamp = Math.floor(Date.now() / 1000);
+    const signature = await sha1Hex(`public_id=${publicId}&timestamp=${timestamp}${cuenta.apiSecret}`);
 
-  const form = new FormData();
-  form.append("public_id", publicId);
-  form.append("api_key", env.CLOUDINARY_API_KEY);
-  form.append("timestamp", timestamp.toString());
-  form.append("signature", signature);
+    const form = new FormData();
+    form.append("public_id", publicId);
+    form.append("api_key", cuenta.apiKey);
+    form.append("timestamp", timestamp.toString());
+    form.append("signature", signature);
 
-  return fetch(`https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/${resourceType}/destroy`, {
-    method: "POST",
-    body: form,
-  });
+    respuesta = await fetch(`https://api.cloudinary.com/v1_1/${cuenta.cloudName}/${resourceType}/destroy`, {
+      method: "POST",
+      body: form,
+    });
+  }
+  return respuesta;
 }
 
 // Posiciones válidas para cada foto (que no sea la portada, que siempre
@@ -6888,7 +7013,7 @@ async function handlePrimary(request, env, ctx) {
                 file.name, file.type, file.size, payload.uid, payload.nombre, club || null, hashArchivo
               ).run();
             } catch (err2) {
-              ctx.waitUntil(borrarDeCloudinary(env, subida.publicId, subida.resourceType));
+              ctx.waitUntil(borrarDeCloudinary(env, subida.publicId, subida.resourceType, subida.cloudName));
               return json({ error: "No se pudo guardar el archivo. Inténtalo de nuevo.", detail: err2.message }, 500);
             }
           } else if (esColumnaFaltante) {
@@ -6902,7 +7027,7 @@ async function handlePrimary(request, env, ctx) {
                 file.name, file.type, file.size, payload.uid, payload.nombre, club || null
               ).run();
             } catch (err2) {
-              ctx.waitUntil(borrarDeCloudinary(env, subida.publicId, subida.resourceType));
+              ctx.waitUntil(borrarDeCloudinary(env, subida.publicId, subida.resourceType, subida.cloudName));
               return json({ error: "No se pudo guardar el archivo. Inténtalo de nuevo.", detail: err2.message }, 500);
             }
           } else {
@@ -6911,7 +7036,7 @@ async function handlePrimary(request, env, ctx) {
           // de la base de datos rechaza la segunda, y aquí deshacemos lo
           // ya subido a Cloudinary para no dejar un archivo huérfano.
           const esDuplicadoBD = /unique/i.test(err.message || "");
-          ctx.waitUntil(borrarDeCloudinary(env, subida.publicId, subida.resourceType));
+          ctx.waitUntil(borrarDeCloudinary(env, subida.publicId, subida.resourceType, subida.cloudName));
           if (esDuplicadoBD) {
             return json({ error: "Este archivo ya se ha subido (se ha detectado justo ahora, puede que alguien lo subiera al mismo tiempo).", duplicado: true }, 409);
           }
@@ -7098,9 +7223,9 @@ async function handlePrimary(request, env, ctx) {
         if (!payload) return json({ error: "No autorizado" }, 401);
         if (payload.rol !== "admin") return json({ error: "Solo un administrador puede eliminar contenido" }, 403);
         const id = parseInt(mediaMatch[1]);
-        const registro = await env.DB.prepare("SELECT cloudinary_public_id, cloudinary_resource_type FROM media WHERE id = ?").bind(id).first();
+        const registro = await env.DB.prepare("SELECT cloudinary_public_id, cloudinary_resource_type, cloudinary_url FROM media WHERE id = ?").bind(id).first();
         if (!registro) return json({ error: "No encontrado" }, 404);
-        await borrarDeCloudinary(env, registro.cloudinary_public_id, registro.cloudinary_resource_type);
+        await borrarDeCloudinary(env, registro.cloudinary_public_id, registro.cloudinary_resource_type, cloudNameDeUrlCloudinary(registro.cloudinary_url));
         await env.DB.prepare("DELETE FROM media WHERE id = ?").bind(id).run();
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "eliminar_media", entidad: "media", entidad_id: id,

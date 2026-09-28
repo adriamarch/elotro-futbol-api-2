@@ -57,8 +57,26 @@ GOOGLE_CLIENT_ID = "129689993263-2dtd5uu2r2bgo9vooohkjc4ia4gu7mkb.apps.googleuse
 # wrangler secret put JWT_SECRET
 # wrangler secret put CLOUDINARY_API_KEY
 # wrangler secret put CLOUDINARY_API_SECRET
+
+# Cuenta SECUNDARIA de Cloudinary (opcional). Cuando la principal se queda
+# sin espacio/créditos, las subidas nuevas pasan solas a esta. Los archivos
+# ya subidos no se mueven. Para activarla, crea otra cuenta gratis en
+# cloudinary.com y ejecuta (dentro de worker/):
+#   wrangler secret put CLOUDINARY_CLOUD_NAME_2
+#   wrangler secret put CLOUDINARY_API_KEY_2
+#   wrangler secret put CLOUDINARY_API_SECRET_2
+# (en Railway: las mismas tres variables en el servicio). Sin ellas, todo
+# funciona como antes con una sola cuenta.
 #
 # Aviso por email a elotrofutbolmedio@gmail.com cada vez que se sube una
 # foto/vídeo o se publica una crónica/noticia. Usa Resend (resend.com,
 # tiene plan gratuito). Crea una cuenta, saca tu API key y ejecuta:
 # wrangler secret put RESEND_API_KEY
+# Cuenta SECUNDARIA de Resend (opcional). Cuando la principal se queda sin
+# cupo de correos, los envíos pasan solos a esta. Un dominio solo puede estar
+# activo en UNA cuenta de Resend, así que RESEND_FROM_2 debe usar otro
+# dominio/subdominio verificado en la cuenta secundaria. Para activarla:
+#   wrangler secret put RESEND_API_KEY_2
+#   wrangler secret put RESEND_FROM_2
+# (en Railway: RESEND_API_KEY_2 y RESEND_FROM_2 en el servicio). Sin ellas,
+# todo funciona como antes con una sola cuenta.

@@ -93,6 +93,13 @@ export async function encolarEscritura({ writeId: writeIdEntrante, method, path,
     }
     programarResumenSinWriteId();
   }
+  // Red de seguridad: un cuerpo con bytes 0x00 es binario (PostgreSQL no
+  // los admite en TEXT y fallaría con un error genérico). Se dice claro y
+  // no se intenta el INSERT.
+  if (typeof body === "string" && body.includes("\u0000")) {
+    console.error(`[pending-writes] ${method} ${path} no se encola: el cuerpo contiene bytes 0x00 (binario, no reproducible como JSON)`);
+    return null;
+  }
   try {
     await pool.query(
       `INSERT INTO pending_writes

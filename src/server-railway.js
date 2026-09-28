@@ -63,9 +63,18 @@ const env = {
   JWT_SECRET: process.env.JWT_SECRET,
   RESEND_API_KEY: process.env.RESEND_API_KEY,
   RESEND_FROM: process.env.RESEND_FROM,
+  // Cuenta secundaria de Resend (opcional): se usa solo cuando la principal
+  // se queda sin cupo. Ver cuentasResend() en src/index.js.
+  RESEND_API_KEY_2: process.env.RESEND_API_KEY_2,
+  RESEND_FROM_2: process.env.RESEND_FROM_2,
   CLOUDINARY_API_KEY: process.env.CLOUDINARY_API_KEY,
   CLOUDINARY_API_SECRET: process.env.CLOUDINARY_API_SECRET,
   CLOUDINARY_CLOUD_NAME: process.env.CLOUDINARY_CLOUD_NAME,
+  // Cuenta secundaria de Cloudinary (opcional): se usa solo cuando la
+  // principal se queda sin espacio. Ver cuentasCloudinary() en src/index.js.
+  CLOUDINARY_CLOUD_NAME_2: process.env.CLOUDINARY_CLOUD_NAME_2,
+  CLOUDINARY_API_KEY_2: process.env.CLOUDINARY_API_KEY_2,
+  CLOUDINARY_API_SECRET_2: process.env.CLOUDINARY_API_SECRET_2,
   // Client ID de OAuth de Google (login "Continuar con Google" de
   // lectores, ver /api/readers/google en src/index.js). Mismo valor que
   // GOOGLE_CLIENT_ID en worker/wrangler.toml.
@@ -284,7 +293,18 @@ app.all("*", async (c) => {
   // ANTES de pasarlo a handler.fetch (que también lo consume) -- de ahí el
   // clone(). Para el resto de peticiones (GET, o failover no confirmado)
   // no merece la pena el coste de leer y clonar el body sin necesidad.
-  const candidataAEncolar = esFailoverReal && debeEncolarse(method, path);
+  const escrituraDeFailover = esFailoverReal && debeEncolarse(method, path);
+  // La cola guarda el body como TEXTO y lo reproduce contra D1 como JSON
+  // (ver pending-writes.js y drainPendingWrites). Las subidas de archivos
+  // (multipart/form-data: /api/media, /api/subir-imagen) son binarias: al
+  // leerlas con .text() traen bytes 0x00 y PostgreSQL rechaza el INSERT
+  // ("invalid byte sequence for encoding UTF8: 0x00"); aunque cupieran,
+  // no se podrían reproducir como JSON. Por eso solo se encolan cuerpos de
+  // texto, y de paso no se lee en memoria un vídeo de decenas de MB.
+  const tipoContenidoEntrada = (c.req.header("Content-Type") || "").toLowerCase();
+  const cuerpoEsTexto = !tipoContenidoEntrada || /^(application\/(json|x-www-form-urlencoded)|text\/)/.test(tipoContenidoEntrada);
+  const candidataAEncolar = escrituraDeFailover && cuerpoEsTexto;
+  const escrituraBinariaSinCola = escrituraDeFailover && !cuerpoEsTexto;
   let bodyTexto = null;
   if (candidataAEncolar) {
     try {
@@ -313,6 +333,13 @@ app.all("*", async (c) => {
   if (writeId) requestConWriteId.headers.set("X-Write-Id", writeId);
 
   const response = await handler.fetch(requestConWriteId, env, ctx);
+
+  if (escrituraBinariaSinCola && response.status < 500) {
+    // No hay nada que reproducir en D1 (ver arriba), pero que no pase en
+    // silencio: este archivo/fila solo existe en Postgres hasta que se
+    // resuelva el failover, y la reconciliación de D1 puede no conservarla.
+    console.warn(`[pending-writes] ${method} ${path} (${tipoContenidoEntrada || "sin content-type"}) atendida en Railway durante failover pero NO encolada: el cuerpo es binario y no se puede reproducir contra D1. Revisar/volver a subir tras recuperar D1.`);
+  }
 
   // Solo en failover real (no en tráfico de prueba/curl directo a
   // Railway) se añade la cabecera de frescura de datos: es la
