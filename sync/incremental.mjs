@@ -46,6 +46,7 @@ import {
   reconciliarFilasPorOriginWriteId,
   desacoplarUsuarioHuerfano,
   desacoplarResultadoHuerfano,
+  sincronizarSecuencia,
 } from "./pg-writer.mjs";
 
 // Antes de borrar una fila huérfana (existe en Postgres pero ya no en D1)
@@ -168,7 +169,24 @@ async function hayEjecucionEnCurso(client) {
   return true;
 }
 
-async function sincronizarTabla(client, tableConfig, { runId }) {
+// Envuelve la sincronización de una tabla y, al terminar, adelanta su
+// secuencia autoincremental a MAX(id) (ver sincronizarSecuencia en
+// pg-writer.mjs): sin esto, los inserts sin id que hace Railway después
+// chocan con los ids copiados desde D1 ("duplicate key ... _pkey").
+// Un fallo aquí no invalida la sincronización de la tabla: se avisa y sigue.
+async function sincronizarTabla(client, tableConfig, opts) {
+  const detalle = await sincronizarTablaSinSecuencia(client, tableConfig, opts);
+  try {
+    if (tableConfig.pk && tableConfig.pk.length === 1) {
+      await sincronizarSecuencia(client, tableConfig.name, tableConfig.pk[0]);
+    }
+  } catch (error) {
+    console.warn(`[${tableConfig.name}] no se pudo sincronizar la secuencia: ${error.message}`);
+  }
+  return detalle;
+}
+
+async function sincronizarTablaSinSecuencia(client, tableConfig, { runId }) {
   const { name, pk, changeStrategy, cursorColumn, deleteDetection } = tableConfig;
 
   const detalle = { table: name, inserted: 0, updated: 0, deleted: 0, errors: [] };

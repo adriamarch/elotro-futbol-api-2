@@ -205,6 +205,34 @@ export async function obtenerIdsPostgresPaginado(client, table, primaryKeys, onP
   return totalFilas;
 }
 
+/**
+ * Adelanta la secuencia autoincremental de "table" hasta MAX(id) si se ha
+ * quedado por detrás. El sincronizador copia filas de D1 con su id
+ * explícito, y eso NO avanza la secuencia de Postgres: cuando después
+ * Railway inserta una fila sin id (failover, cron de respaldo...), la
+ * secuencia devuelve un id que ya existe y salta
+ * "duplicate key value violates unique constraint <tabla>_pkey"
+ * (visto en activity_log, match_events y readers). Nunca retrocede la
+ * secuencia ni borra filas. Si la columna no tiene secuencia (PK de texto,
+ * PK compuesta...) no hace nada.
+ */
+export async function sincronizarSecuencia(client, table, column = "id") {
+  const tabla = escaparIdentificador(table);
+  const col = escaparIdentificador(column);
+  const seq = await client.query(
+    `SELECT pg_get_serial_sequence($1, $2) AS seq;`,
+    [`public.${tabla}`, column]
+  );
+  const nombreSeq = seq.rows[0]?.seq;
+  if (!nombreSeq) return false;
+  await client.query(
+    `SELECT setval($1::regclass, GREATEST((SELECT COALESCE(MAX(${col}), 0) FROM public.${tabla}), 1), (SELECT COUNT(*) > 0 FROM public.${tabla}))
+     WHERE (SELECT COALESCE(MAX(${col}), 0) FROM public.${tabla}) >= (SELECT last_value FROM ${nombreSeq});`,
+    [nombreSeq]
+  );
+  return true;
+}
+
 export { escaparIdentificador };
 
 /**
