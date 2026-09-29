@@ -1023,7 +1023,7 @@ function urlNoticia(categoria, slug) {
 // una segunda cuenta de Resend. La secundaria es OPCIONAL: sin
 // RESEND_API_KEY_2 todo funciona exactamente como antes.
 //   Principal:   RESEND_API_KEY    (+ RESEND_FROM   opcional)
-//   Secundaria:  RESEND_API_KEY_2  (+ RESEND_FROM_2 opcional)
+//   Secundaria:  RESEND_API_KEY_2  + RESEND_FROM_2 (los DOS son obligatorios para activarla)
 // OJO: un dominio solo puede estar activo en UNA cuenta de Resend a la vez,
 // así que el remitente de la secundaria (RESEND_FROM_2) tiene que usar otro
 // dominio/subdominio verificado en esa cuenta (p. ej. mail2.elotrofutbol.media).
@@ -1033,13 +1033,21 @@ const REMITENTE_RESEND_POR_DEFECTO = "ELOTROFÚTBOLTV <notificaciones@elotrofutb
 // boletín con muchos suscriptores). Solo vive mientras dure este isolate.
 let RESEND_PRINCIPAL_AGOTADA_HASTA = 0;
 
+let AVISO_RESEND_SIN_FROM_2_MOSTRADO = false;
 function cuentasResend(env) {
   const cuentas = [];
   if (env.RESEND_API_KEY) {
     cuentas.push({ clave: env.RESEND_API_KEY, from: env.RESEND_FROM || REMITENTE_RESEND_POR_DEFECTO });
   }
-  if (env.RESEND_API_KEY_2) {
-    cuentas.push({ clave: env.RESEND_API_KEY_2, from: env.RESEND_FROM_2 || env.RESEND_FROM || REMITENTE_RESEND_POR_DEFECTO });
+  // La secundaria SOLO se activa si tiene su propio remitente (RESEND_FROM_2):
+  // como un dominio solo puede estar activo en una cuenta de Resend, si se
+  // reutilizase el remitente de la principal, la secundaria fallaría siempre
+  // con 403 (dominio no verificado en esa cuenta) y no serviría de respaldo.
+  if (env.RESEND_API_KEY_2 && env.RESEND_FROM_2) {
+    cuentas.push({ clave: env.RESEND_API_KEY_2, from: env.RESEND_FROM_2 });
+  } else if (env.RESEND_API_KEY_2 && !AVISO_RESEND_SIN_FROM_2_MOSTRADO) {
+    AVISO_RESEND_SIN_FROM_2_MOSTRADO = true;
+    console.warn("Resend: RESEND_API_KEY_2 está definida pero falta RESEND_FROM_2; la cuenta secundaria NO se usa (necesita un remitente de otro dominio verificado en esa cuenta)");
   }
   return cuentas;
 }
@@ -2017,8 +2025,12 @@ function esFalloDeCuentaCloudinary(status, mensaje) {
   if (status === undefined) return true; // error de red: no llegó a responder
   if (status === 401 || status === 403 || status === 420 || status === 429 || status >= 500) return true;
   const m = (mensaje || "").toLowerCase();
+  // Primero las señales claras de que la CUENTA no puede aceptar más (un
+  // mensaje tipo "Maximum storage exceeded" contiene "maximum" pero es de
+  // cuota, no del archivo), y solo después las del propio archivo.
+  if (/quota|credit|storage|disabled|blocked|suspended|usage/.test(m)) return true;
   if (/file size|megapixel|pixel|dimension|resolution|maximum|too large|invalid|unsupported|corrupt/.test(m)) return false;
-  return /quota|credit|storage|disabled|blocked|suspended|usage|exceed|limit/.test(m);
+  return /exceed|limit/.test(m);
 }
 
 // Sube un archivo a UNA cuenta concreta de Cloudinary sin ninguna
@@ -2185,7 +2197,12 @@ async function borrarDeCloudinary(env, publicId, resourceType, cloudName) {
   // URL o de la propia subida). Si no se sabe cuál es, se prueba en todas:
   // destroy en una cuenta que no lo tiene responde "not found" sin más.
   const cuentas = cuentasCloudinary(env);
-  const candidatas = cloudName ? cuentas.filter((c) => c.cloudName === cloudName) : cuentas;
+  const coincidentes = cloudName ? cuentas.filter((c) => c.cloudName === cloudName) : cuentas;
+  // Si este backend no tiene configurada la cuenta donde vive el archivo
+  // (p. ej. le faltan las variables _2), antes no se borraba nada y sin
+  // avisar; ahora se prueba en las que sí tiene (destroy en una cuenta que
+  // no lo tiene responde "not found" sin más).
+  const candidatas = coincidentes.length ? coincidentes : cuentas;
   let respuesta = null;
   for (const cuenta of candidatas) {
     const timestamp = Math.floor(Date.now() / 1000);
