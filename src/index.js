@@ -482,7 +482,10 @@ function paginaMantenimiento(horaHasta, desdeISO) {
 // una lista de datos clave (autor, club, etc.) y un botón de acción.
 // Todo con estilos en línea (tablas) porque así es como hay que maquetar
 // para que se vea bien en Gmail, Outlook, etc.
-function plantillaEmail({ etiqueta, titulo, filas = [], parrafo, boton }) {
+// bloqueHtml (opcional): HTML ya construido y ya escapado por quien llama
+// (p. ej. el resumen de partidos sin cubrir, agrupado por tipo). Se pinta
+// entre las filas y el botón, con el mismo ancho que el resto.
+function plantillaEmail({ etiqueta, titulo, filas = [], parrafo, boton, bloqueHtml }) {
   const filasHtml = filas
     .filter((f) => f && f.valor)
     .map(
@@ -532,6 +535,12 @@ function plantillaEmail({ etiqueta, titulo, filas = [], parrafo, boton }) {
               <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;background:#eef1f5;border-radius:8px;padding:14px 16px;">
                 ${filasHtml}
               </table>
+            </td>
+          </tr>` : ""}
+          ${bloqueHtml ? `
+          <tr>
+            <td style="padding:14px 28px 0;">
+              ${bloqueHtml}
             </td>
           </tr>` : ""}
           <tr>
@@ -2929,9 +2938,11 @@ async function crearFinPartidoAutomaticoAlMinuto90(env) {
 //
 // Dos situaciones se consideran "desatendido":
 //   1) El cronómetro sigue corriendo (no pausado) y ya ha superado el
-//      minuto UMBRAL_PRIMERA_PARTE_SIN_DESCANSO sin que exista un
-//      evento "descanso" registrado: la primera parte no dura tanto en
-//      ningún partido real, así que el reloj se ha "olvidado" corriendo.
+//      minuto UMBRAL_PRIMERA_PARTE_SIN_DESCANSO (o el
+//      UMBRAL_SEGUNDA_PARTE_SIN_FINAL, si ya va por la 2ª parte) sin que
+//      nadie haya pitado el descanso / el final. Entre el min. 55 y el
+//      100 el reloj corre con normalidad SOLO si ya se inició la 2ª
+//      parte (evento "fin_descanso"): ver evaluarSituacionDesatendida().
 //   2) El cronómetro está pausado en el descanso (evento "descanso" es
 //      el último evento de tipo pausa) desde hace más de
 //      UMBRAL_DESCANSO_SIN_REANUDAR minutos: el redactor no ha pulsado
@@ -3004,7 +3015,7 @@ async function marcarPartidosColgados(env, ctx) {
     idsColgados.push(partido.id);
 
     const nombrePartido = `${partido.equipo_local} - ${partido.equipo_visitante}`;
-    const enlacePanel = `${SITIO_URL}/admin/minuto-a-minuto.html?id=${partido.id}`;
+    const enlacePanel = `${SITIO_URL}/admin/panel.html?minuto_a_minuto=${partido.id}`;
     const motivo = `El cronómetro lleva corriendo sin parar desde hace más de ${Math.floor(minuto / 60 / 24)} días (minuto ${minuto}) sin que se haya registrado el final del partido. Se ha ocultado automáticamente de la web mientras se revisa.`;
 
     let destinatario = EMAIL_NOTIFICACIONES;
@@ -3063,6 +3074,140 @@ function minutoEnVivoServidor(resultado) {
   return Math.max(0, Math.floor((Date.now() - inicioMs) / 60000) + ajuste);
 }
 
+// ---------- Avisos de partidos sin cubrir: evaluación, validación y agrupación ----------
+//
+// Interpreta una fecha guardada en la BD como instante UTC (ms). Acepta
+// "YYYY-MM-DD HH:MM:SS" (D1), ISO con T/Z/offset y objetos Date (que es
+// lo que puede devolver el driver "pg" en Railway). Devuelve NaN si no
+// se entiende. Antes cada sitio hacía su propio new Date(String(x)
+// .replace(" ", "T") + "Z"), que con un objeto Date daba NaN en silencio.
+function fechaBdAMs(valor) {
+  if (valor instanceof Date) return valor.getTime();
+  if (valor === null || valor === undefined || valor === "") return NaN;
+  let raw = String(valor).trim();
+  if (!/[zZ]|[+-]\d\d:?\d\d$/.test(raw)) {
+    raw = raw.includes("T") ? raw + "Z" : raw.replace(" ", "T") + "Z";
+  }
+  return new Date(raw).getTime();
+}
+
+const NOMBRE_COMPETICION_AVISO = {
+  hypermotion: "LaLiga Hypermotion",
+  primera_federacion: "Primera Federación",
+  segunda_federacion: "Segunda Federación",
+};
+
+// Si se ha registrado un evento (gol, tarjeta, cambio...) hace menos de
+// estos minutos, el partido SÍ se está cubriendo aunque el reloj vaya
+// más allá de lo normal. Mismo margen que MAM_MINUTOS_ACTIVIDAD_RECIENTE
+// en public/admin/js/admin.js: el email y el "🔴 Sin cubrir" del panel
+// deben coincidir (antes el panel ya lo respetaba y el email no).
+const AVISOS_DESATENDIDOS_ACTIVIDAD_RECIENTE_MIN = 5;
+
+// Grupos del email, de más a menos grave. "corto" es la etiqueta que
+// se usa en el asunto.
+const AVISOS_DESATENDIDOS_GRUPOS = [
+  { tipo: "sin_final", emoji: "🔴", titulo: "Sin final del partido", corto: "sin final",
+    detalle: "El cronómetro sigue corriendo y nadie ha pulsado «Fin del partido»." },
+  { tipo: "sin_descanso", emoji: "🟠", titulo: "Sin descanso ni 2ª parte", corto: "sin descanso",
+    detalle: "El reloj ha pasado del minuto 45 sin que nadie pitara el descanso ni iniciara la 2ª parte." },
+  { tipo: "descanso_sin_reanudar", emoji: "⏸️", titulo: "Parados en el descanso", corto: "parados en el descanso",
+    detalle: "Nadie ha pulsado «Comienza la 2ª parte»." },
+  { tipo: "cerrado_auto", emoji: "⚫", titulo: "Cerrados automáticamente", corto: "cerrados por el sistema",
+    detalle: "El sistema los cerró solo: revisa el marcador y los eventos del tramo final." },
+];
+
+async function partidoTieneEvento(env, resultadoId, tipo) {
+  const fila = await env.DB.prepare(
+    "SELECT id FROM match_events WHERE resultado_id = ? AND tipo = ? LIMIT 1"
+  ).bind(resultadoId, tipo).first();
+  return !!fila;
+}
+
+async function partidoTieneActividadReciente(env, resultadoId) {
+  const fila = await env.DB.prepare(
+    "SELECT MAX(created_at) AS ultimo FROM match_events WHERE resultado_id = ?"
+  ).bind(resultadoId).first();
+  const ms = fechaBdAMs(fila && fila.ultimo);
+  if (!Number.isFinite(ms)) return false;
+  return (Date.now() - ms) / 60000 < AVISOS_DESATENDIDOS_ACTIVIDAD_RECIENTE_MIN;
+}
+
+// Decide si un partido "en_juego" está AHORA MISMO sin cubrir y de qué
+// tipo. Devuelve null si no lo está, o { tipo, mitad, motivo,
+// motivoCorto, minuto }. La usan tanto la detección (cada minuto) como
+// la validación justo antes de enviar el resumen, para que las dos
+// miren exactamente lo mismo.
+//
+// El cronómetro NO se reinicia en la 2ª parte: "Comienza la 2ª parte"
+// lo reanuda desde el minuto 45 (ver mamComenzarSegundaParte en
+// minuto-a-minuto.js) y registra un evento "fin_descanso". Por eso un
+// reloj corriendo entre el min. 55 y el 100 es lo NORMAL si ya hay
+// "fin_descanso" (2ª parte en marcha). Antes solo se miraba si existía
+// un evento "descanso", pero ese evento lo inserta también el cron solo
+// al llegar al minuto 45 (crearDescansoAutomaticoAlMinuto45), así que
+// casi todos los partidos, con o sin redactor delante, acababan
+// marcados como "sin final" hacia el minuto 55 de la 2ª parte. Ahora el
+// aviso "sin descanso" salta solo si pasa del minuto 55 SIN
+// "fin_descanso": nadie ha pausado el descanso ni iniciado la 2ª parte.
+//
+// omitirMitades (opcional): mitades ya avisadas. Si la situación que
+// tocaría evaluar pertenece a una de ellas se devuelve null sin gastar
+// consultas (el cron pasa por aquí cada minuto por cada partido en
+// juego; el envío del resumen no pasa esta lista y evalúa todo).
+async function evaluarSituacionDesatendida(env, partido, omitirMitades = []) {
+  const corriendo = partido.cronometro_pausado_en === null || partido.cronometro_pausado_en === undefined;
+  const minuto = minutoEnVivoServidor(partido);
+  let situacion = null;
+
+  if (corriendo && minuto >= UMBRAL_SEGUNDA_PARTE_SIN_FINAL) {
+    if (omitirMitades.includes("segunda")) return null;
+    situacion = {
+      tipo: "sin_final", mitad: "segunda",
+      motivo: `El cronómetro sigue corriendo y ya marca el minuto ${minuto} sin que se haya registrado el final del partido.`,
+      motivoCorto: `min. ${minuto} sin final`,
+    };
+  } else if (corriendo && minuto >= UMBRAL_PRIMERA_PARTE_SIN_DESCANSO) {
+    if (omitirMitades.includes("primera")) return null;
+    if (!(await partidoTieneEvento(env, partido.id, "fin_descanso"))) {
+      situacion = {
+        tipo: "sin_descanso", mitad: "primera",
+        motivo: `El cronómetro sigue corriendo y ya marca el minuto ${minuto} sin que nadie haya pausado el descanso ni iniciado la 2ª parte.`,
+        motivoCorto: `min. ${minuto} sin descanso`,
+      };
+    }
+  } else if (!corriendo) {
+    if (omitirMitades.includes("primera")) return null;
+    // Se incluye "fin_descanso" en la búsqueda: si lo último es que se
+    // inició la 2ª parte, un reloj pausado después ya no es "parado en
+    // el descanso" (antes se seguía contando desde el evento "descanso",
+    // que podía tener horas).
+    const ultimaPausa = await env.DB.prepare(
+      `SELECT tipo, created_at FROM match_events
+       WHERE resultado_id = ? AND tipo IN ('descanso', 'fin_descanso', 'pausa_hidratacion')
+       ORDER BY id DESC LIMIT 1`
+    ).bind(partido.id).first();
+    if (ultimaPausa && ultimaPausa.tipo === "descanso") {
+      const desdeMs = fechaBdAMs(ultimaPausa.created_at);
+      const minutosParado = Number.isFinite(desdeMs) ? Math.floor((Date.now() - desdeMs) / 60000) : 0;
+      if (minutosParado >= UMBRAL_DESCANSO_SIN_REANUDAR) {
+        situacion = {
+          tipo: "descanso_sin_reanudar",
+          // El descanso es la frontera entre mitades: se cuenta como
+          // aviso de la 1ª parte (es el cierre pendiente de esa mitad).
+          mitad: "primera",
+          motivo: `El partido lleva parado en el descanso ${minutosParado} minutos sin que se haya iniciado la 2ª parte.`,
+          motivoCorto: `${minutosParado} min parado en el descanso`,
+        };
+      }
+    }
+  }
+
+  if (!situacion) return null;
+  if (await partidoTieneActividadReciente(env, partido.id)) return null;
+  return { ...situacion, minuto };
+}
+
 // Lee la cola de avisos pendientes (tabla avisos_desatendidos_cola).
 // Devuelve siempre un array. encolado_ms se pasa por Number(): el driver
 // "pg" devuelve los BIGINT de Postgres como string (no como número, a
@@ -3073,7 +3218,7 @@ async function leerColaAvisosDesatendidos(env) {
     "SELECT resultado_id, partido, jornada, redactor, motivo_corto, encolado_ms FROM avisos_desatendidos_cola ORDER BY encolado_ms ASC"
   ).all();
   return (results || []).map((f) => ({
-    id: f.resultado_id,
+    id: Number(f.resultado_id),
     partido: f.partido,
     jornada: f.jornada,
     redactor: f.redactor,
@@ -3082,43 +3227,169 @@ async function leerColaAvisosDesatendidos(env) {
   }));
 }
 
-// Manda UN solo email con todos los partidos de la cola. Devuelve true
-// si había algo que enviar.
-async function enviarDigestAvisosDesatendidos(env, cola, motivoEnvio) {
-  if (!cola.length) return false;
+// Carga el estado ACTUAL de los partidos de la cola (en tandas de 90:
+// D1/SQLite admite como mucho 100 parámetros bind por consulta).
+async function cargarPartidosDeAvisos(env, ids) {
+  const mapa = new Map();
+  const TANDA = 90;
+  for (let inicio = 0; inicio < ids.length; inicio += TANDA) {
+    const tanda = ids.slice(inicio, inicio + TANDA);
+    const { results } = await env.DB.prepare(
+      `SELECT id, competicion, jornada, equipo_local, equipo_visitante, autor_nombre, estado, finalizado_no_cubierto,
+              inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos
+       FROM results WHERE id IN (${tanda.map(() => "?").join(",")})`
+    ).bind(...tanda).all();
+    for (const fila of results || []) mapa.set(Number(fila.id), fila);
+  }
+  return mapa;
+}
 
-  const visibles = cola.slice(0, AVISOS_DESATENDIDOS_MAX_FILAS_EMAIL);
-  const ocultos = cola.length - visibles.length;
-  const enlaceLista = `${SITIO_URL}/admin/resultados.html`;
+// Los avisos esperan en la cola hasta 30 minutos: en ese rato el
+// redactor puede haber retomado el partido, haberlo cerrado o haber
+// vuelto a meter eventos. Justo antes de enviar se vuelve a mirar cada
+// partido y solo pasan los que SIGUEN sin cubrir, ya clasificados por
+// tipo y con el minuto actual (no el de hace media hora):
+//   - en_juego y todavía desatendido -> su tipo actual
+//   - finalizado por el cron (finalizado_no_cubierto) -> "cerrado_auto"
+//   - cualquier otra cosa (resuelto, cerrado a mano, oculto por
+//     'colgado' -que ya manda su propio email urgente-, borrado) -> se
+//     descarta.
+async function validarAvisosDesatendidos(env, cola) {
+  const filas = await cargarPartidosDeAvisos(env, cola.map((a) => a.id));
+  const vigentes = [];
+  for (const aviso of cola) {
+    const p = filas.get(aviso.id);
+    if (!p) continue;
 
-  const filas = visibles.map((a) => ({
-    etiqueta: `Jornada ${a.jornada}`,
-    valor: `${a.partido} — ${a.redactor || "sin asignar"} (${a.motivoCorto})`,
-  }));
-  if (ocultos > 0) filas.push({ etiqueta: "…", valor: `y ${ocultos} partidos más (revisa el panel)` });
+    let tipo = null;
+    let motivoCorto = null;
+    if (p.estado === "en_juego") {
+      const situacion = await evaluarSituacionDesatendida(env, p);
+      if (!situacion) continue;
+      tipo = situacion.tipo;
+      motivoCorto = situacion.motivoCorto;
+    } else if (p.estado === "finalizado" && (p.finalizado_no_cubierto === true || Number(p.finalizado_no_cubierto) === 1)) {
+      tipo = "cerrado_auto";
+      motivoCorto = "cerrado por el sistema";
+    } else {
+      continue;
+    }
 
-  const titulo = cola.length === 1
-    ? "1 partido posiblemente sin cubrir"
-    : `${cola.length} partidos posiblemente sin cubrir`;
+    vigentes.push({
+      id: aviso.id,
+      tipo,
+      motivoCorto,
+      partido: `${p.equipo_local} - ${p.equipo_visitante}`,
+      competicion: NOMBRE_COMPETICION_AVISO[p.competicion] || p.competicion || "",
+      jornada: p.jornada,
+      redactor: p.autor_nombre || aviso.redactor || null,
+    });
+  }
+  return vigentes;
+}
+
+// Agrupa por tipo (de más a menos grave) y, dentro de cada tipo, por
+// redactor (los "sin asignar" al final) y jornada.
+function agruparAvisosDesatendidos(avisos) {
+  const comparar = (a, b) => {
+    const sinA = a.redactor ? 0 : 1;
+    const sinB = b.redactor ? 0 : 1;
+    if (sinA !== sinB) return sinA - sinB;
+    const porRedactor = String(a.redactor || "").localeCompare(String(b.redactor || ""), "es");
+    if (porRedactor) return porRedactor;
+    const porJornada = (Number(a.jornada) || 0) - (Number(b.jornada) || 0);
+    if (porJornada) return porJornada;
+    return String(a.partido).localeCompare(String(b.partido), "es");
+  };
+  return AVISOS_DESATENDIDOS_GRUPOS
+    .map((g) => ({ ...g, items: avisos.filter((a) => a.tipo === g.tipo).sort(comparar) }))
+    .filter((g) => g.items.length > 0);
+}
+
+function detalleAvisoDesatendido(a) {
+  return [a.competicion, a.jornada ? `J${a.jornada}` : "", a.redactor || "Sin asignar", a.motivoCorto]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+// Construye asunto, texto y HTML del resumen ya agrupado.
+function construirDigestAvisosDesatendidos(grupos, motivoEnvio) {
+  const total = grupos.reduce((n, g) => n + g.items.length, 0);
+  const urlLista = `${SITIO_URL}/admin/panel.html?ir=resultados.lista&sin_cubrir=1`;
+  const urlPartido = (id) => `${SITIO_URL}/admin/panel.html?minuto_a_minuto=${id}`;
+
+  // Tope de filas listadas entre TODOS los grupos (los más graves
+  // primero); el resto se resume con "y N más" en su grupo.
+  let restantes = AVISOS_DESATENDIDOS_MAX_FILAS_EMAIL;
+  const visibles = grupos.map((g) => {
+    const mostrados = g.items.slice(0, Math.max(0, restantes));
+    restantes -= mostrados.length;
+    return { ...g, mostrados, ocultos: g.items.length - mostrados.length };
+  });
+
+  const porRedactor = new Map();
+  for (const g of grupos) {
+    for (const a of g.items) {
+      const nombre = a.redactor || "Sin asignar";
+      porRedactor.set(nombre, (porRedactor.get(nombre) || 0) + 1);
+    }
+  }
+  const resumenRedactores = [...porRedactor.entries()]
+    .sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0]), "es"))
+    .map(([nombre, n]) => `${nombre} (${n})`)
+    .join(", ");
+
+  const desglose = grupos.map((g) => `${g.items.length} ${g.corto}`).join(", ");
+  const asunto = `⚠️ ${total} ${total === 1 ? "partido" : "partidos"} sin cubrir: ${desglose}`;
+  const titulo = total === 1 ? "1 partido sin cubrir" : `${total} partidos sin cubrir`;
   const parrafo = motivoEnvio === "lote"
-    ? `Se han acumulado ${cola.length} partidos en los que el cronómetro parece desatendido.`
-    : `Estos partidos llevan un rato con el cronómetro desatendido y siguen sin resolverse.`;
+    ? `Se han acumulado ${total} partidos que parecen desatendidos. Solo se listan los que siguen sin resolverse ahora mismo.`
+    : `Estos partidos llevan un rato desatendidos y siguen sin resolverse.`;
 
-  const lineasTexto = visibles
-    .map((a) => `- ${a.partido} (jornada ${a.jornada}) — ${a.redactor || "sin asignar"}: ${a.motivoCorto}\n  ${SITIO_URL}/admin/minuto-a-minuto.html?id=${a.id}`)
-    .join("\n");
+  const texto = [
+    parrafo,
+    total > 1 ? `Por redactor: ${resumenRedactores}` : "",
+    ...visibles.map((g) => [
+      `${g.emoji} ${g.titulo.toUpperCase()} (${g.items.length})`,
+      ...g.mostrados.map((a) => `- ${a.partido} · ${detalleAvisoDesatendido(a)}\n  ${urlPartido(a.id)}`),
+      g.ocultos > 0 ? `  …y ${g.ocultos} más de este grupo.` : "",
+    ].filter(Boolean).join("\n")),
+    `Ver todos en el panel: ${urlLista}`,
+  ].filter(Boolean).join("\n\n");
 
-  await enviarEmailNotificacion(env, {
-    asunto: `⚠️ ${titulo}`,
-    texto: `${parrafo}\n\n${lineasTexto}${ocultos > 0 ? `\n\n…y ${ocultos} partidos más.` : ""}\n\nRevisa el panel: ${enlaceLista}`,
-    html: plantillaEmail({
-      etiqueta: "Aviso automático",
-      titulo,
-      parrafo,
-      filas,
-      boton: { texto: "Abrir el panel", url: enlaceLista },
-    }),
-  }, { destinatario: EMAIL_NOTIFICACIONES });
+  const seccionesHtml = visibles.map((g) => `
+    <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;margin:0 0 14px;background:#eef1f5;border-radius:8px;padding:12px 16px;">
+      <tr><td style="padding:0 0 8px;">
+        <div style="font-size:13px;font-weight:700;color:#0c1b2e;">${g.emoji} ${escapeHtmlEmail(g.titulo)} <span style="color:#d1132e;">(${g.items.length})</span></div>
+        <div style="margin-top:2px;font-size:12px;line-height:1.4;color:#5a6270;">${escapeHtmlEmail(g.detalle)}</div>
+      </td></tr>
+      ${g.mostrados.map((a) => `
+      <tr><td style="padding:9px 0;border-top:1px solid #dde2ea;">
+        <a href="${urlPartido(a.id)}" style="font-size:14px;font-weight:700;color:#0c1b2e;text-decoration:none;">${escapeHtmlEmail(a.partido)}</a>
+        <div style="margin-top:3px;font-size:12.5px;line-height:1.45;color:#5a6270;">${escapeHtmlEmail(detalleAvisoDesatendido(a))}</div>
+      </td></tr>`).join("")}
+      ${g.ocultos > 0 ? `<tr><td style="padding:9px 0 0;border-top:1px solid #dde2ea;font-size:12.5px;color:#5a6270;">…y ${g.ocultos} más de este grupo (revisa el panel)</td></tr>` : ""}
+    </table>`).join("");
+
+  const bloqueHtml = `${total > 1 ? `<p style="margin:0 0 14px;font-size:13px;line-height:1.5;color:#5a6270;"><strong style="color:#0c1b2e;">Por redactor:</strong> ${escapeHtmlEmail(resumenRedactores)}</p>` : ""}${seccionesHtml}`;
+
+  const html = plantillaEmail({
+    etiqueta: "Aviso automático",
+    titulo,
+    parrafo,
+    bloqueHtml,
+    boton: { texto: "Ver sin cubrir en el panel", url: urlLista },
+  });
+  return { asunto, texto, html };
+}
+
+// Manda UN solo email con todos los partidos vigentes, agrupados.
+// Devuelve true si había algo que enviar.
+async function enviarDigestAvisosDesatendidos(env, avisos, motivoEnvio) {
+  if (!avisos.length) return false;
+  const { asunto, texto, html } = construirDigestAvisosDesatendidos(agruparAvisosDesatendidos(avisos), motivoEnvio);
+  const enviado = await enviarEmailNotificacion(env, { asunto, texto, html }, { destinatario: EMAIL_NOTIFICACIONES });
+  if (!enviado) console.log("Resumen de partidos sin cubrir: el envío ha fallado (la cola ya estaba vaciada, no se reintenta).");
   return true;
 }
 
@@ -3141,73 +3412,28 @@ async function revisarPartidosDesatendidos(env, ctx) {
   // Aunque no haya partidos en juego hay que mirar la cola igualmente:
   // puede haber avisos pendientes de un partido que ya terminó, y su
   // temporizador de espera máxima debe seguir corriendo para que se
-  // envíen. Por eso ya no hay un "return" temprano aquí.
+  // envíen. Por eso no hay un "return" temprano aquí.
   for (const partido of partidos) {
-    const corriendo = partido.cronometro_pausado_en === null || partido.cronometro_pausado_en === undefined;
-    const minuto = minutoEnVivoServidor(partido);
-
-    // A qué mitad del partido pertenece la situación de riesgo detectada,
-    // para repartir como mucho un aviso por mitad (ver comentario de la
-    // columna aviso_desatendido_mitad) en vez de un único aviso para todo
-    // el partido: así un partido que se queda desatendido en la 1ª parte
-    // y luego, tras retomarlo, vuelve a quedarse desatendido en la 2ª,
-    // puede avisar de nuevo esa segunda vez en lugar de quedarse callado.
-    let motivo = null;
-    let motivoCorto = null;
-    let mitad = null;
-    if (corriendo && minuto >= UMBRAL_SEGUNDA_PARTE_SIN_FINAL) {
-      motivo = `El cronómetro sigue corriendo y ya marca el minuto ${minuto} sin que se haya registrado el final del partido.`;
-      motivoCorto = `min. ${minuto} sin final`;
-      mitad = "segunda";
-    } else if (corriendo && minuto >= UMBRAL_PRIMERA_PARTE_SIN_DESCANSO) {
-      const yaHuboDescanso = await env.DB.prepare(
-        "SELECT id FROM match_events WHERE resultado_id = ? AND tipo = 'descanso' LIMIT 1"
-      ).bind(partido.id).first();
-      if (!yaHuboDescanso) {
-        motivo = `El cronómetro sigue corriendo y ya marca el minuto ${minuto} sin que se haya pitado el descanso.`;
-        motivoCorto = `min. ${minuto} sin descanso`;
-        mitad = "primera";
-      } else {
-        // Ya hubo descanso pero el cronómetro sigue corriendo por encima
-        // del umbral de la 1ª parte: en realidad ya estamos en la 2ª.
-        motivo = `El cronómetro sigue corriendo y ya marca el minuto ${minuto} sin que se haya registrado el final del partido.`;
-        motivoCorto = `min. ${minuto} sin final`;
-        mitad = "segunda";
-      }
-    } else if (!corriendo) {
-      const ultimaPausa = await env.DB.prepare(
-        `SELECT tipo, created_at FROM match_events WHERE resultado_id = ? AND tipo IN ('descanso', 'pausa_hidratacion')
-         ORDER BY id DESC LIMIT 1`
-      ).bind(partido.id).first();
-      if (ultimaPausa && ultimaPausa.tipo === "descanso") {
-        const desdeMs = new Date(String(ultimaPausa.created_at).replace(" ", "T") + "Z").getTime();
-        const minutosParado = isNaN(desdeMs) ? 0 : Math.floor((Date.now() - desdeMs) / 60000);
-        if (minutosParado >= UMBRAL_DESCANSO_SIN_REANUDAR) {
-          motivo = `El partido lleva parado en el descanso ${minutosParado} minutos sin que se haya iniciado la 2ª parte.`;
-          motivoCorto = `${minutosParado} min parado en el descanso`;
-          // El descanso es la frontera entre mitades: se cuenta como
-          // aviso de la 1ª parte (es el cierre pendiente de esa mitad).
-          mitad = "primera";
-        }
-      }
-    }
-
+    // A qué mitad pertenece la situación (ver evaluarSituacionDesatendida)
+    // para repartir como mucho un aviso por mitad (columna
+    // aviso_desatendido_mitad) en vez de uno para todo el partido: así
+    // un partido desatendido en la 1ª parte que, tras retomarlo, vuelve
+    // a desatenderse en la 2ª, puede avisar otra vez.
+    //
+    // Si el partido ya no está en situación de riesgo pero se había
+    // avisado antes, no se toca nada: cada mitad solo se limpia cuando
+    // termina el partido o se reinicia desde cero, así no se vuelve a
+    // avisar dentro de la misma mitad nada más resolverse un despiste
+    // puntual.
     const mitadesAvisadas = (partido.aviso_desatendido_mitad || "").split("_").filter(Boolean);
+    const situacion = await evaluarSituacionDesatendida(env, partido, mitadesAvisadas);
+    if (!situacion) continue;
+    if (mitadesAvisadas.includes(situacion.mitad)) continue; // ya avisado en esta mitad, no se repite
 
-    if (!motivo) {
-      // Si el partido ya no está en situación de riesgo pero se había
-      // avisado antes, no se toca nada: cada mitad solo se limpia
-      // cuando termina el partido o se reinicia desde cero (abajo),
-      // así no se vuelve a avisar dentro de la misma mitad nada más
-      // resolverse un despiste puntual.
-      continue;
-    }
-    if (mitadesAvisadas.includes(mitad)) continue; // ya avisado en esta mitad, no se repite
-
-    // Se marca la mitad como avisada YA (igual que antes, aunque el email
-    // salga más tarde en el lote): así el mismo partido no se vuelve a
-    // apuntar en la cola en el siguiente minuto del cron.
-    const nuevoValor = [...new Set([...mitadesAvisadas, mitad])].join("_");
+    // Se marca la mitad como avisada YA (aunque el email salga más tarde
+    // en el lote): así el mismo partido no se vuelve a apuntar en la
+    // cola en el siguiente minuto del cron.
+    const nuevoValor = [...new Set([...mitadesAvisadas, situacion.mitad])].join("_");
     await env.DB.prepare("UPDATE results SET aviso_desatendido_mitad = ? WHERE id = ?").bind(nuevoValor, partido.id).run();
 
     // INSERT ... ON CONFLICT: si el mismo partido ya estaba en la cola
@@ -3220,12 +3446,12 @@ async function revisarPartidosDesatendidos(env, ctx) {
          redactor = excluded.redactor, motivo_corto = excluded.motivo_corto, encolado_ms = excluded.encolado_ms`
     ).bind(
       partido.id, `${partido.equipo_local} - ${partido.equipo_visitante}`, partido.jornada,
-      partido.autor_nombre || null, motivoCorto, Date.now()
+      partido.autor_nombre || null, situacion.motivoCorto, Date.now()
     ).run();
 
     await registrarActividad(env, null, { uid: null, nombre: "Vigilancia de partidos", rol: "sistema" }, {
       accion: "aviso_partido_desatendido", entidad: "resultado", entidad_id: partido.id,
-      descripcion: `Aviso automático (en cola para el resumen): ${partido.equipo_local} - ${partido.equipo_visitante} — ${motivo}`,
+      descripcion: `Aviso automático (en cola para el resumen): ${partido.equipo_local} - ${partido.equipo_visitante} — ${situacion.motivo}`,
     });
   }
 
@@ -3236,7 +3462,9 @@ async function revisarPartidosDesatendidos(env, ctx) {
   // más antiguo (la cola viene ordenada por encolado_ms ASC) lleva
   // esperando más de AVISOS_DESATENDIDOS_ESPERA_MAX_MIN. Un encolado_ms
   // ilegible (NaN) cuenta como "ya lleva mucho": mejor avisar de más una
-  // vez que dejar un aviso atascado para siempre.
+  // vez que dejar un aviso atascado para siempre. Esta decisión usa la
+  // cola tal cual (una sola consulta por minuto); la comprobación de
+  // que cada partido sigue sin cubrir se hace solo al enviar.
   const esperaMin = Number.isFinite(cola[0].encoladoMs) ? (Date.now() - cola[0].encoladoMs) / 60000 : Infinity;
   const loteCompleto = cola.length >= AVISOS_DESATENDIDOS_LOTE;
   const esperaAgotada = esperaMin >= AVISOS_DESATENDIDOS_ESPERA_MAX_MIN;
@@ -3251,14 +3479,12 @@ async function revisarPartidosDesatendidos(env, ctx) {
   // un fallo puntual de Resend es preferible a un bucle de reintentos
   // que agote el cupo diario.
   //
-  // Se trocea en lotes de 90 ids: D1/SQLite tiene un límite de 100
-  // parámetros bind por consulta (mismo criterio que
-  // contarPublicacionesPorTipoDeVarios). Con AVISOS_DESATENDIDOS_LOTE = 20
-  // rara vez habrá tantos, pero si la espera máxima acumula más de 100
-  // partidos (una jornada entera sin nadie cubriendo) un DELETE de una
-  // sola vez fallaría con "too many SQL variables" y, al no borrarse la
-  // cola, el mismo aviso se reenviaría CADA MINUTO: justo el bucle de
-  // emails que este sistema existe para evitar.
+  // Se trocea en lotes de 90 ids (límite de 100 parámetros bind en
+  // D1/SQLite, mismo criterio que contarPublicacionesPorTipoDeVarios):
+  // si la espera máxima acumula más de 100 partidos (una jornada entera
+  // sin nadie cubriendo) un DELETE de una sola vez fallaría con "too many
+  // SQL variables" y, al no borrarse la cola, el mismo aviso se
+  // reenviaría CADA MINUTO.
   const ids = cola.map((a) => a.id);
   const LOTE_BORRADO = 90;
   for (let inicio = 0; inicio < ids.length; inicio += LOTE_BORRADO) {
@@ -3267,7 +3493,16 @@ async function revisarPartidosDesatendidos(env, ctx) {
       `DELETE FROM avisos_desatendidos_cola WHERE resultado_id IN (${lote.map(() => "?").join(",")})`
     ).bind(...lote).run();
   }
-  await enviarDigestAvisosDesatendidos(env, cola, loteCompleto ? "lote" : "espera");
+
+  // Solo se avisa de lo que sigue sin cubrir en este momento. Si durante
+  // la espera se resolvió todo, no se manda nada (y ya no queda nada en
+  // la cola).
+  const vigentes = await validarAvisosDesatendidos(env, cola);
+  if (!vigentes.length) {
+    console.log(`Resumen de partidos sin cubrir: ${cola.length} aviso(s) en cola, todos resueltos antes de enviar. No se manda email.`);
+    return;
+  }
+  await enviarDigestAvisosDesatendidos(env, vigentes, loteCompleto ? "lote" : "espera");
 }
 
 async function publicarArticulosProgramados(env) {
@@ -10094,12 +10329,25 @@ async function handlePrimary(request, env, ctx) {
         if (idsEnJuego.length) {
           const placeholders = idsEnJuego.map(() => "?").join(",");
           const { results: ultimosEventos } = await env.DB.prepare(
-            `SELECT resultado_id, MAX(created_at) AS ultimo_evento_at FROM match_events
+            `SELECT resultado_id, MAX(created_at) AS ultimo_evento_at,
+                    MAX(CASE WHEN tipo = 'fin_descanso' THEN 1 ELSE 0 END) AS segunda_parte_iniciada
+             FROM match_events
              WHERE resultado_id IN (${placeholders}) GROUP BY resultado_id`
           ).bind(...idsEnJuego).all();
           const mapaUltimoEvento = {};
-          ultimosEventos.forEach(e => { mapaUltimoEvento[e.resultado_id] = e.ultimo_evento_at; });
-          results.forEach(r => { r.ultimo_evento_at = mapaUltimoEvento[r.id] || null; });
+          // segunda_parte_iniciada (1/0): ya existe el evento "fin_descanso",
+          // es decir, el partido va por la 2ª parte y un reloj corriendo
+          // entre el min. 55 y el 100 es normal (ver avisoPartidoDesatendido
+          // en admin.js y evaluarSituacionDesatendida).
+          const mapaSegundaParte = {};
+          ultimosEventos.forEach(e => {
+            mapaUltimoEvento[e.resultado_id] = e.ultimo_evento_at;
+            mapaSegundaParte[e.resultado_id] = Number(e.segunda_parte_iniciada) === 1 ? 1 : 0;
+          });
+          results.forEach(r => {
+            r.ultimo_evento_at = mapaUltimoEvento[r.id] || null;
+            r.segunda_parte_iniciada = mapaSegundaParte[r.id] || 0;
+          });
         }
         return json({ results });
       }
