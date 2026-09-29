@@ -10546,6 +10546,43 @@ async function handlePrimary(request, env, ctx) {
             (body.goles_local === undefined || body.goles_local === null || body.goles_visitante === undefined || body.goles_visitante === null)) {
           return json({ error: "Falta el marcador (goles de ambos equipos)" }, 400);
         }
+        // No se deja crear un resultado de una jornada que ya ha terminado.
+        // Se considera "pasada" cuando el calendario de jornadas
+        // (tabla jornadas_calendario) tiene registrada esa jornada para la
+        // competición/grupo y su fecha_fin es anterior al día de hoy
+        // (hora de Madrid; la fecha_fin es inclusiva, así que durante el
+        // último día de la jornada todavía se puede crear). Si el
+        // calendario no conoce esa jornada, o la competición no usa
+        // jornadas (amistoso), no hay forma de saber si está pasada y se
+        // deja crear como siempre. Solo aplica al crear (POST), no al editar.
+        {
+          if (body.competicion !== "amistoso") {
+            const jornadaNum = parseInt(body.jornada, 10);
+            if (Number.isInteger(jornadaNum)) {
+              const grupoJornada = body.competicion === "segunda_federacion"
+                ? (body.grupo || grupoAutomaticoSegundaFederacion(body.competicion, body.equipo_local, body.equipo_visitante))
+                : (body.grupo || null);
+              const filaJornada = await env.DB.prepare(
+                `SELECT MAX(fecha_fin) AS fecha_fin FROM jornadas_calendario
+                 WHERE competicion = ? AND (grupo IS ? OR grupo = ?) AND jornada = ?`
+              ).bind(body.competicion, grupoJornada, grupoJornada, jornadaNum).first();
+              if (filaJornada && filaJornada.fecha_fin) {
+                // "en-CA" formatea directamente como YYYY-MM-DD.
+                const hoyMadrid = new Intl.DateTimeFormat("en-CA", {
+                  timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit",
+                }).format(new Date());
+                if (String(filaJornada.fecha_fin) < hoyMadrid) {
+                  return json({
+                    error: `La jornada ${jornadaNum} ya ha pasado (terminó el ${filaJornada.fecha_fin}). No se pueden crear resultados de una jornada pasada.`,
+                    jornada_pasada: true,
+                    jornada: jornadaNum,
+                    fecha_fin_jornada: filaJornada.fecha_fin,
+                  }, 400);
+                }
+              }
+            }
+          }
+        }
         // Comprobación de duplicados (ver detectarPartidoDuplicado).
         // El caso bloqueante (mismo enfrentamiento en la misma jornada)
         // NO se puede saltar con "confirmar_duplicado": ese flag solo
