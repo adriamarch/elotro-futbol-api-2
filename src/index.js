@@ -10315,8 +10315,39 @@ async function handlePrimary(request, env, ctx) {
         // en la propia consulta). Se ordena por fecha_partido en su lugar,
         // que es lo relevante para "traer los partidos más recientes" y no
         // deja huecos según la jornada de cada competición.
+        // "?orden=cercania" (panel de admin): mismo orden que el worker
+        // principal (en juego, por jugar, terminados; cada bloque por
+        // cercanía a la hora de Madrid). Aquí se ordena en JS porque
+        // julianday() no existe en PostgreSQL; el tope es de 2000 filas,
+        // así que el recorte por fecha no deja fuera partidos próximos.
+        const ordenCercania = url.searchParams.get("orden") === "cercania";
         query += ` ORDER BY fecha_partido DESC LIMIT ${limit}`;
         const { results } = await env.DB.prepare(query).bind(...binds).all();
+        if (ordenCercania) {
+          const pm = new Intl.DateTimeFormat("en-US", {
+            timeZone: "Europe/Madrid", hourCycle: "h23",
+            year: "numeric", month: "2-digit", day: "2-digit",
+            hour: "2-digit", minute: "2-digit", second: "2-digit",
+          }).formatToParts(new Date()).reduce((acc, x) => (acc[x.type] = x.value, acc), {});
+          const ahora = Date.UTC(pm.year, pm.month - 1, pm.day, pm.hour, pm.minute, pm.second);
+          const ts = (r) => {
+            const m = String(r.fecha_partido || "").match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?/);
+            return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0)) : NaN;
+          };
+          const prio = (e) => e === "en_juego" ? 0 : (e === "programado" || e === "retrasado") ? 1 : 2;
+          const orden = results.map((r, i) => ({ r, i, t: ts(r) })).sort((a, b) => {
+            const pa = prio(a.r.estado), pb = prio(b.r.estado);
+            if (pa !== pb) return pa - pb;
+            const na = isNaN(a.t), nb = isNaN(b.t);
+            if (na || nb) return na && nb ? a.i - b.i : (na ? 1 : -1);
+            const da = Math.abs(a.t - ahora), db = Math.abs(b.t - ahora);
+            if (da !== db) return da - db;
+            const fa = a.t >= ahora, fb = b.t >= ahora;
+            if (fa !== fb) return fa ? -1 : 1;
+            return a.i - b.i;
+          }).map(x => x.r);
+          results.splice(0, results.length, ...orden);
+        }
         // Se añade el instante del último evento (gol, tarjeta, cambio...)
         // registrado en el minuto a minuto de cada partido, para que el
         // panel de admin pueda distinguir un partido realmente desatendido
