@@ -7112,6 +7112,18 @@ async function handlePrimary(request, env, ctx) {
         const id = parseInt(userMatch[1]);
         if (id === payload.uid) return json({ error: "No puedes eliminar tu propia cuenta" }, 400);
         const userBorrado = await env.DB.prepare("SELECT username FROM users WHERE id = ?").bind(id).first();
+        // tienda_pedidos.usuario_id es NOT NULL y apunta a users(id): si esta
+        // persona tiene pedidos, borrarla rompería la clave foránea. Se avisa
+        // con un 409 claro (un 5xx o una excepción harían failover a Railway
+        // y taparían el motivo real con un 401 engañoso).
+        try {
+          const pedidos = await env.DB.prepare("SELECT COUNT(*) AS n FROM tienda_pedidos WHERE usuario_id = ?").bind(id).first();
+          if (pedidos && Number(pedidos.n) > 0) {
+            return json({ error: "Este usuario tiene pedidos en la tienda y no se puede eliminar. Desactívalo en su lugar." }, 409);
+          }
+        } catch (e) {
+          if (!/no such table|does not exist/i.test(String(e && e.message))) throw e;
+        }
         // El historial de acciones guarda el nombre en texto aparte
         // (usuario_nombre), así que al eliminar la cuenta solo hace
         // falta soltar la referencia (usuario_id) para no chocar con la
@@ -7141,7 +7153,25 @@ async function handlePrimary(request, env, ctx) {
         await env.DB.prepare("DELETE FROM edit_requests WHERE solicitante_id = ?").bind(id).run();
         await env.DB.prepare("UPDATE edit_requests SET autor_id = NULL WHERE autor_id = ?").bind(id).run();
         await env.DB.prepare("UPDATE edit_requests SET resuelta_por_id = NULL WHERE resuelta_por_id = ?").bind(id).run();
-        await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(id).run();
+        // Referencias a users(id) que faltaban por soltar (todas nullables):
+        // sin esto, el DELETE FROM users lanzaba FOREIGN KEY constraint.
+        for (const sqlLimpieza of [
+          "UPDATE match_gallery SET vinculado_por_id = NULL WHERE vinculado_por_id = ?",
+          "UPDATE polls SET autor_id = NULL WHERE autor_id = ?",
+          "UPDATE tienda_pedidos SET gestionado_por = NULL WHERE gestionado_por = ?",
+        ]) {
+          try { await env.DB.prepare(sqlLimpieza).bind(id).run(); }
+          catch (e) { if (!/no such table|no such column|does not exist/i.test(String(e && e.message))) throw e; }
+        }
+        try {
+          await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(id).run();
+        } catch (e) {
+          if (/FOREIGN KEY|foreign key|violates/i.test(String(e && e.message))) {
+            console.error("DELETE users: clave foránea pendiente:", e.message);
+            return json({ error: "No se puede eliminar: el usuario aún tiene datos vinculados (" + e.message + ")" }, 409);
+          }
+          throw e;
+        }
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "eliminar_usuario", entidad: "usuario", entidad_id: id,
           descripcion: `Ha eliminado el usuario "${userBorrado ? userBorrado.username : id}"`,
