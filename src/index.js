@@ -2550,7 +2550,7 @@ function longitudTextoPlano(html) {
     .trim().length;
 }
 
-const CONTENIDO_MIN = 2000;
+const CONTENIDO_MIN = 1500;
 const CONTENIDO_MAX = 8000;
 
 // ---------- Sistema de niveles y recompensas ----------
