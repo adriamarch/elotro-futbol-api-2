@@ -320,6 +320,15 @@ export const TABLES = [
     deleteDetection: false, // los pedidos no se borran, se marcan "cancelado"
     syncMode: "authoritative",
   },
+  {
+    name: "noticias_rapidas",
+    pk: ["id"],
+    order: 23,
+    changeStrategy: "updated_at",
+    cursorColumn: "updated_at",
+    deleteDetection: true, // el panel permite borrar noticias rápidas
+    syncMode: "authoritative", // D1 es la autoridad; tabla pequeña
+  },
 ];
 
 export function getTable(name) {
@@ -348,6 +357,7 @@ export const DEPENDENCIAS_FK = {
   comment_votes: ["comments"],
   comment_reports: ["comments"],
   polls: ["articles", "users"],
+  noticias_rapidas: ["users"],
   poll_options: ["polls"],
   poll_votes: ["polls", "poll_options", "readers"],
   tienda_pedidos: ["users", "tienda_productos"],

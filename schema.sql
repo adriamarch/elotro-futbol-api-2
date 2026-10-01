@@ -768,3 +768,17 @@ CREATE INDEX idx_article_reading_created ON article_reading(created_at);
 CREATE INDEX idx_article_reading_view ON article_reading(view_id);
 CREATE INDEX idx_article_reading_created_article ON article_reading(created_at, article_id);
 
+-- Noticias rápidas: foto + titular + subtitular, escritas por redactores/admin.
+-- Ver worker/migracion_noticias_rapidas.sql.
+DROP TABLE IF EXISTS noticias_rapidas;
+CREATE TABLE noticias_rapidas (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  titulo TEXT NOT NULL,
+  subtitulo TEXT NOT NULL,
+  imagen_url TEXT NOT NULL,
+  autor_id INTEGER REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_noticias_rapidas_created ON noticias_rapidas(created_at DESC);
+CREATE INDEX idx_noticias_rapidas_autor ON noticias_rapidas(autor_id);

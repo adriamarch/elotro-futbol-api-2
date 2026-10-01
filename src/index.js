@@ -1653,6 +1653,31 @@ function puedeGestionarContenidoEditorial(payload) {
   return esAdmin(payload) || esRedactor(payload);
 }
 
+// ---------- Noticias rápidas: validación del body ----------
+// Una noticia rápida lleva SOLO tres campos, todos obligatorios: foto
+// (URL ya subida con /api/subir-imagen), titular y subtitular.
+const NOTICIA_RAPIDA_TITULO_MAX = 120;
+const NOTICIA_RAPIDA_SUBTITULO_MAX = 220;
+
+function validarNoticiaRapida(body) {
+  const titulo = normalizarTexto(body && body.titulo);
+  const subtitulo = normalizarTexto(body && body.subtitulo);
+  const imagenUrl = normalizarTexto(body && body.imagen_url);
+  if (!titulo) return { error: "Falta el titular" };
+  if (titulo.length > NOTICIA_RAPIDA_TITULO_MAX) {
+    return { error: `El titular es demasiado largo (máximo ${NOTICIA_RAPIDA_TITULO_MAX} caracteres, tiene ${titulo.length})` };
+  }
+  if (!subtitulo) return { error: "Falta el subtitular" };
+  if (subtitulo.length > NOTICIA_RAPIDA_SUBTITULO_MAX) {
+    return { error: `El subtitular es demasiado largo (máximo ${NOTICIA_RAPIDA_SUBTITULO_MAX} caracteres, tiene ${subtitulo.length})` };
+  }
+  if (!imagenUrl) return { error: "Falta la foto" };
+  if (imagenUrl.length > 1000 || !/^https?:\/\//i.test(imagenUrl)) {
+    return { error: "La foto no es válida: súbela de nuevo" };
+  }
+  return { titulo, subtitulo, imagenUrl };
+}
+
 function puedeGestionarGaleria(payload) {
   return esAdmin(payload) || esFotografo(payload);
 }
@@ -9405,6 +9430,109 @@ async function handlePrimary(request, env, ctx) {
 
         const conResultados = await obtenerEncuestaConResultados(env, poll, readerId);
         return json({ ok: true, encuesta: conResultados });
+      }
+
+      // ---------- Noticias rápidas (foto + titular + subtitular) ----------
+      // Público: últimas noticias rápidas, de más nueva a más antigua.
+      if (path === "/api/noticias-rapidas" && method === "GET") {
+        const limite = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "20", 10) || 20, 1), 50);
+        const { results } = await env.DB.prepare(
+          `SELECT nr.id, nr.titulo, nr.subtitulo, nr.imagen_url, nr.created_at,
+                  u.nombre AS autor_nombre
+           FROM noticias_rapidas nr
+           LEFT JOIN users u ON u.id = nr.autor_id
+           ORDER BY nr.created_at DESC, nr.id DESC
+           LIMIT ?`
+        ).bind(limite).all();
+        return json({ noticias_rapidas: results });
+      }
+
+      // Panel: listado completo (cualquier redactor/admin ve todas, pero
+      // solo puede editar/borrar las suyas; el admin, todas).
+      if (path === "/api/admin/noticias-rapidas" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede gestionar noticias rápidas" }, 403);
+        }
+        const { results } = await env.DB.prepare(
+          `SELECT nr.*, u.nombre AS autor_nombre
+           FROM noticias_rapidas nr
+           LEFT JOIN users u ON u.id = nr.autor_id
+           ORDER BY nr.created_at DESC, nr.id DESC
+           LIMIT 200`
+        ).all();
+        return json({ noticias_rapidas: results });
+      }
+
+      if (path === "/api/admin/noticias-rapidas" && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede crear noticias rápidas" }, 403);
+        }
+        const v = validarNoticiaRapida(await request.json());
+        if (v.error) return json({ error: v.error }, 400);
+
+        const { meta } = await env.DB.prepare(
+          "INSERT INTO noticias_rapidas (titulo, subtitulo, imagen_url, autor_id) VALUES (?, ?, ?, ?)"
+        ).bind(v.titulo, v.subtitulo, v.imagenUrl, payload.uid).run();
+        const nuevoId = meta.last_row_id;
+
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "crear_noticia_rapida", entidad: "noticia_rapida", entidad_id: nuevoId,
+          descripcion: `Ha publicado la noticia rápida "${v.titulo}"`,
+        }));
+        const creada = await env.DB.prepare("SELECT * FROM noticias_rapidas WHERE id = ?").bind(nuevoId).first();
+        return json({ ok: true, noticia_rapida: creada });
+      }
+
+      const noticiaRapidaMatch = path.match(/^\/api\/admin\/noticias-rapidas\/(\d+)$/);
+      if (noticiaRapidaMatch && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede editar noticias rápidas" }, 403);
+        }
+        const id = parseInt(noticiaRapidaMatch[1], 10);
+        const actual = await env.DB.prepare("SELECT * FROM noticias_rapidas WHERE id = ?").bind(id).first();
+        if (!actual) return json({ error: "Noticia rápida no encontrada" }, 404);
+        if (!(await puedeEditarEntidad(env, payload, "noticia_rapida", actual.autor_id))) {
+          return json({ error: "Solo puedes editar tus propias noticias rápidas" }, 403);
+        }
+        const v = validarNoticiaRapida(await request.json());
+        if (v.error) return json({ error: v.error }, 400);
+
+        await env.DB.prepare(
+          "UPDATE noticias_rapidas SET titulo = ?, subtitulo = ?, imagen_url = ?, updated_at = datetime('now') WHERE id = ?"
+        ).bind(v.titulo, v.subtitulo, v.imagenUrl, id).run();
+
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "editar_noticia_rapida", entidad: "noticia_rapida", entidad_id: id,
+          descripcion: `Ha editado la noticia rápida "${v.titulo}"`,
+        }));
+        const editada = await env.DB.prepare("SELECT * FROM noticias_rapidas WHERE id = ?").bind(id).first();
+        return json({ ok: true, noticia_rapida: editada });
+      }
+
+      if (noticiaRapidaMatch && method === "DELETE") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede borrar noticias rápidas" }, 403);
+        }
+        const id = parseInt(noticiaRapidaMatch[1], 10);
+        const actual = await env.DB.prepare("SELECT * FROM noticias_rapidas WHERE id = ?").bind(id).first();
+        if (!actual) return json({ error: "Noticia rápida no encontrada" }, 404);
+        if (!(await puedeEditarEntidad(env, payload, "noticia_rapida", actual.autor_id))) {
+          return json({ error: "Solo puedes borrar tus propias noticias rápidas" }, 403);
+        }
+        await env.DB.prepare("DELETE FROM noticias_rapidas WHERE id = ?").bind(id).run();
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "borrar_noticia_rapida", entidad: "noticia_rapida", entidad_id: id,
+          descripcion: `Ha borrado la noticia rápida "${actual.titulo}"`,
+        }));
+        return json({ ok: true });
       }
 
       // ---------- Encuestas: gestión desde el panel (redactores/admin) ----------
