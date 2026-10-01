@@ -2731,8 +2731,9 @@ async function construirProgresoNivel(env, usuario, conteoPrecalculado) {
 //
 // Se guarda en settings (clave 'horario_publicacion') como
 //   {"activo": true, "dias": {"lunes": ["noticia","previa"], ...}}
-// Mientras no esté activo (o no exista), todo se puede subir cualquier día
-// y nada se marca como fuera de calendario.
+// Por defecto (sin nada guardado) el horario está activo y lo que no esté
+// marcado cuenta como desactivado. Solo si un admin lo apaga (activo:false)
+// se puede subir cualquier tipo cualquier día y nada se marca como fuera de calendario.
 const DIAS_HORARIO = ["lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo"];
 const TIPOS_HORARIO = [
   { id: "noticia", etiqueta: "Noticias" },
@@ -2761,7 +2762,10 @@ function normalizarHorarioPublicacion(raw) {
     const lista = raw && raw.dias && Array.isArray(raw.dias[dia]) ? raw.dias[dia] : [];
     dias[dia] = IDS_TIPOS_HORARIO.filter((id) => lista.includes(id));
   }
-  return { activo: !!(raw && raw.activo), dias };
+  // Sin horario guardado (o ilegible) el horario está ACTIVO: todo lo que no
+  // esté marcado en la tabla cuenta como desactivado. Solo se desactiva si un
+  // admin lo apaga a propósito (raw.activo === false).
+  return { activo: raw ? raw.activo !== false : true, dias };
 }
 
 async function obtenerHorarioPublicacion(env) {
