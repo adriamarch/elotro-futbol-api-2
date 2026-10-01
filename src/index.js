@@ -2730,7 +2730,7 @@ async function construirProgresoNivel(env, usuario, conteoPrecalculado) {
 // no se sube a redes sociales, así que el panel no ofrece "Compartir".
 //
 // Se guarda en settings (clave 'horario_publicacion') como
-//   {"activo": true, "dias": {"lunes": ["noticia","previa"], ...}}
+//   {"activo": true, "dias": {"lunes": ["noticia","cronica_anterior"], ...}}
 // Por defecto (sin nada guardado) el horario está activo y lo que no esté
 // marcado cuenta como desactivado. Solo si un admin lo apaga (activo:false)
 // se puede subir cualquier tipo cualquier día y nada se marca como fuera de calendario.
@@ -2739,6 +2739,7 @@ const TIPOS_HORARIO = [
   { id: "noticia", etiqueta: "Noticias" },
   { id: "previa", etiqueta: "Previas" },
   { id: "cronica_actual", etiqueta: "Crónicas de la jornada en curso" },
+  { id: "cronica_anterior", etiqueta: "Crónicas de la jornada anterior" },
   { id: "analisis", etiqueta: "Análisis" },
   { id: "opinion", etiqueta: "Opinión" },
   { id: "entrevista", etiqueta: "Entrevistas" },
@@ -2804,8 +2805,6 @@ async function estaFueraDeCalendario(env, { tipo, resultado_id, fecha }) {
   const hoy = hoyEnMadrid(fecha || new Date());
   let tipoHorario = tipoArticulo;
   if (tipoArticulo === "cronica") {
-    // "cronica_anterior" ya no es una columna del horario: no está en TIPOS_HORARIO,
-    // así que más abajo devuelve false y esas crónicas nunca quedan fuera de calendario.
     tipoHorario = (await esCronicaDeJornadaAnterior(env, resultado_id, hoy.ymd)) ? "cronica_anterior" : "cronica_actual";
   }
   if (!IDS_TIPOS_HORARIO.includes(tipoHorario)) return false;
