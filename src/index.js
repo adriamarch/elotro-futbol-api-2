@@ -2720,6 +2720,103 @@ async function construirProgresoNivel(env, usuario, conteoPrecalculado) {
   };
 }
 
+// ---------- HORARIO DE PUBLICACIÓN (calendario editorial) ----------
+// Un admin define, para cada día de la semana, qué tipos de contenido
+// se pueden subir ese día (p. ej. "crónicas de la jornada anterior" de
+// viernes a miércoles, pero no el jueves). Lo ven todos los redactores en
+// Funcionalidades > Horario. Una noticia publicada un día en el que su
+// tipo NO está permitido queda marcada como "fuera de calendario"
+// (articles.fuera_calendario = 1): se publica igualmente en la web, pero
+// no se sube a redes sociales, así que el panel no ofrece "Compartir".
+//
+// Se guarda en settings (clave 'horario_publicacion') como
+//   {"activo": true, "dias": {"lunes": ["noticia","previa"], ...}}
+// Mientras no esté activo (o no exista), todo se puede subir cualquier día
+// y nada se marca como fuera de calendario.
+const DIAS_HORARIO = ["lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo"];
+const TIPOS_HORARIO = [
+  { id: "noticia", etiqueta: "Noticias" },
+  { id: "previa", etiqueta: "Previas" },
+  { id: "cronica_actual", etiqueta: "Crónicas de la jornada en curso" },
+  { id: "analisis", etiqueta: "Análisis" },
+  { id: "opinion", etiqueta: "Opinión" },
+  { id: "entrevista", etiqueta: "Entrevistas" },
+];
+const IDS_TIPOS_HORARIO = TIPOS_HORARIO.map((t) => t.id);
+const DIA_SEMANA_POR_INDICE = { Mon: "lunes", Tue: "martes", Wed: "miercoles", Thu: "jueves", Fri: "viernes", Sat: "sabado", Sun: "domingo" };
+
+// Día de la semana y fecha (YYYY-MM-DD) de hoy en hora de Madrid (no en
+// UTC: a las 00:30 de un jueves en España, en UTC todavía es miércoles).
+function hoyEnMadrid(ahora = new Date()) {
+  const partes = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/Madrid", weekday: "short", year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(ahora);
+  const get = (t) => (partes.find((p) => p.type === t) || {}).value;
+  return { dia: DIA_SEMANA_POR_INDICE[get("weekday")], ymd: `${get("year")}-${get("month")}-${get("day")}` };
+}
+
+function normalizarHorarioPublicacion(raw) {
+  const dias = {};
+  for (const dia of DIAS_HORARIO) {
+    const lista = raw && raw.dias && Array.isArray(raw.dias[dia]) ? raw.dias[dia] : [];
+    dias[dia] = IDS_TIPOS_HORARIO.filter((id) => lista.includes(id));
+  }
+  return { activo: !!(raw && raw.activo), dias };
+}
+
+async function obtenerHorarioPublicacion(env) {
+  const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'horario_publicacion'").first();
+  let raw = null;
+  if (row) { try { raw = JSON.parse(row.value); } catch { raw = null; } }
+  return normalizarHorarioPublicacion(raw);
+}
+
+// ¿La crónica es de una jornada que ya terminó? Se mira el rango de
+// fechas de la jornada del partido en jornadas_calendario (terminó si su
+// fecha_fin es anterior a hoy). Si esa jornada no tiene rango definido,
+// se usa la fecha del propio partido: más de 3 días atrás = anterior.
+async function esCronicaDeJornadaAnterior(env, resultadoId, hoyYmd) {
+  if (!resultadoId) return false;
+  const partido = await env.DB.prepare(
+    "SELECT competicion, grupo, jornada, fecha_partido FROM results WHERE id = ?"
+  ).bind(resultadoId).first();
+  if (!partido) return false;
+  const rango = await env.DB.prepare(
+    "SELECT fecha_fin FROM jornadas_calendario WHERE competicion = ? AND grupo IS ? AND jornada = ? LIMIT 1"
+  ).bind(partido.competicion, partido.grupo || null, partido.jornada).first();
+  if (rango && rango.fecha_fin) return rango.fecha_fin < hoyYmd;
+  const fechaPartido = String(partido.fecha_partido || "").slice(0, 10);
+  if (!fechaPartido) return false;
+  const limite = new Date(`${hoyYmd}T00:00:00Z`);
+  limite.setUTCDate(limite.getUTCDate() - 3);
+  return fechaPartido < limite.toISOString().slice(0, 10);
+}
+
+// true si publicar este artículo AHORA cae fuera del horario configurado.
+async function estaFueraDeCalendario(env, { tipo, resultado_id }) {
+  const horario = await obtenerHorarioPublicacion(env);
+  if (!horario.activo) return false;
+  const tipoArticulo = tipo || "noticia";
+  const hoy = hoyEnMadrid();
+  let tipoHorario = tipoArticulo;
+  if (tipoArticulo === "cronica") {
+    // "cronica_anterior" ya no es una columna del horario: no está en TIPOS_HORARIO,
+    // así que más abajo devuelve false y esas crónicas nunca quedan fuera de calendario.
+    tipoHorario = (await esCronicaDeJornadaAnterior(env, resultado_id, hoy.ymd)) ? "cronica_anterior" : "cronica_actual";
+  }
+  if (!IDS_TIPOS_HORARIO.includes(tipoHorario)) return false;
+  return !horario.dias[hoy.dia].includes(tipoHorario);
+}
+
+// Evalúa y guarda la marca en el momento de publicarse (alta, edición que
+// publica un borrador, o publicación programada). Devuelve true/false.
+async function marcarFueraDeCalendario(env, articuloId, datos) {
+  let fuera = false;
+  try { fuera = await estaFueraDeCalendario(env, datos); } catch (err) { console.error("horario_publicacion:", err); }
+  await env.DB.prepare("UPDATE articles SET fuera_calendario = ? WHERE id = ?").bind(fuera ? 1 : 0, articuloId).run();
+  return fuera;
+}
+
 // ---------- Permisos por autor + solicitudes de edición ----------
 // Minutos que dura el permiso de edición sobre una entidad concreta una
 // vez aprobada una solicitud (tiempo de sobra para hacer la edición sin
@@ -3532,7 +3629,7 @@ async function revisarPartidosDesatendidos(env, ctx) {
 
 async function publicarArticulosProgramados(env) {
   const { results: pendientes } = await env.DB.prepare(
-    `SELECT id, slug, titulo, subtitulo, tipo, categoria, club, autor_nombre, coautor_nombre, imagen_url
+    `SELECT id, slug, titulo, subtitulo, tipo, categoria, club, autor_nombre, coautor_nombre, imagen_url, resultado_id
      FROM articles
      WHERE publicado = 0 AND programado_para IS NOT NULL AND programado_para <= datetime('now')`
   ).all();
@@ -3542,6 +3639,8 @@ async function publicarArticulosProgramados(env) {
     await env.DB.prepare(
       `UPDATE articles SET publicado = 1, programado_para = NULL, slug_congelado = 1, fecha_publicacion = datetime('now'), updated_at = datetime('now') WHERE id = ?`
     ).bind(articulo.id).run();
+    // El horario se evalúa en el momento real de publicación, no cuando se programó.
+    await marcarFueraDeCalendario(env, articulo.id, { tipo: articulo.tipo, resultado_id: articulo.resultado_id });
 
     const tipoLabel = { noticia: "Noticia", cronica: "Crónica", opinion: "Opinión", entrevista: "Entrevista" }[articulo.tipo] || "Artículo";
     const firmaAutores = articulo.coautor_nombre ? `${articulo.autor_nombre} y ${articulo.coautor_nombre}` : articulo.autor_nombre;
@@ -6655,6 +6754,36 @@ async function handlePrimary(request, env, ctx) {
         return json({ ok: true, redes: redesLimpias });
       }
 
+      // ---------- HORARIO DE PUBLICACIÓN ----------
+      // Misma lógica que worker/src/index.js: lo consulta cualquier usuario
+      // con sesión; solo un admin lo modifica.
+      if (path === "/api/horario-publicacion" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const horario = await obtenerHorarioPublicacion(env);
+        return json({ ...horario, tipos: TIPOS_HORARIO, dias_semana: DIAS_HORARIO, hoy: hoyEnMadrid().dia });
+      }
+
+      if (path === "/api/horario-publicacion" && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede modificar el horario de publicación" }, 403);
+        const body = await request.json();
+        if (!body || typeof body.dias !== "object" || body.dias === null || Array.isArray(body.dias)) {
+          return json({ error: "Falta el horario" }, 400);
+        }
+        const horario = normalizarHorarioPublicacion({ activo: body.activo === true, dias: body.dias });
+        await env.DB.prepare(
+          `INSERT INTO settings (key, value, updated_at) VALUES ('horario_publicacion', ?, datetime('now'))
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+        ).bind(JSON.stringify(horario)).run();
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "editar_settings", entidad: "settings",
+          descripcion: `Ha ${horario.activo ? "actualizado" : "desactivado"} el horario de publicación`,
+        }));
+        return json({ ok: true, ...horario });
+      }
+
       // ---------- AUTORES (cualquier usuario logueado) ----------
       // Lista ligera (solo id + nombre) de redactores/admins activos, para
       // poder elegir "quién ha hecho la noticia" al crear o editar una
@@ -7801,7 +7930,7 @@ async function handlePrimary(request, env, ctx) {
             titulo_ca, LENGTH(contenido_ca) AS contenido_ca_len,
             titulo_gl, LENGTH(contenido_gl) AS contenido_gl_len,
             titulo_en, LENGTH(contenido_en) AS contenido_en_len,
-            ficha_tecnica
+            ficha_tecnica, fuera_calendario
           FROM articles WHERE 1=1`;
         const binds = [];
         if (!admin) {
@@ -8014,6 +8143,15 @@ async function handlePrimary(request, env, ctx) {
           origenWriteId, fichaTecnica, activarBanner ? 1 : 0
         ).run();
 
+        // Horario de publicación (ver worker/src/index.js): si se publica
+        // ahora se comprueba si el día y el tipo están permitidos. Este
+        // INSERT no devuelve el id, así que se busca por slug (único).
+        let fueraCalendario = false;
+        if (body.publicado !== false && !programadoPara) {
+          const filaNueva = await env.DB.prepare("SELECT id FROM articles WHERE slug = ?").bind(slug).first();
+          if (filaNueva) fueraCalendario = await marcarFueraDeCalendario(env, filaNueva.id, { tipo: body.tipo, resultado_id: resultadoId });
+        }
+
         const publicado = body.publicado !== false;
         const tipoLabel = { noticia: "Noticia", cronica: "Crónica", opinion: "Opinión", entrevista: "Entrevista" }[body.tipo] || "Artículo";
         const firmaAutores = coautorNombre ? `${autorNombre} y ${coautorNombre}` : autorNombre;
@@ -8069,7 +8207,7 @@ async function handlePrimary(request, env, ctx) {
             : `Ha ${publicado ? "publicado" : "guardado el borrador de"} "${tipoLabel.toLowerCase()}": "${body.titulo}"${estadoBorrador ? ` (${estadoBorrador === "terminado" ? "terminado" : "en proceso"})` : ""}${esUltimaHora ? " (Última hora)" : ""}`,
         }));
 
-        return json({ ok: true, slug, publicado, estado_borrador: estadoBorrador, programado_para: programadoPara, avisos_traduccion: avisosTraduccion });
+        return json({ ok: true, slug, publicado, fuera_calendario: fueraCalendario, estado_borrador: estadoBorrador, programado_para: programadoPara, avisos_traduccion: avisosTraduccion });
       }
 
       // ---------- ARTICLE individual ----------
@@ -8317,7 +8455,7 @@ async function handlePrimary(request, env, ctx) {
         // Solo el autor (o coautor, o un admin, o alguien con una
         // solicitud de edición aprobada y vigente para esta noticia)
         // puede editarla.
-        const articuloParaPermiso = await env.DB.prepare("SELECT slug, autor_id, coautor_id, publicado, estado_borrador, fecha_publicacion, slug_congelado, resultado_id, tipo, categoria, club, ficha_tecnica, banner_urgente FROM articles WHERE id = ?").bind(id).first();
+        const articuloParaPermiso = await env.DB.prepare("SELECT slug, autor_id, coautor_id, publicado, estado_borrador, fecha_publicacion, slug_congelado, resultado_id, tipo, categoria, club, ficha_tecnica, banner_urgente, fuera_calendario FROM articles WHERE id = ?").bind(id).first();
         if (!articuloParaPermiso) return json({ error: "Noticia no encontrada" }, 404);
         if (!(await puedeEditar(env, payload, "articulo", id, articuloParaPermiso.autor_id, articuloParaPermiso.coautor_id))) {
           return json({ error: "No puedes editar esta noticia porque no es tuya. Solicita permiso al autor o a un administrador." }, 403);
@@ -8537,6 +8675,14 @@ async function handlePrimary(request, env, ctx) {
         ).run();
         await registrarRedirectSiCambia(env, id, articuloParaPermiso.slug, slug);
 
+        // Horario de publicación: solo se evalúa cuando esta edición
+        // publica por primera vez un borrador; si ya estaba publicada se
+        // conserva la marca que tuviera.
+        let fueraCalendario = !!articuloParaPermiso.fuera_calendario;
+        if (!articuloParaPermiso.publicado && vaAPublicarseAhora) {
+          fueraCalendario = await marcarFueraDeCalendario(env, id, { tipo: tipoFinal, resultado_id: resultadoIdFinal });
+        }
+
         // Si esta edición vincula por primera vez la noticia a un
         // partido (no lo tenía antes y ahora sí), cualquier alineación
         // que la noticia tuviera colgada de sí misma (article_id) pasa a
@@ -8595,7 +8741,7 @@ async function handlePrimary(request, env, ctx) {
           accion: "editar_articulo", entidad: "articulo", entidad_id: id,
           descripcion: `Ha editado la noticia/crónica "${body.titulo}"${estadoBorrador ? ` (${estadoBorrador === "terminado" ? "borrador terminado" : "borrador en proceso"})` : ""}${esEdicionAjenaPorNivel4 ? " (revisión de contenido ajeno, Nivel 4)" : ""}`,
         }));
-        return json({ ok: true, slug, publicado: body.publicado === false ? 0 : 1, estado_borrador: estadoBorrador, programado_para: programadoPara, avisos_traduccion: avisosTraduccion });
+        return json({ ok: true, slug, publicado: body.publicado === false ? 0 : 1, fuera_calendario: fueraCalendario, estado_borrador: estadoBorrador, programado_para: programadoPara, avisos_traduccion: avisosTraduccion });
       }
 
       if (articleMatch && method === "DELETE") {
