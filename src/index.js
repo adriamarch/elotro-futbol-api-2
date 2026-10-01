@@ -2797,11 +2797,11 @@ async function esCronicaDeJornadaAnterior(env, resultadoId, hoyYmd) {
 }
 
 // true si publicar este artículo AHORA cae fuera del horario configurado.
-async function estaFueraDeCalendario(env, { tipo, resultado_id }) {
+async function estaFueraDeCalendario(env, { tipo, resultado_id, fecha }) {
   const horario = await obtenerHorarioPublicacion(env);
   if (!horario.activo) return false;
   const tipoArticulo = tipo || "noticia";
-  const hoy = hoyEnMadrid();
+  const hoy = hoyEnMadrid(fecha || new Date());
   let tipoHorario = tipoArticulo;
   if (tipoArticulo === "cronica") {
     // "cronica_anterior" ya no es una columna del horario: no está en TIPOS_HORARIO,
@@ -2819,6 +2819,45 @@ async function marcarFueraDeCalendario(env, articuloId, datos) {
   try { fuera = await estaFueraDeCalendario(env, datos); } catch (err) { console.error("horario_publicacion:", err); }
   await env.DB.prepare("UPDATE articles SET fuera_calendario = ? WHERE id = ?").bind(fuera ? 1 : 0, articuloId).run();
   return fuera;
+}
+
+// La marca articles.fuera_calendario se guarda una sola vez, al publicar. Eso
+// deja sin marcar lo publicado antes de activar el horario (o programado para
+// un día no permitido), y el panel seguía ofreciendo "Compartir". Para el
+// listado del panel se vuelve a evaluar aquí, al leer, con el horario actual:
+// si la fecha de publicación (o la programada) cae en un día en el que su tipo
+// no está marcado, se devuelve fuera_calendario = 1. Solo añade marcas; nunca
+// quita una que ya estuviera guardada.
+function fechaSqlADate(valor) {
+  if (!valor) return null;
+  let t = String(valor).trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) t += "T12:00:00Z";
+  else if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(t)) t = t.replace(" ", "T") + (/(Z|[+-]\d{2}:?\d{2})$/.test(t) ? "" : "Z");
+  const d = new Date(t);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+async function aplicarFueraCalendarioEnLectura(env, articulos) {
+  let horario;
+  try { horario = await obtenerHorarioPublicacion(env); } catch (err) { console.error("horario_publicacion:", err); return articulos; }
+  if (!horario.activo) return articulos;
+  const cacheAnterior = new Map();
+  return Promise.all(articulos.map(async (a) => {
+    if (a.fuera_calendario) return a;
+    if (!a.publicado && !a.programado_para) return a; // borrador: aún no se publica
+    const fecha = fechaSqlADate(a.publicado ? a.fecha_publicacion : a.programado_para);
+    if (!fecha) return a;
+    const { dia, ymd } = hoyEnMadrid(fecha);
+    const tipoArticulo = a.tipo || "noticia";
+    let tipoHorario = tipoArticulo;
+    if (tipoArticulo === "cronica") {
+      const clave = `${a.resultado_id || 0}|${ymd}`;
+      if (!cacheAnterior.has(clave)) cacheAnterior.set(clave, await esCronicaDeJornadaAnterior(env, a.resultado_id, ymd).catch(() => false));
+      tipoHorario = cacheAnterior.get(clave) ? "cronica_anterior" : "cronica_actual";
+    }
+    if (!IDS_TIPOS_HORARIO.includes(tipoHorario)) return a;
+    return horario.dias[dia].includes(tipoHorario) ? a : { ...a, fuera_calendario: 1 };
+  }));
 }
 
 // ---------- Permisos por autor + solicitudes de edición ----------
@@ -7968,7 +8007,9 @@ async function handlePrimary(request, env, ctx) {
         query += " ORDER BY fecha_publicacion DESC LIMIT ?";
         binds.push(limit);
 
-        const { results } = await env.DB.prepare(query).bind(...binds).all();
+        const { results: resultadosBD } = await env.DB.prepare(query).bind(...binds).all();
+        // Vista admin: se reevalúa el horario al leer (ver aplicarFueraCalendarioEnLectura).
+        const results = admin ? await aplicarFueraCalendarioEnLectura(env, resultadosBD) : resultadosBD;
         // Reconstruye, a partir de las longitudes pedidas, los mismos
         // campos "contenido_XX" que espera conIdiomasDisponibles (solo le
         // importa si están vacíos o no), sin haber transferido el texto.
@@ -8154,6 +8195,10 @@ async function handlePrimary(request, env, ctx) {
         if (body.publicado !== false && !programadoPara) {
           const filaNueva = await env.DB.prepare("SELECT id FROM articles WHERE slug = ?").bind(slug).first();
           if (filaNueva) fueraCalendario = await marcarFueraDeCalendario(env, filaNueva.id, { tipo: body.tipo, resultado_id: resultadoId });
+        } else if (programadoPara) {
+          // Programada: se avisa ya si su día/hora cae fuera del horario, para no
+          // ofrecer "Compartir". La marca definitiva la guarda el cron al publicarse.
+          try { fueraCalendario = await estaFueraDeCalendario(env, { tipo: body.tipo, resultado_id: resultadoId, fecha: fechaSqlADate(programadoPara) || undefined }); } catch (err) { console.error("horario_publicacion:", err); }
         }
 
         const publicado = body.publicado !== false;
