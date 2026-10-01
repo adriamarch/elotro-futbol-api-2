@@ -6799,6 +6799,21 @@ async function handlePrimary(request, env, ctx) {
       // ---------- HORARIO DE PUBLICACIÓN ----------
       // Misma lógica que worker/src/index.js: lo consulta cualquier usuario
       // con sesión; solo un admin lo modifica.
+      // ¿Se puede compartir esta noticia en redes? Se evalúa en el momento de abrir
+      // "Compartir" con el horario actual (no solo con la marca guardada al publicar).
+      const compartirPermitidoMatch = path.match(/^\/api\/articles\/(\d+)\/compartir-permitido$/);
+      if (compartirPermitidoMatch && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const art = await env.DB.prepare(
+          "SELECT id, tipo, resultado_id, publicado, programado_para, fecha_publicacion, fuera_calendario FROM articles WHERE id = ?"
+        ).bind(parseInt(compartirPermitidoMatch[1], 10)).first();
+        if (!art) return json({ error: "Noticia no encontrada" }, 404);
+        const [evaluada] = await aplicarFueraCalendarioEnLectura(env, [art]);
+        const fuera = !!(evaluada && evaluada.fuera_calendario);
+        return json({ permitido: !fuera, fuera_calendario: fuera });
+      }
+
       if (path === "/api/horario-publicacion" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
