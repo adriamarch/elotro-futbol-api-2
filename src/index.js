@@ -9286,6 +9286,58 @@ async function handlePrimary(request, env, ctx) {
         return json({ ok: true, id: meta.last_row_id });
       }
 
+      // Borra un producto del catálogo. Si ya tiene pedidos (aunque estén
+      // cancelados) NO se borra: tienda_pedidos.producto_id apunta a esta
+      // tabla y se perdería el historial. En ese caso se pide ocultarlo.
+      if (path.match(/^\/api\/tienda\/productos\/\d+$/) && method === "DELETE") {
+        const payload = await requireAuthTienda(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!(await puedeGestionarTienda(env, payload))) {
+          return json({ error: "No tienes permiso para gestionar la tienda" }, 403);
+        }
+        const productoId = parseInt(path.split("/").pop(), 10);
+        const producto = await env.DB.prepare(
+          "SELECT id, nombre FROM tienda_productos WHERE id = ?"
+        ).bind(productoId).first();
+        if (!producto) return json({ error: "Producto no encontrado" }, 404);
+        const pedidos = await env.DB.prepare(
+          "SELECT COUNT(*) AS n FROM tienda_pedidos WHERE producto_id = ?"
+        ).bind(productoId).first();
+        if (pedidos && Number(pedidos.n) > 0) {
+          return json({ error: `Este producto tiene ${pedidos.n} pedido(s) y no se puede borrar sin perder el historial. Ocúltalo en su lugar.` }, 409);
+        }
+        await env.DB.prepare("DELETE FROM tienda_productos WHERE id = ?").bind(productoId).run();
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "borrar_producto_tienda", entidad: "producto_tienda", entidad_id: productoId,
+          descripcion: `${payload.nombre} ha borrado el producto "${producto.nombre}" de la tienda`,
+        }));
+        return json({ ok: true });
+      }
+
+      // Duplica un producto: crea una copia oculta con "(copia)" en el nombre.
+      if (path.match(/^\/api\/tienda\/productos\/\d+\/duplicar$/) && method === "POST") {
+        const payload = await requireAuthTienda(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!(await puedeGestionarTienda(env, payload))) {
+          return json({ error: "No tienes permiso para gestionar la tienda" }, 403);
+        }
+        const productoId = parseInt(path.split("/")[4], 10);
+        const orig = await env.DB.prepare(
+          "SELECT nombre, descripcion, precio_centimos, imagen_url, imagenes, stock, variantes, orden FROM tienda_productos WHERE id = ?"
+        ).bind(productoId).first();
+        if (!orig) return json({ error: "Producto no encontrado" }, 404);
+        const nombreCopia = `${orig.nombre} (copia)`;
+        const { meta } = await env.DB.prepare(
+          `INSERT INTO tienda_productos (nombre, descripcion, precio_centimos, imagen_url, imagenes, stock, variantes, orden, activo)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`
+        ).bind(nombreCopia, orig.descripcion, orig.precio_centimos, orig.imagen_url, orig.imagenes, orig.stock, orig.variantes, orig.orden).run();
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "crear_producto_tienda", entidad: "producto_tienda", entidad_id: meta.last_row_id,
+          descripcion: `${payload.nombre} ha duplicado el producto "${orig.nombre}" en la tienda`,
+        }));
+        return json({ ok: true, id: meta.last_row_id });
+      }
+
       // Edita un producto existente (datos, o solo activo/inactivo si el
       // body trae únicamente ese campo).
       if (path.match(/^\/api\/tienda\/productos\/\d+$/) && method === "PUT") {
