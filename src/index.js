@@ -1626,6 +1626,48 @@ async function requireAuth(request, env, url) {
   return payload;
 }
 
+// Variante de requireAuth para las rutas de la TIENDA (/api/tienda/*).
+// Mismo motivo que requireAuthSubida (ver más abajo/arriba según worker): una
+// sesión válida podía dar 401 "No autorizado" solo porque su fila no estaba
+// en la tabla "sessions" de este backend (token emitido por el otro
+// backend, réplica con lag, sesión creada en otro sitio). Aquí:
+//   - fila de sesión AUSENTE  -> no es motivo de rechazo.
+//   - fila de sesión REVOCADA -> se rechaza.
+// Siguen siendo obligatorios: JWT firmado y sin caducar, y usuario activo.
+async function requireAuthTienda(request, env) {
+  const estricto = await requireAuth(request, env);
+  if (estricto) return estricto;
+
+  const auth = request.headers.get("Authorization") || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+  if (!token) return null;
+
+  let payload;
+  try {
+    payload = await verifyJWT(token, env.JWT_SECRET);
+  } catch {
+    return null;
+  }
+  if (!payload || !payload.uid) return null;
+
+  try {
+    if (payload.sid) {
+      const sesion = await env.DB.prepare(
+        "SELECT revoked_at FROM sessions WHERE id = ? AND user_id = ?"
+      ).bind(payload.sid, payload.uid).first();
+      if (sesion && sesion.revoked_at) return null;
+    }
+    const usuario = await env.DB.prepare(
+      "SELECT id FROM users WHERE id = ? AND activo = 1"
+    ).bind(payload.uid).first();
+    if (!usuario) return null;
+  } catch (err) {
+    console.error("requireAuthTienda: no se pudo comprobar la sesión/usuario:", err.message);
+    return null;
+  }
+  return payload;
+}
+
 // ---------- Colaboradores: roles y permisos ----------
 // Espejo exacto de los helpers equivalentes en worker/src/index.js (D1):
 // ver ahí la explicación completa. Se mantienen sincronizados a mano
@@ -9141,7 +9183,7 @@ async function handlePrimary(request, env, ctx) {
       // Catálogo de productos activos, visible para cualquier persona
       // logueada en el panel (no hace falta ser admin para ver la tienda).
       if (path === "/api/tienda/productos" && method === "GET") {
-        const payload = await requireAuth(request, env);
+        const payload = await requireAuthTienda(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         const { results: productos } = await env.DB.prepare(
           `SELECT p.id, p.nombre, p.descripcion, p.precio_centimos, p.imagen_url, p.imagenes, p.variantes, p.stock,
@@ -9158,7 +9200,7 @@ async function handlePrimary(request, env, ctx) {
       // Listado completo, incluidos los productos desactivados, para la
       // subtab "Productos" del panel de gestión.
       if (path === "/api/tienda/productos/todos" && method === "GET") {
-        const payload = await requireAuth(request, env);
+        const payload = await requireAuthTienda(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         if (!(await puedeGestionarTienda(env, payload))) {
           return json({ error: "No tienes permiso para gestionar la tienda" }, 403);
@@ -9219,7 +9261,7 @@ async function handlePrimary(request, env, ctx) {
 
       // Crea un producto nuevo en el catálogo.
       if (path === "/api/tienda/productos" && method === "POST") {
-        const payload = await requireAuth(request, env);
+        const payload = await requireAuthTienda(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         if (!(await puedeGestionarTienda(env, payload))) {
           return json({ error: "No tienes permiso para gestionar la tienda" }, 403);
@@ -9247,7 +9289,7 @@ async function handlePrimary(request, env, ctx) {
       // Edita un producto existente (datos, o solo activo/inactivo si el
       // body trae únicamente ese campo).
       if (path.match(/^\/api\/tienda\/productos\/\d+$/) && method === "PUT") {
-        const payload = await requireAuth(request, env);
+        const payload = await requireAuthTienda(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         if (!(await puedeGestionarTienda(env, payload))) {
           return json({ error: "No tienes permiso para gestionar la tienda" }, 403);
@@ -9301,7 +9343,7 @@ async function handlePrimary(request, env, ctx) {
       // redactor escribe (p.ej. el concepto que ha puesto en el Bizum)
       // para que sea fácil de localizar al confirmarlo.
       if (path === "/api/tienda/pedidos" && method === "POST") {
-        const payload = await requireAuth(request, env);
+        const payload = await requireAuthTienda(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         const body = await request.json();
         const productoId = parseInt(body.producto_id, 10);
@@ -9362,7 +9404,7 @@ async function handlePrimary(request, env, ctx) {
       // Pedidos del propio redactor (para ver en qué estado está lo que
       // ha pedido: pendiente de pago, pagado, enviado...).
       if (path === "/api/tienda/mis-pedidos" && method === "GET") {
-        const payload = await requireAuth(request, env);
+        const payload = await requireAuthTienda(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         const { results: pedidos } = await env.DB.prepare(
           `SELECT id, producto_nombre, variante, precio_centimos, estado, referencia_pago, created_at
@@ -9375,7 +9417,7 @@ async function handlePrimary(request, env, ctx) {
       // siga "pendiente_pago" (una vez pagado/enviado ya no se puede
       // cancelar desde aquí; eso lo gestiona quien administra la tienda).
       if (path.match(/^\/api\/tienda\/mis-pedidos\/\d+\/cancelar$/) && method === "PUT") {
-        const payload = await requireAuth(request, env);
+        const payload = await requireAuthTienda(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         const pedidoId = parseInt(path.split("/")[3], 10);
         const pedido = await env.DB.prepare(
@@ -9407,7 +9449,7 @@ async function handlePrimary(request, env, ctx) {
       // enviar, primero hay que cancelarlo o esperar a que se gestione,
       // para no perder de vista un Bizum que aún puede estar en curso.
       if (path.match(/^\/api\/tienda\/mis-pedidos\/\d+$/) && method === "DELETE") {
-        const payload = await requireAuth(request, env);
+        const payload = await requireAuthTienda(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         const pedidoId = parseInt(path.split("/").pop(), 10);
         const pedido = await env.DB.prepare(
@@ -9432,7 +9474,7 @@ async function handlePrimary(request, env, ctx) {
       // Todos los pedidos de todo el mundo: solo para quien puede
       // gestionar la tienda (admin o redactor con el permiso concedido).
       if (path === "/api/tienda/pedidos" && method === "GET") {
-        const payload = await requireAuth(request, env);
+        const payload = await requireAuthTienda(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         if (!(await puedeGestionarTienda(env, payload))) {
           return json({ error: "No tienes permiso para gestionar la tienda" }, 403);
@@ -9456,7 +9498,7 @@ async function handlePrimary(request, env, ctx) {
       // Cambia el estado de un pedido (confirmar pago, marcar enviado,
       // cancelar...). Solo quien puede gestionar la tienda.
       if (path.match(/^\/api\/tienda\/pedidos\/\d+$/) && method === "PUT") {
-        const payload = await requireAuth(request, env);
+        const payload = await requireAuthTienda(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         if (!(await puedeGestionarTienda(env, payload))) {
           return json({ error: "No tienes permiso para gestionar la tienda" }, 403);
@@ -9493,7 +9535,7 @@ async function handlePrimary(request, env, ctx) {
       // que quien gestiona puede necesitar limpiar pedidos duplicados,
       // de prueba o mal introducidos en cualquier momento.
       if (path.match(/^\/api\/tienda\/pedidos\/\d+$/) && method === "DELETE") {
-        const payload = await requireAuth(request, env);
+        const payload = await requireAuthTienda(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         if (!(await puedeGestionarTienda(env, payload))) {
           return json({ error: "No tienes permiso para gestionar la tienda" }, 403);
