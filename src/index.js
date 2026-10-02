@@ -2923,6 +2923,13 @@ async function puedeEditar(env, payload, tipoEntidad, entidadId, autorId, coauto
 //   normalmente; >0 cuando se arranca tarde, ver más abajo).
 async function iniciarCronometroPartido(env, resultadoId, minutoInicial = 0) {
   const minutos = Number.isFinite(minutoInicial) && minutoInicial > 0 ? Math.floor(minutoInicial) : 0;
+  // Margen de seguridad al retomar/arrancar con minuto inicial > 0 (p. ej.
+  // la 2ª parte tras el descanso, que debe mostrar 45' desde el primer
+  // segundo). El reloj se calcula en cada navegador con Math.floor((Date.now()
+  // - inicio) / 60000); si el reloj del dispositivo va unos segundos por
+  // detrás del servidor, justo al reanudar salía 44:5x y se mostraba el 44.
+  // Adelantamos el inicio 10 s para absorber ese desfase.
+  const segundosMargen = minutos > 0 ? 10 : 0;
   // Se limpia aviso_desatendido_mitad al (re)arrancar el partido, sea la
   // primera vez o tras reabrirlo (estaba finalizado/retrasado/anulado y
   // un admin lo vuelve a poner en juego). Sin este reset, un partido que
@@ -2949,7 +2956,7 @@ async function iniciarCronometroPartido(env, resultadoId, minutoInicial = 0) {
        ajuste_cronometro_minutos = 0, estado = 'en_juego', aviso_desatendido_mitad = NULL,
        goles_local = COALESCE(goles_local, 0), goles_visitante = COALESCE(goles_visitante, 0)
        WHERE id = ?`
-  ).bind(`-${minutos} minutes`, resultadoId).run();
+  ).bind(`-${minutos * 60 + segundosMargen} seconds`, resultadoId).run();
 }
 
 // Revisa cada minuto (mismo cron que ya revisaba artículos programados)
