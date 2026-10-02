@@ -9105,21 +9105,50 @@ async function handlePrimary(request, env, ctx) {
         return !!(fila && fila.puede_gestionar_tienda === 1);
       }
 
+      // Datos de un producto tal como los consume el panel: variantes e
+      // imágenes extra ya parseadas y las unidades que quedan. "stock" es
+      // el total de unidades (NULL = sin límite) y "disponibles" = stock
+      // menos las unidades ya pedidas sin cancelar. Se calcula sobre los
+      // pedidos en vez de descontar a mano del stock: así cancelar o
+      // borrar un pedido devuelve la unidad sin tocar nada más.
+      const SQL_UNIDADES_PEDIDAS = `(SELECT COUNT(*) FROM tienda_pedidos tp WHERE tp.producto_id = p.id AND tp.estado != 'cancelado')`;
+      function parsearListaJsonTienda(texto) {
+        try {
+          const v = JSON.parse(texto);
+          return Array.isArray(v) ? v : [];
+        } catch {
+          return [];
+        }
+      }
+      function prepararProductoTienda(p, { gestion = false } = {}) {
+        const stock = p.stock === null || p.stock === undefined ? null : Number(p.stock);
+        const pedidas = Number(p.pedidas) || 0;
+        const salida = {
+          ...p,
+          variantes: p.variantes ? parsearListaJsonTienda(p.variantes) : [],
+          imagenes: p.imagenes ? parsearListaJsonTienda(p.imagenes) : [],
+          stock,
+          pedidas,
+          disponibles: stock === null ? null : Math.max(0, stock - pedidas),
+        };
+        if (!gestion) {
+          delete salida.stock;
+          delete salida.pedidas;
+        }
+        return salida;
+      }
+
       // Catálogo de productos activos, visible para cualquier persona
       // logueada en el panel (no hace falta ser admin para ver la tienda).
       if (path === "/api/tienda/productos" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         const { results: productos } = await env.DB.prepare(
-          `SELECT id, nombre, descripcion, precio_centimos, imagen_url, variantes
-           FROM tienda_productos WHERE activo = 1 ORDER BY orden ASC, id ASC`
+          `SELECT p.id, p.nombre, p.descripcion, p.precio_centimos, p.imagen_url, p.imagenes, p.variantes, p.stock,
+                  ${SQL_UNIDADES_PEDIDAS} AS pedidas
+           FROM tienda_productos p WHERE p.activo = 1 ORDER BY p.orden ASC, p.id ASC`
         ).all();
-        return json({
-          productos: productos.map((p) => ({
-            ...p,
-            variantes: p.variantes ? JSON.parse(p.variantes) : [],
-          })),
-        });
+        return json({ productos: productos.map((p) => prepararProductoTienda(p)) });
       }
 
       // ---------- Gestión del catálogo (crear/editar/activar productos) ----------
@@ -9135,15 +9164,11 @@ async function handlePrimary(request, env, ctx) {
           return json({ error: "No tienes permiso para gestionar la tienda" }, 403);
         }
         const { results: productos } = await env.DB.prepare(
-          `SELECT id, nombre, descripcion, precio_centimos, imagen_url, variantes, activo, orden
-           FROM tienda_productos ORDER BY orden ASC, id ASC`
+          `SELECT p.id, p.nombre, p.descripcion, p.precio_centimos, p.imagen_url, p.imagenes, p.variantes, p.stock,
+                  p.activo, p.orden, ${SQL_UNIDADES_PEDIDAS} AS pedidas
+           FROM tienda_productos p ORDER BY p.orden ASC, p.id ASC`
         ).all();
-        return json({
-          productos: productos.map((p) => ({
-            ...p,
-            variantes: p.variantes ? JSON.parse(p.variantes) : [],
-          })),
-        });
+        return json({ productos: productos.map((p) => prepararProductoTienda(p, { gestion: true })) });
       }
 
       // Valida y normaliza los campos de un producto recibidos del panel,
@@ -9162,11 +9187,31 @@ async function handlePrimary(request, env, ctx) {
             .map((v) => (typeof v === "string" ? v.trim() : ""))
             .filter(Boolean);
         }
+        // Stock total: vacío/null = sin límite. Si se indica, entero >= 0.
+        let stock = null;
+        if (body.stock !== undefined && body.stock !== null && String(body.stock).trim() !== "") {
+          const s = Number(body.stock);
+          if (!Number.isInteger(s) || s < 0) {
+            throw new Error("El stock debe ser un número entero de 0 o más (déjalo vacío para no limitarlo)");
+          }
+          stock = s;
+        }
+        // Imágenes adicionales (galería de la ficha), máximo 8, solo
+        // URLs http(s); la imagen principal sigue siendo imagen_url.
+        let imagenes = [];
+        if (Array.isArray(body.imagenes)) {
+          imagenes = body.imagenes
+            .map((u) => (typeof u === "string" ? u.trim() : ""))
+            .filter((u) => /^https?:\/\//i.test(u))
+            .slice(0, 8);
+        }
         return {
           nombre,
           descripcion: normalizarTexto(body.descripcion),
           precio_centimos: precio,
           imagen_url: normalizarTexto(body.imagen_url),
+          imagenes: JSON.stringify(imagenes),
+          stock,
           variantes: JSON.stringify(variantes),
           orden: Number.isInteger(Number(body.orden)) ? Number(body.orden) : 0,
         };
@@ -9187,9 +9232,9 @@ async function handlePrimary(request, env, ctx) {
           return json({ error: err.message }, 400);
         }
         const { meta } = await env.DB.prepare(
-          `INSERT INTO tienda_productos (nombre, descripcion, precio_centimos, imagen_url, variantes, orden)
-           VALUES (?, ?, ?, ?, ?, ?)`
-        ).bind(campos.nombre, campos.descripcion, campos.precio_centimos, campos.imagen_url, campos.variantes, campos.orden).run();
+          `INSERT INTO tienda_productos (nombre, descripcion, precio_centimos, imagen_url, imagenes, stock, variantes, orden)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(campos.nombre, campos.descripcion, campos.precio_centimos, campos.imagen_url, campos.imagenes, campos.stock, campos.variantes, campos.orden).run();
 
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "crear_producto_tienda", entidad: "producto_tienda", entidad_id: meta.last_row_id,
@@ -9233,12 +9278,12 @@ async function handlePrimary(request, env, ctx) {
         const activo = typeof body.activo === "boolean" ? (body.activo ? 1 : 0) : undefined;
         const resultado = await env.DB.prepare(
           `UPDATE tienda_productos
-           SET nombre = ?, descripcion = ?, precio_centimos = ?, imagen_url = ?, variantes = ?, orden = ?,
+           SET nombre = ?, descripcion = ?, precio_centimos = ?, imagen_url = ?, imagenes = ?, stock = ?, variantes = ?, orden = ?,
                activo = ${activo === undefined ? "activo" : "?"}
            WHERE id = ?`
         ).bind(...(activo === undefined
-          ? [campos.nombre, campos.descripcion, campos.precio_centimos, campos.imagen_url, campos.variantes, campos.orden, productoId]
-          : [campos.nombre, campos.descripcion, campos.precio_centimos, campos.imagen_url, campos.variantes, campos.orden, activo, productoId]
+          ? [campos.nombre, campos.descripcion, campos.precio_centimos, campos.imagen_url, campos.imagenes, campos.stock, campos.variantes, campos.orden, productoId]
+          : [campos.nombre, campos.descripcion, campos.precio_centimos, campos.imagen_url, campos.imagenes, campos.stock, campos.variantes, campos.orden, activo, productoId]
         )).run();
         if (!resultado.meta.changes) return json({ error: "Producto no encontrado" }, 404);
 
@@ -9273,19 +9318,45 @@ async function handlePrimary(request, env, ctx) {
         }
         const referenciaPago = normalizarTexto(body.referencia_pago);
 
-        const { meta } = await env.DB.prepare(
-          `INSERT INTO tienda_pedidos
-             (usuario_id, producto_id, producto_nombre, variante, precio_centimos, referencia_pago)
-           VALUES (?, ?, ?, ?, ?, ?)`
-        ).bind(payload.uid, producto.id, producto.nombre, variantesDisponibles.length ? variante : null,
-               producto.precio_centimos, referenciaPago).run();
+        // Cantidad: cada unidad es una fila de tienda_pedidos (ver
+        // migracion_tienda.sql), así que pedir 3 crea 3 pedidos que se
+        // gestionan por separado. Máximo 10 por pedido para evitar
+        // errores de dedo.
+        const cantidad = body.cantidad === undefined || body.cantidad === null ? 1 : Number(body.cantidad);
+        if (!Number.isInteger(cantidad) || cantidad < 1 || cantidad > 10) {
+          return json({ error: "La cantidad debe ser un número entre 1 y 10" }, 400);
+        }
+
+        // Stock: si el producto lo limita, se comprueba contra las
+        // unidades ya pedidas (sin contar las canceladas).
+        if (producto.stock !== null && producto.stock !== undefined) {
+          const fila = await env.DB.prepare(
+            "SELECT COUNT(*) AS n FROM tienda_pedidos WHERE producto_id = ? AND estado != 'cancelado'"
+          ).bind(producto.id).first();
+          const quedan = Math.max(0, Number(producto.stock) - (Number(fila?.n) || 0));
+          if (quedan <= 0) return json({ error: "Este producto está agotado" }, 409);
+          if (cantidad > quedan) {
+            return json({ error: `Solo quedan ${quedan} unidad${quedan === 1 ? "" : "es"} de este producto` }, 409);
+          }
+        }
+
+        const pedidosIds = [];
+        for (let i = 0; i < cantidad; i++) {
+          const { meta } = await env.DB.prepare(
+            `INSERT INTO tienda_pedidos
+               (usuario_id, producto_id, producto_nombre, variante, precio_centimos, referencia_pago)
+             VALUES (?, ?, ?, ?, ?, ?)`
+          ).bind(payload.uid, producto.id, producto.nombre, variantesDisponibles.length ? variante : null,
+                 producto.precio_centimos, referenciaPago).run();
+          pedidosIds.push(meta.last_row_id);
+        }
 
         ctx.waitUntil(registrarActividad(env, request, payload, {
-          accion: "crear_pedido_tienda", entidad: "pedido_tienda", entidad_id: meta.last_row_id,
-          descripcion: `${payload.nombre} ha pedido "${producto.nombre}"${variante ? " (" + variante + ")" : ""} en la tienda`,
+          accion: "crear_pedido_tienda", entidad: "pedido_tienda", entidad_id: pedidosIds[0],
+          descripcion: `${payload.nombre} ha pedido ${cantidad > 1 ? cantidad + " x " : ""}"${producto.nombre}"${variante ? " (" + variante + ")" : ""} en la tienda`,
         }));
 
-        return json({ ok: true, pedido_id: meta.last_row_id });
+        return json({ ok: true, pedido_id: pedidosIds[0], pedidos_ids: pedidosIds, cantidad });
       }
 
       // Pedidos del propio redactor (para ver en qué estado está lo que
