@@ -9501,9 +9501,12 @@ async function handlePrimary(request, env, ctx) {
       }
 
       // ---------- Encuestas ----------
-      // Solo puede votar un lector con cuenta, logueado (sesión válida,
-      // vía requireReaderAuth, igual que para comentar) y con el email
-      // verificado: mismo requisito que ya existe para comentar. Una
+      // Votar es libre: cualquier lector puede votar SIN cuenta y SIN
+      // iniciar sesión. Para no contar dos veces a la misma persona se usa
+      // un hash no reversible de IP + User-Agent (+ id de encuesta + secreto
+      // del servidor), igual que ya se hace en analíticas (ver
+      // hashVisitante): no se guarda ni la IP ni nada que identifique a
+      // nadie, y no hace falta ninguna cookie ni localStorage. Una
       // encuesta puede vivir en una noticia (article_id), en portada
       // (en_portada), en ambos sitios, o solo en portada sin noticia.
 
@@ -9518,11 +9521,13 @@ async function handlePrimary(request, env, ctx) {
         ).run();
       }
 
-      // Arma el objeto de encuesta con recuento de votos por opción y,
-      // si se pasa readerId, qué opción votó ese lector (o null si no ha
-      // votado). Los recuentos siempre se devuelven (no hay razón para
-      // ocultar resultados agregados), lo único restringido es el voto.
-      async function obtenerEncuestaConResultados(env, poll, readerId) {
+      // Arma el objeto de encuesta con recuento de votos por opción y qué
+      // opción votó quien consulta (mi_voto, o null si no ha votado). A
+      // quien consulta se le reconoce por el hash anónimo de IP +
+      // User-Agent (ver hashVotanteEncuesta) y, solo si además trae una
+      // sesión de lector válida (readerId), por un voto antiguo de cuando
+      // votar exigía cuenta. Los recuentos siempre se devuelven.
+      async function obtenerEncuestaConResultados(env, poll, request, readerId) {
         const { results: opciones } = await env.DB.prepare(
           `SELECT po.id, po.texto, po.orden, COUNT(pv.id) AS votos
            FROM poll_options po
@@ -9535,11 +9540,18 @@ async function handlePrimary(request, env, ctx) {
         const totalVotos = opciones.reduce((acc, o) => acc + o.votos, 0);
 
         let miVoto = null;
-        if (readerId) {
+        const voterHash = await hashVotanteEncuesta(request, env, poll.id);
+        if (voterHash) {
           const voto = await env.DB.prepare(
+            "SELECT option_id FROM poll_votes WHERE poll_id = ? AND voter_hash = ?"
+          ).bind(poll.id, voterHash).first();
+          if (voto) miVoto = voto.option_id;
+        }
+        if (miVoto === null && readerId) {
+          const votoAntiguo = await env.DB.prepare(
             "SELECT option_id FROM poll_votes WHERE poll_id = ? AND reader_id = ?"
           ).bind(poll.id, readerId).first();
-          if (voto) miVoto = voto.option_id;
+          if (votoAntiguo) miVoto = votoAntiguo.option_id;
         }
 
         return {
@@ -9555,19 +9567,41 @@ async function handlePrimary(request, env, ctx) {
         };
       }
 
-      // Comprueba que quien llama es un lector con cuenta activa, sesión
-      // válida y correo verificado. Devuelve el id del lector, o null +
-      // motivo si no cumple algún requisito (para poder distinguir en el
-      // frontend "no has iniciado sesión" de "verifica tu correo").
-      async function requireReaderVerificado(request, env) {
-        const payloadLector = await requireReaderAuth(request, env);
-        if (!payloadLector) return { readerId: null, motivo: "no_logueado" };
-        const lector = await env.DB.prepare(
-          "SELECT id, email_verificado FROM readers WHERE id = ? AND activo = 1"
-        ).bind(payloadLector.rid).first();
-        if (!lector) return { readerId: null, motivo: "no_logueado" };
-        if (!lector.email_verificado) return { readerId: null, motivo: "no_verificado" };
-        return { readerId: lector.id, motivo: null };
+      // Hash no reversible que identifica a quien vota SOLO dentro de una
+      // encuesta: IP + User-Agent + id de la encuesta + secreto del
+      // servidor. Lleva el id de la encuesta a propósito para que no se
+      // pueda enlazar a la misma persona entre encuestas distintas. NO
+      // lleva el día (a diferencia de hashVisitante): un voto debe contar
+      // una sola vez por encuesta, no una vez al día. Devuelve null si no
+      // se puede determinar la IP: mejor rechazar el voto que juntar a
+      // todo el mundo bajo la misma IP "vacía" y falsear los resultados.
+      async function hashVotanteEncuesta(request, env, pollId) {
+        const ip =
+          request.headers.get("CF-Connecting-IP") ||
+          (request.headers.get("X-Forwarded-For") || "").split(",")[0].trim() ||
+          request.headers.get("X-Real-IP") ||
+          "";
+        if (!ip) return null;
+        const ua = request.headers.get("User-Agent") || "";
+        return sha1Hex(`encuesta|${pollId}|${ip}|${ua}|${env.JWT_SECRET || ""}`);
+      }
+
+      // Id del lector si la petición trae una sesión de lector válida y
+      // cuenta activa; null en cualquier otro caso. NO se exige: votar ya
+      // no requiere cuenta. Solo sirve para reconocer votos hechos cuando
+      // sí se exigía (filas con reader_id), y que quien votó entonces no
+      // pueda volver a votar y contar doble ni vea el formulario otra vez.
+      async function lectorOpcionalEncuestas(request, env) {
+        try {
+          const payloadLector = await requireReaderAuth(request, env);
+          if (!payloadLector) return null;
+          const lector = await env.DB.prepare(
+            "SELECT id FROM readers WHERE id = ? AND activo = 1"
+          ).bind(payloadLector.rid).first();
+          return lector ? lector.id : null;
+        } catch {
+          return null;
+        }
       }
 
       // Público: encuesta(s) destacada(s) en portada, ya abiertas o
@@ -9580,9 +9614,9 @@ async function handlePrimary(request, env, ctx) {
           `SELECT * FROM polls WHERE en_portada = 1 ORDER BY orden_portada ASC, id DESC`
         ).all();
 
-        const { readerId } = await requireReaderVerificado(request, env);
+        const readerId = await lectorOpcionalEncuestas(request, env);
         const conResultados = await Promise.all(
-          encuestas.map((p) => obtenerEncuestaConResultados(env, p, readerId))
+          encuestas.map((p) => obtenerEncuestaConResultados(env, p, request, readerId))
         );
         return json({ encuestas: conResultados });
       }
@@ -9597,21 +9631,18 @@ async function handlePrimary(request, env, ctx) {
         ).bind(articleId).first();
         if (!poll) return json({ encuesta: null });
 
-        const { readerId } = await requireReaderVerificado(request, env);
-        const conResultados = await obtenerEncuestaConResultados(env, poll, readerId);
+        const readerId = await lectorOpcionalEncuestas(request, env);
+        const conResultados = await obtenerEncuestaConResultados(env, poll, request, readerId);
         return json({ encuesta: conResultados });
       }
 
-      // Público: votar. Exige lector con cuenta activa, sesión válida y
-      // correo verificado; si no cumple alguno de los tres, error 403
-      // con un "motivo" que el frontend usa para mostrar el aviso
-      // correcto (iniciar sesión / verificar correo) en vez de las
-      // opciones de voto.
+      // Público: votar. Libre, sin cuenta ni sesión. Un solo voto por
+      // persona y encuesta (identificada por hashVotanteEncuesta): si ya
+      // había votado, esto cambia su voto a la nueva opción en vez de
+      // sumar uno nuevo.
       const votoEncuestaMatch = path.match(/^\/api\/polls\/(\d+)\/vote$/);
       if (votoEncuestaMatch && method === "POST") {
         const pollId = parseInt(votoEncuestaMatch[1]);
-        const { readerId, motivo } = await requireReaderVerificado(request, env);
-        if (!readerId) return json({ error: "No autorizado para votar", motivo }, 403);
 
         const poll = await env.DB.prepare("SELECT * FROM polls WHERE id = ?").bind(pollId).first();
         if (!poll) return json({ error: "Encuesta no encontrada" }, 404);
@@ -9622,7 +9653,7 @@ async function handlePrimary(request, env, ctx) {
           return json({ error: "Esta encuesta ya está cerrada" }, 409);
         }
 
-        const body = await request.json();
+        const body = await request.json().catch(() => ({}));
         const optionId = parseInt(body.option_id);
         if (!optionId) return json({ error: "Falta la opción elegida" }, 400);
         const opcion = await env.DB.prepare(
@@ -9630,14 +9661,33 @@ async function handlePrimary(request, env, ctx) {
         ).bind(optionId, pollId).first();
         if (!opcion) return json({ error: "Opción no válida para esta encuesta" }, 400);
 
-        // Un solo voto por lector y encuesta: si ya había votado, esto
-        // cambia su voto a la nueva opción en vez de sumar uno nuevo.
-        await env.DB.prepare(
-          `INSERT INTO poll_votes (poll_id, option_id, reader_id) VALUES (?, ?, ?)
-           ON CONFLICT(poll_id, reader_id) DO UPDATE SET option_id = excluded.option_id, created_at = datetime('now')`
-        ).bind(pollId, optionId, readerId).run();
+        const voterHash = await hashVotanteEncuesta(request, env, pollId);
+        if (!voterHash) {
+          return json({ error: "No se ha podido registrar tu voto en este momento. Inténtalo de nuevo más tarde." }, 503);
+        }
 
-        const conResultados = await obtenerEncuestaConResultados(env, poll, readerId);
+        // Voto antiguo, de cuando votar exigía cuenta: si quien vota trae
+        // una sesión de lector y ya tenía un voto así en esta encuesta, se
+        // actualiza ESE voto (no se crea otro, o contaría doble).
+        const readerId = await lectorOpcionalEncuestas(request, env);
+        const votoAntiguo = readerId
+          ? await env.DB.prepare(
+              "SELECT id FROM poll_votes WHERE poll_id = ? AND reader_id = ?"
+            ).bind(pollId, readerId).first()
+          : null;
+
+        if (votoAntiguo) {
+          await env.DB.prepare(
+            "UPDATE poll_votes SET option_id = ?, created_at = datetime('now') WHERE id = ?"
+          ).bind(optionId, votoAntiguo.id).run();
+        } else {
+          await env.DB.prepare(
+            `INSERT INTO poll_votes (poll_id, option_id, voter_hash) VALUES (?, ?, ?)
+             ON CONFLICT(poll_id, voter_hash) DO UPDATE SET option_id = excluded.option_id, created_at = datetime('now')`
+          ).bind(pollId, optionId, voterHash).run();
+        }
+
+        const conResultados = await obtenerEncuestaConResultados(env, poll, request, readerId);
         return json({ ok: true, encuesta: conResultados });
       }
 

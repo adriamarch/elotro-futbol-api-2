@@ -705,9 +705,14 @@ CREATE TABLE poll_votes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   poll_id INTEGER NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
   option_id INTEGER NOT NULL REFERENCES poll_options(id) ON DELETE CASCADE,
-  reader_id INTEGER NOT NULL REFERENCES readers(id),
+  -- Votar es libre (sin cuenta): reader_id solo lo tienen los votos antiguos,
+  -- de cuando votar exigía cuenta. Los votos nuevos se identifican por
+  -- voter_hash (hash no reversible de IP + User-Agent + encuesta + secreto).
+  reader_id INTEGER REFERENCES readers(id),
+  voter_hash TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  UNIQUE(poll_id, reader_id)
+  UNIQUE(poll_id, reader_id),
+  UNIQUE(poll_id, voter_hash)
 );
 CREATE INDEX idx_poll_votes_poll ON poll_votes(poll_id);
 CREATE INDEX idx_poll_votes_option ON poll_votes(option_id);
