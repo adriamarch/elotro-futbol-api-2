@@ -8419,7 +8419,7 @@ async function handlePrimary(request, env, ctx) {
             titulo_ca, LENGTH(contenido_ca) AS contenido_ca_len,
             titulo_gl, LENGTH(contenido_gl) AS contenido_gl_len,
             titulo_en, LENGTH(contenido_en) AS contenido_en_len,
-            ficha_tecnica, fuera_calendario,
+            ficha_tecnica, fuera_calendario, banner_urgente, banner_urgente_hasta,
             ${admin
               ? `CASE WHEN publicado = 1 AND tipo IN ('previa', 'cronica') AND resultado_id IS NOT NULL
                    THEN (SELECT COUNT(*) FROM articles b WHERE b.resultado_id = articles.resultado_id AND b.tipo = articles.tipo AND b.publicado = 1)
