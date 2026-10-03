@@ -3144,9 +3144,52 @@ async function crearDescansoAutomaticoAlMinuto45(env) {
     ).bind(partido.id).first();
     if (yaHuboDescanso) continue;
 
+    // Igual que el descanso manual del panel (mamPitarDescanso): se PARA
+    // el cronómetro en el 45 y se registra el evento. var_motivo =
+    // 'automatico' es la marca que usa reanudarSegundaParteAutomatica para
+    // saber que este descanso lo puso el cron y que, por tanto, también
+    // debe reanudarlo solo (un descanso pitado a mano nunca se reanuda
+    // solo). No se pinta en ningún sitio: solo se muestra para tipo 'var'.
     await env.DB.prepare(
-      `INSERT INTO match_events (resultado_id, tipo, equipo, minuto, orden) VALUES (?, 'descanso', 'ninguno', ?, 0)`
+      "UPDATE results SET cronometro_pausado_en = ? WHERE id = ? AND cronometro_pausado_en IS NULL"
+    ).bind(MINUTO_DESCANSO_AUTOMATICO, partido.id).run();
+    await env.DB.prepare(
+      `INSERT INTO match_events (resultado_id, tipo, equipo, minuto, orden, var_motivo) VALUES (?, 'descanso', 'ninguno', ?, 0, 'automatico')`
     ).bind(partido.id, MINUTO_DESCANSO_AUTOMATICO).run();
+  }
+}
+
+// Minutos que dura el descanso automático antes de que el cron reanude
+// solo la 2ª parte.
+const MINUTOS_DESCANSO_AUTOMATICO = 15;
+
+// Reanuda solo la 2ª parte de los partidos cuyo descanso lo puso el cron
+// (crearDescansoAutomaticoAlMinuto45) y llevan ya MINUTOS_DESCANSO_AUTOMATICO
+// minutos parados: retoma el cronómetro desde el minuto en el que se
+// pausó (45) y registra el evento "fin_descanso" (con orden 1 para que
+// quede detrás de "descanso", como hace mamComenzarSegundaParte). Si el
+// redactor ya ha reanudado a mano (lo último es "fin_descanso") o el
+// descanso lo pitó él (sin marca 'automatico'), no se toca nada.
+async function reanudarSegundaParteAutomatica(env, partidosEnJuego) {
+  const pausados = (partidosEnJuego ?? (await env.DB.prepare(
+    `SELECT id, cronometro_pausado_en FROM results WHERE estado = 'en_juego' AND cronometro_pausado_en IS NOT NULL`
+  ).all()).results).filter((p) => p.cronometro_pausado_en !== null && p.cronometro_pausado_en !== undefined);
+  for (const partido of pausados) {
+    const ultima = await env.DB.prepare(
+      `SELECT tipo, var_motivo, created_at FROM match_events
+       WHERE resultado_id = ? AND tipo IN ('descanso', 'fin_descanso')
+       ORDER BY id DESC LIMIT 1`
+    ).bind(partido.id).first();
+    if (!ultima || ultima.tipo !== "descanso" || ultima.var_motivo !== "automatico") continue;
+    const desdeMs = fechaBdAMs(ultima.created_at);
+    if (!Number.isFinite(desdeMs) || Date.now() - desdeMs < MINUTOS_DESCANSO_AUTOMATICO * 60000) continue;
+
+    const minutoReanudar = Number.isInteger(partido.cronometro_pausado_en) && partido.cronometro_pausado_en > 0
+      ? partido.cronometro_pausado_en : MINUTO_DESCANSO_AUTOMATICO;
+    await iniciarCronometroPartido(env, partido.id, minutoReanudar);
+    await env.DB.prepare(
+      `INSERT INTO match_events (resultado_id, tipo, equipo, minuto, orden, var_motivo) VALUES (?, 'fin_descanso', 'ninguno', ?, 1, 'automatico')`
+    ).bind(partido.id, 45).run();
   }
 }
 
@@ -5193,7 +5236,7 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
   async scheduled(event, env, ctx) {
     ctx.waitUntil(publicarArticulosProgramados(env));
     ctx.waitUntil(iniciarPartidosProgramadosCuyaHoraHaLlegado(env));
-    ctx.waitUntil(crearDescansoAutomaticoAlMinuto45(env));
+    ctx.waitUntil(crearDescansoAutomaticoAlMinuto45(env).then(() => reanudarSegundaParteAutomatica(env)));
     ctx.waitUntil(crearFinPartidoAutomaticoAlMinuto90(env));
     // marcarPartidosColgados va ANTES de revisarPartidosDesatendidos:
     // pasa a 'colgado' los partidos con más de 2000' corriendo, para que
