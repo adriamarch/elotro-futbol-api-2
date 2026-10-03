@@ -1224,7 +1224,7 @@ async function enviarBoletinSemanalSiToca(env) {
     const desde = (ultimo || new Date(ahora - SIETE_DIAS_MS)).toISOString().replace("T", " ").slice(0, 19);
     const { results: articulos } = await env.DB.prepare(
       `SELECT slug, titulo, categoria, imagen_url FROM articles
-       WHERE publicado = 1 AND fecha_publicacion >= ?
+       WHERE publicado = 1${SQL_OCULTAR_SEGUNDO_DE_FUSION} AND fecha_publicacion >= ?
        ORDER BY fecha_publicacion DESC LIMIT 8`
     ).bind(desde).all();
 
@@ -2474,21 +2474,29 @@ function normalizarImagenes(raw) {
     .filter(Boolean);
 }
 
-// ---------- Fusión de dos previas / dos crónicas del mismo partido ----------
-// Cuando hay DOS previas (o DOS crónicas) PUBLICADAS del mismo partido, la
-// web las muestra automáticamente como UNA sola, dividida en dos secciones:
-// la primera con el nombre del equipo local en un <h3> y la segunda con el
-// del visitante en otro <h3>, con las fotos de ambas juntas. Es una fusión
-// al LEER (no se toca la base de datos): cada redactor sigue teniendo su
-// artículo propio (y sus publicaciones cuentan para su nivel), y si una de
-// las dos se despublica o se borra, la otra vuelve a verse sola.
-//  - La "primera" es la que tiene el id más bajo (la primera en crearse).
-//  - Con tres o más del mismo tipo, solo se fusionan las dos primeras; las
-//    demás siguen apareciendo por separado.
-//  - La segunda deja de salir en listados/sitemap/RSS, y su URL redirige a
-//    la primera. Se aplica solo al pedir por slug (el panel pide por id y
-//    sigue viendo cada artículo por separado para poder editarlo).
-const SQL_OCULTAR_SEGUNDO_DE_FUSION = ` AND NOT (tipo IN ('previa', 'cronica') AND resultado_id IS NOT NULL AND (SELECT COUNT(*) FROM articles b WHERE b.resultado_id = articles.resultado_id AND b.tipo = articles.tipo AND b.publicado = 1 AND b.id < articles.id) = 1)`;
+// ---------- Fusión de las previas / crónicas del mismo partido (v2) ----------
+// Cuando hay DOS O MÁS previas (o crónicas) PUBLICADAS del mismo partido, la
+// web las muestra automáticamente como UNA sola página, dividida en una
+// sección por redactor: cada sección con su <h3> (el nombre del equipo del que
+// habla, o "La visión de <autor>" si no se sabe), sus fotos recolocadas, y la
+// firma conjunta de todos los autores. Es una fusión al LEER (no se toca la
+// base de datos, así que NO hace falta ninguna migración): cada redactor sigue
+// teniendo su artículo propio (y sus publicaciones cuentan para su nivel), y si
+// una se despublica o se borra, las demás vuelven a verse como correspondan.
+//  - La "primera" es la de id más bajo (la primera en crearse): su URL, su
+//    título y su fecha son los de la página fusionada. Las demás redirigen a ella.
+//  - Qué sección va primero se decide leyendo de qué equipo habla cada texto
+//    (título, subtítulo y cuerpo, comparados con los nombres del partido). Con
+//    dos textos, si solo uno se identifica, el otro es del equipo contrario.
+//    Sin pistas claras se mantiene el orden de creación y se titulan por autor.
+//  - Las demás quedan fuera de listados, sitemap, RSS, boletín, widgets, ficha
+//    del partido y página de autor (esta última enlaza a la fusionada).
+//  - Los comentarios de todas se leen juntos en la página fusionada.
+//  - El panel pide por id y sigue viendo cada artículo por separado para
+//    poder editarlo (con una insignia "Fusionada" en el listado).
+const FUSION_TIPOS = ["previa", "cronica"];
+const FUSION_MAX_ARTICULOS = 20;
+const SQL_OCULTAR_SEGUNDO_DE_FUSION = ` AND NOT (tipo IN ('previa', 'cronica') AND resultado_id IS NOT NULL AND EXISTS (SELECT 1 FROM articles b WHERE b.resultado_id = articles.resultado_id AND b.tipo = articles.tipo AND b.publicado = 1 AND b.id < articles.id))`;
 
 function escaparHtmlFusion(texto) {
   return String(texto ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -2496,7 +2504,7 @@ function escaparHtmlFusion(texto) {
 
 // Cuenta los bloques de primer nivel de un trozo de HTML (lo mismo que
 // "children" en el navegador): se usa para recolocar las fotos "tras el
-// párrafo N" de la segunda sección, que cuenta desde su propio texto.
+// párrafo N" de cada sección, que cuenta desde su propio texto.
 function contarBloquesHtmlFusion(html) {
   const VACIAS = new Set(["br", "img", "hr", "input", "meta", "link", "wbr", "source"]);
   let profundidad = 0;
@@ -2517,75 +2525,235 @@ function contarBloquesHtmlFusion(html) {
   return bloques;
 }
 
-// Devuelve { rol: "primero"|"segundo", primero: {id, slug}, segundo: {id, slug} }
-// si el artículo forma pareja de fusión, o null si no.
-async function buscarParejaFusionPartido(env, article) {
-  if (!article || !article.resultado_id || !["previa", "cronica"].includes(article.tipo)) return null;
-  const { results } = await env.DB.prepare(
-    `SELECT id, slug FROM articles WHERE resultado_id = ? AND tipo = ? AND publicado = 1 ORDER BY id ASC LIMIT 2`
-  ).bind(article.resultado_id, article.tipo).all();
-  if (!results || results.length < 2) return null;
-  const [primero, segundo] = results;
-  if (article.id === primero.id) return { rol: "primero", primero, segundo };
-  if (article.id === segundo.id) return { rol: "segundo", primero, segundo };
-  return null;
-}
-
 function parseImagenesFusion(raw) {
   try { return normalizarImagenes(raw ? JSON.parse(raw) : []); } catch { return []; }
 }
 
-// Mezcla "base" (la primera) con "segundo" y deja el resultado en base.
-// nombres = { local, visitante }.
-function fusionarArticulosDePartido(base, segundo, nombres) {
-  const h3 = (nombre) => `<h3>${escaparHtmlFusion(nombre)}</h3>`;
-  const n1 = contarBloquesHtmlFusion(base.contenido);
+// ----- Detección de a qué equipo se refiere cada texto -----
+const FUSION_PALABRAS_GENERICAS = new Set(["club", "real", "deportivo", "deportiva", "futbol", "sociedad", "sad", "balompie", "union"]);
 
-  // Texto: sección 1 (local) + sección 2 (visitante). En cada idioma solo
-  // se ofrece la traducción si las DOS están traducidas (si no, se
-  // quedaría a medias).
-  base.contenido = h3(nombres.local) + (base.contenido || "") + h3(nombres.visitante) + (segundo.contenido || "");
+function normalizarTextoFusion(texto) {
+  return String(texto ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+}
+
+function textoPlanoFusion(html) {
+  return normalizarTextoFusion(String(html ?? "").replace(/<[^>]*>/g, " ").replace(/&nbsp;/g, " "));
+}
+
+// Claves distintivas de un equipo: palabras de 3+ letras que no sean
+// genéricas ("club", "real"...). Las de 5+ letras se comparan por su raíz
+// de 4 (acabada en "*") para casar "Barça"/"Barcelona" o "gimnásticos".
+function clavesEquipoFusion(nombre) {
+  const claves = normalizarTextoFusion(nombre)
+    .split(/[^a-z0-9]+/)
+    .filter((t) => t.length >= 3 && !/^\d+$/.test(t) && !FUSION_PALABRAS_GENERICAS.has(t))
+    .map((t) => (t.length >= 5 ? `${t.slice(0, 4)}*` : t));
+  return [...new Set(claves)];
+}
+
+// Solo las claves que identifican a UN equipo (las que comparten los dos
+// nombres, p. ej. "madrid" en "Real Madrid Castilla" - "Atlético Madrid B",
+// no sirven para distinguirlos).
+function clavesDistintivasFusion(local, visitante) {
+  const l = clavesEquipoFusion(local);
+  const v = clavesEquipoFusion(visitante);
+  const sl = new Set(l);
+  const sv = new Set(v);
+  return { local: l.filter((c) => !sv.has(c)), visitante: v.filter((c) => !sl.has(c)) };
+}
+
+function contarClavesFusion(textoNormalizado, claves) {
+  let total = 0;
+  for (const c of claves) {
+    const patron = c.endsWith("*") ? `${c.slice(0, -1)}[a-z0-9]*` : `${c}(?![a-z0-9])`;
+    const m = textoNormalizado.match(new RegExp(`(?:^|[^a-z0-9])${patron}`, "g"));
+    if (m) total += m.length;
+  }
+  return total;
+}
+
+// "local", "visitante" o null (sin señal clara).
+function ladoPorTextoFusion(art, claves) {
+  if (!claves.local.length && !claves.visitante.length) return null;
+  const campos = [
+    [normalizarTextoFusion(art.titulo), 6],
+    [normalizarTextoFusion(art.subtitulo), 4],
+    [textoPlanoFusion(art.contenido).slice(0, 700), 3],
+    [textoPlanoFusion(art.contenido), 1],
+  ];
+  let l = 0;
+  let v = 0;
+  for (const [txt, peso] of campos) {
+    if (!txt) continue;
+    l += peso * contarClavesFusion(txt, claves.local);
+    v += peso * contarClavesFusion(txt, claves.visitante);
+  }
+  const total = l + v;
+  const diff = l - v;
+  if (total === 0 || Math.abs(diff) < Math.max(3, total * 0.35)) return null;
+  return diff > 0 ? "local" : "visitante";
+}
+
+// Devuelve [{ art, i, lado }] en el orden en que irán las secciones.
+function ordenarSeccionesFusion(articulos, nombres) {
+  const claves = clavesDistintivasFusion(nombres.local, nombres.visitante);
+  const items = articulos.map((art, i) => ({ art, i, lado: ladoPorTextoFusion(art, claves) }));
+  if (items.length === 2) {
+    const [a, b] = items;
+    const contrario = (x) => (x === "local" ? "visitante" : "local");
+    if (a.lado && !b.lado) b.lado = contrario(a.lado);
+    else if (b.lado && !a.lado) a.lado = contrario(b.lado);
+    else if (a.lado && a.lado === b.lado) { a.lado = null; b.lado = null; }
+  }
+  const rango = (x) => (x.lado === "local" ? 0 : x.lado === "visitante" ? 1 : 2);
+  return items.sort((x, y) => rango(x) - rango(y) || x.i - y.i);
+}
+
+function tituloSeccionFusion(item, items, nombres, idioma) {
+  const equipo = item.lado === "local" ? nombres.local : item.lado === "visitante" ? nombres.visitante : null;
+  const autor = item.art.autor_nombre || "";
+  if (equipo) {
+    const repetido = items.filter((x) => x.lado === item.lado).length > 1;
+    return repetido && autor ? `${equipo} · ${autor}` : equipo;
+  }
+  if (!autor) return `${nombres.local} - ${nombres.visitante}`;
+  // En las traducciones solo el nombre, para no dejar texto en castellano.
+  return idioma ? autor : `La visión de ${autor}`;
+}
+
+// ----- Búsqueda del grupo de un partido -----
+// { rol: "primero"|"otro", primero: {id, slug}, grupo: [{id, slug}, ...] }
+// si el artículo forma parte de una fusión (2 o más publicados del mismo
+// partido y tipo), o null si no.
+async function buscarGrupoFusionPartido(env, article) {
+  if (!article || !article.resultado_id || !FUSION_TIPOS.includes(article.tipo)) return null;
+  const { results } = await env.DB.prepare(
+    `SELECT id, slug FROM articles WHERE resultado_id = ? AND tipo = ? AND publicado = 1 ORDER BY id ASC LIMIT ?`
+  ).bind(article.resultado_id, article.tipo, FUSION_MAX_ARTICULOS).all();
+  if (!results || results.length < 2) return null;
+  if (!results.some((r) => r.id === article.id)) return null;
+  const primero = results[0];
+  return { rol: article.id === primero.id ? "primero" : "otro", primero, grupo: results };
+}
+
+// Ids de todos los artículos que se muestran juntos con este (incluido él).
+// Sirve para unir los comentarios de la página fusionada.
+async function idsGrupoFusion(env, articleId) {
+  const art = await env.DB.prepare("SELECT id, tipo, resultado_id, publicado FROM articles WHERE id = ?").bind(articleId).first();
+  if (!art || !art.publicado) return [articleId];
+  const grupo = await buscarGrupoFusionPartido(env, art);
+  return grupo ? grupo.grupo.map((r) => r.id) : [articleId];
+}
+
+// Página de autor: sus previas/crónicas que se muestran fusionadas enlazan
+// a la página fusionada (slug de la primera) y no salen duplicadas.
+async function remapearSlugsFusion(env, articulos) {
+  const candidatos = (articulos || []).filter((a) => a && a.resultado_id && FUSION_TIPOS.includes(a.tipo));
+  if (!candidatos.length) return articulos;
+  const ids = [...new Set(candidatos.map((a) => a.resultado_id))];
+  const { results: primeros } = await env.DB.prepare(
+    `SELECT p.id, p.slug, p.tipo, p.resultado_id FROM articles p
+     WHERE p.publicado = 1 AND p.tipo IN ('previa', 'cronica') AND p.resultado_id IN (${ids.map(() => "?").join(",")})
+       AND NOT EXISTS (SELECT 1 FROM articles b WHERE b.resultado_id = p.resultado_id AND b.tipo = p.tipo AND b.publicado = 1 AND b.id < p.id)`
+  ).bind(...ids).all();
+  const mapa = new Map((primeros || []).map((p) => [`${p.resultado_id}:${p.tipo}`, p]));
+  const vistos = new Set();
+  const salida = [];
+  for (const a of articulos) {
+    const clave = `${a.resultado_id}:${a.tipo}`;
+    const p = a.resultado_id && FUSION_TIPOS.includes(a.tipo) ? mapa.get(clave) : null;
+    if (p) {
+      if (vistos.has(clave)) continue;
+      vistos.add(clave);
+    }
+    salida.push(p && p.id !== a.id ? { ...a, slug: p.slug, fusionada: true } : a);
+  }
+  return salida;
+}
+
+// Mezcla "base" (la primera) con "otros" y deja el resultado en base.
+// nombres = { local, visitante }.
+function fusionarGrupoDePartido(base, otros, nombres) {
+  const secciones = ordenarSeccionesFusion([base, ...otros], nombres);
+  const h3 = (nombre) => `<h3>${escaparHtmlFusion(nombre)}</h3>`;
+
+  // Texto: una sección por artículo. Todo se calcula ANTES de tocar base.
+  const offsets = [];
+  let offset = 0;
+  let contenido = "";
+  for (const s of secciones) {
+    offsets.push(offset);
+    contenido += h3(tituloSeccionFusion(s, secciones, nombres, null)) + (s.art.contenido || "");
+    offset += 1 + contarBloquesHtmlFusion(s.art.contenido);
+  }
+  // En cada idioma solo se ofrece la traducción si TODAS están traducidas
+  // (si no, se quedaría a medias).
+  const traducciones = {};
   for (const idioma of IDIOMAS_TRADUCCION) {
-    const a = base[`contenido_${idioma}`];
-    const b = segundo[`contenido_${idioma}`];
-    base[`contenido_${idioma}`] = (a && b)
-      ? h3(nombres.local) + a + h3(nombres.visitante) + b
+    const campo = `contenido_${idioma}`;
+    traducciones[campo] = secciones.every((s) => s.art[campo])
+      ? secciones.map((s) => h3(tituloSeccionFusion(s, secciones, nombres, idioma)) + s.art[campo]).join("")
       : null;
   }
 
-  // Fotos: las de la primera se desplazan 1 bloque (por el <h3> inicial);
-  // las de la segunda, n1 + 2 (el <h3> de la primera, sus n1 bloques y el
-  // <h3> de la segunda). Los collages de la segunda cambian de grupo para
-  // no mezclarse con los de la primera.
-  const imgs1 = parseImagenesFusion(base.imagenes).map((f) => {
-    if ((f.posicion === "personalizada" || f.posicion === "collage") && f.trasParrafo) return { ...f, trasParrafo: f.trasParrafo + 1 };
-    return f;
-  });
-  const imgs2 = parseImagenesFusion(segundo.imagenes).map((f) => {
-    const g = { ...f };
-    if (g.posicion === "inicio") { g.posicion = "personalizada"; g.trasParrafo = n1 + 2; }
-    else if ((g.posicion === "personalizada" || g.posicion === "collage") && g.trasParrafo) g.trasParrafo = g.trasParrafo + n1 + 2;
-    if (g.posicion === "collage" && g.grupo) g.grupo = `fusion-${g.grupo}`;
-    return g;
-  });
+  // Fotos: las de cada sección se desplazan por los bloques anteriores (más
+  // el <h3> propio). Las "al inicio" de las secciones que no abren la página
+  // pasan a ir justo tras su <h3>. Los collages de cada sección cambian de
+  // grupo para no mezclarse con los de otra.
   const vistas = new Set([base.imagen_url].filter(Boolean));
   const todas = [];
-  for (const f of imgs1) { if (!vistas.has(f.url)) { vistas.add(f.url); todas.push(f); } }
-  for (const f of imgs2) { if (!vistas.has(f.url)) { vistas.add(f.url); todas.push(f); } }
-  if (segundo.imagen_url && !vistas.has(segundo.imagen_url)) {
-    vistas.add(segundo.imagen_url);
-    if (!base.imagen_url) { base.imagen_url = segundo.imagen_url; }
-    else todas.push({ url: segundo.imagen_url, posicion: "galeria", foco: "50% 50%" });
-  }
-  base.imagenes = todas.length ? JSON.stringify(todas) : null;
+  let portada = base.imagen_url || null;
+  secciones.forEach((s, k) => {
+    const off = offsets[k];
+    const imgs = parseImagenesFusion(s.art.imagenes).map((f) => {
+      const g = { ...f };
+      const colocable = (g.posicion === "personalizada" || g.posicion === "collage") && g.trasParrafo;
+      if (k === 0) {
+        if (colocable) g.trasParrafo = g.trasParrafo + 1;
+      } else {
+        if (g.posicion === "inicio") { g.posicion = "personalizada"; g.trasParrafo = off + 1; }
+        else if (colocable) g.trasParrafo = g.trasParrafo + off + 1;
+        if (g.posicion === "collage" && g.grupo) g.grupo = `fusion${k}-${g.grupo}`;
+      }
+      return g;
+    });
+    for (const f of imgs) { if (!vistas.has(f.url)) { vistas.add(f.url); todas.push(f); } }
+    if (s.art !== base && s.art.imagen_url && !vistas.has(s.art.imagen_url)) {
+      vistas.add(s.art.imagen_url);
+      if (!portada) portada = s.art.imagen_url;
+      else todas.push({ url: s.art.imagen_url, posicion: "galeria", foco: "50% 50%" });
+    }
+  });
 
-  // Firma: se acredita también a la autora/autor de la segunda.
-  if (!base.coautor_id && !base.coautor_nombre && segundo.autor_nombre && segundo.autor_id !== base.autor_id) {
-    base.coautor_id = segundo.autor_id || null;
-    base.coautor_nombre = segundo.autor_nombre;
+  // Firma: todos los autores distintos (coautor_* conserva al segundo para
+  // lo que ya lo lee; "firmantes" trae la lista completa).
+  const firmantes = [];
+  const vistosFirma = new Set();
+  const anadirFirma = (id, nombre) => {
+    if (!nombre) return;
+    const clave = id ? `i${id}` : `n${String(nombre).toLowerCase()}`;
+    if (vistosFirma.has(clave)) return;
+    vistosFirma.add(clave);
+    firmantes.push({ id: id || null, nombre });
+  };
+  for (const a of [base, ...otros]) { anadirFirma(a.autor_id, a.autor_nombre); anadirFirma(a.coautor_id, a.coautor_nombre); }
+  const fichaTecnica = [base, ...otros].map((a) => a.ficha_tecnica).find(Boolean) || null;
+
+  base.contenido = contenido;
+  Object.assign(base, traducciones);
+  base.imagen_url = portada;
+  base.imagenes = todas.length ? JSON.stringify(todas) : null;
+  if (!base.coautor_id && !base.coautor_nombre && firmantes[1]) {
+    base.coautor_id = firmantes[1].id;
+    base.coautor_nombre = firmantes[1].nombre;
   }
-  if (!base.ficha_tecnica && segundo.ficha_tecnica) base.ficha_tecnica = segundo.ficha_tecnica;
-  base.fusionado_con_slug = segundo.slug;
+  base.firmantes = firmantes;
+  if (!base.ficha_tecnica && fichaTecnica) base.ficha_tecnica = fichaTecnica;
+  base.fusionado_con_slug = otros[0] ? otros[0].slug : null;
+  base.fusion = {
+    total: secciones.length,
+    secciones: secciones.map((s) => ({ lado: s.lado, autor_nombre: s.art.autor_nombre || null, titulo: s.art.titulo, slug: s.art.slug })),
+  };
 }
 
 // ---------- Alineaciones ----------
@@ -7146,13 +7314,14 @@ async function handlePrimary(request, env, ctx) {
         }
 
         const { results: articulos } = await env.DB.prepare(
-          `SELECT id, slug, titulo, subtitulo, contenido, categoria, club, imagen_url, imagenes, autor_id, autor_nombre, coautor_id, coautor_nombre, fecha_publicacion
+          `SELECT id, slug, titulo, subtitulo, contenido, tipo, resultado_id, categoria, club, imagen_url, imagenes, autor_id, autor_nombre, coautor_id, coautor_nombre, fecha_publicacion
            FROM articles WHERE (autor_id = ? OR coautor_id = ?) AND publicado = 1 ORDER BY fecha_publicacion DESC LIMIT 30`
         ).bind(id, id).all();
+        const articulosAutor = await remapearSlugsFusion(env, articulos);
 
         return json({
           autor: { id: autor.id, nombre: autor.nombre, bio: autor.bio || "", experiencia: autor.experiencia || "", avatar_url: autor.avatar_url || "", equipo: parsearEquipos(autor.equipo), redes },
-          articulos: articulos.map((a) => ({ ...a, imagen_foco: focoDePortada(a), imagenes: undefined })),
+          articulos: articulosAutor.map((a) => ({ ...a, imagen_foco: focoDePortada(a), imagenes: undefined })),
         });
       }
 
@@ -7324,7 +7493,7 @@ async function handlePrimary(request, env, ctx) {
         // para elegir artículos.
         const { results: articulos } = await env.DB.prepare(
           `SELECT slug, titulo, categoria, imagen_url FROM articles
-           WHERE publicado = 1 ORDER BY fecha_publicacion DESC LIMIT 8`
+           WHERE publicado = 1${SQL_OCULTAR_SEGUNDO_DE_FUSION} ORDER BY fecha_publicacion DESC LIMIT 8`
         ).all();
         if (!articulos.length) {
           return json({ error: "No hay noticias publicadas para incluir en el boletín" }, 400);
@@ -8250,7 +8419,12 @@ async function handlePrimary(request, env, ctx) {
             titulo_ca, LENGTH(contenido_ca) AS contenido_ca_len,
             titulo_gl, LENGTH(contenido_gl) AS contenido_gl_len,
             titulo_en, LENGTH(contenido_en) AS contenido_en_len,
-            ficha_tecnica, fuera_calendario
+            ficha_tecnica, fuera_calendario,
+            ${admin
+              ? `CASE WHEN publicado = 1 AND tipo IN ('previa', 'cronica') AND resultado_id IS NOT NULL
+                   THEN (SELECT COUNT(*) FROM articles b WHERE b.resultado_id = articles.resultado_id AND b.tipo = articles.tipo AND b.publicado = 1)
+                   ELSE 0 END`
+              : "0"} AS fusion_total
           FROM articles WHERE 1=1`;
         const binds = [];
         if (!admin) {
@@ -8607,21 +8781,23 @@ async function handlePrimary(request, env, ctx) {
         // Fusión de dos previas / dos crónicas del mismo partido (ver
         // SQL_OCULTAR_SEGUNDO_DE_FUSION). Solo en lectura pública por
         // slug (el panel pide por id y ve cada artículo por separado).
-        let segundoFusion = null;
+        let idsFusion = null;
         if (isNaN(key) && article.publicado) {
-          const pareja = await buscarParejaFusionPartido(env, article);
-          if (pareja && pareja.rol === "segundo") {
-            return json({ redirect: pareja.primero.slug });
+          const grupoFusion = await buscarGrupoFusionPartido(env, article);
+          if (grupoFusion && grupoFusion.rol === "otro") {
+            return json({ redirect: grupoFusion.primero.slug });
           }
-          if (pareja && pareja.rol === "primero") {
-            segundoFusion = await env.DB.prepare("SELECT * FROM articles WHERE id = ?").bind(pareja.segundo.id).first();
-            const partido = segundoFusion
+          if (grupoFusion && grupoFusion.rol === "primero") {
+            const idsOtros = grupoFusion.grupo.filter((r) => r.id !== article.id).map((r) => r.id);
+            const { results: otrosFusion } = await env.DB.prepare(
+              `SELECT * FROM articles WHERE id IN (${idsOtros.map(() => "?").join(",")}) ORDER BY id ASC`
+            ).bind(...idsOtros).all();
+            const partido = otrosFusion && otrosFusion.length
               ? await env.DB.prepare("SELECT equipo_local, equipo_visitante FROM results WHERE id = ?").bind(article.resultado_id).first()
               : null;
-            if (segundoFusion && partido) {
-              fusionarArticulosDePartido(article, segundoFusion, { local: partido.equipo_local, visitante: partido.equipo_visitante });
-            } else {
-              segundoFusion = null;
+            if (partido) {
+              fusionarGrupoDePartido(article, otrosFusion, { local: partido.equipo_local, visitante: partido.equipo_visitante });
+              idsFusion = [article.id, ...otrosFusion.map((o) => o.id)];
             }
           }
         }
@@ -8672,14 +8848,15 @@ async function handlePrimary(request, env, ctx) {
         // (tabla puente article_media). Mismo criterio que en el worker
         // principal, para que ambos devuelvan la misma respuesta pública.
         if (article.id) {
+          const idsMedia = idsFusion || [article.id];
           const { results: mediaArticulo } = await env.DB.prepare(
             `SELECT am.orden, m.id AS media_id, m.cloudinary_url, m.descripcion,
                     m.tipo, m.autor_id, m.autor_nombre
              FROM article_media am
              JOIN media m ON m.id = am.media_id
-             WHERE am.article_id IN (?, ?)
+             WHERE am.article_id IN (${idsMedia.map(() => "?").join(",")})
              ORDER BY am.orden ASC`
-          ).bind(article.id, segundoFusion ? segundoFusion.id : article.id).all();
+          ).bind(...idsMedia).all();
           article.galeria_fotografo = (mediaArticulo || [])
             .filter((m, i, arr) => m.tipo !== "video" && arr.findIndex((x) => x.cloudinary_url === m.cloudinary_url) === i)
             .map((m) => ({
@@ -9877,12 +10054,15 @@ async function handlePrimary(request, env, ctx) {
       const comentariosArticuloMatch = path.match(/^\/api\/articles\/(\d+)\/comments$/);
       if (comentariosArticuloMatch && method === "GET") {
         const articleId = parseInt(comentariosArticuloMatch[1]);
+        // Si es una previa/crónica fusionada con otras del mismo partido,
+        // se leen los comentarios de todas juntas.
+        const idsComentarios = await idsGrupoFusion(env, articleId);
         const { results: comentarios } = await env.DB.prepare(
           `SELECT id, nombre, texto, created_at, likes, dislikes, reader_id
            FROM comments
-           WHERE article_id = ? AND estado = 'aprobado' AND oculto_por_denuncia = 0
+           WHERE article_id IN (${idsComentarios.map(() => "?").join(",")}) AND estado = 'aprobado' AND oculto_por_denuncia = 0
            ORDER BY created_at ASC`
-        ).bind(articleId).all();
+        ).bind(...idsComentarios).all();
         return json({ comentarios });
       }
 
@@ -11539,7 +11719,7 @@ async function handlePrimary(request, env, ctx) {
         // primero.
         const { results: noticiasVinculadas } = await env.DB.prepare(
           `SELECT slug, titulo, tipo, categoria FROM articles
-           WHERE resultado_id = ? AND publicado = 1
+           WHERE resultado_id = ? AND publicado = 1${SQL_OCULTAR_SEGUNDO_DE_FUSION}
            ORDER BY fecha_publicacion DESC LIMIT 5`
         ).bind(id).all();
         resultado.noticias_vinculadas = noticiasVinculadas || [];
