@@ -36,6 +36,63 @@ function aSqliteDatetimeUTC(fecha) {
   return fecha.toISOString().slice(0, 19).replace("T", " ");
 }
 
+// Valida y normaliza el rango "fecha_preferencia_desde"/"...hasta" que
+// puede mandar un redactor, opcionalmente, al marcar su borrador como
+// "terminado" (ver estado_borrador): una sugerencia de en qué días (y,
+// opcionalmente, a qué hora) le gustaría que se publicase la noticia,
+// puramente informativa para quien la revise. Solo se guardan si "body"
+// no es null (el llamador ya ha comprobado que el borrador se está
+// marcando como "terminado": si no, se descartan sin más, ver más abajo
+// dónde se llama a esta función).
+// Formato: "YYYY-MM-DD" (fecha simple, sin hora, "todo el día" -
+// compatible con lo guardado antes de añadir la hora) o
+// "YYYY-MM-DDTHH:MM" (con hora opcional, la que manda un
+// <input type="datetime-local"> del panel). Se valida con una expresión
+// regular estricta en vez de fiarse de "new Date(...)", que aceptaría
+// cosas ambiguas.
+// Reglas:
+//  - Las dos son opcionales; se puede mandar solo "desde" (sin límite
+//    superior), o ninguna de las dos.
+//  - Si se manda "hasta" sin "desde", se descarta "hasta" (no tiene
+//    sentido un rango solo con límite superior).
+//  - Si "hasta" es anterior (o igual) a "desde", se descarta "hasta"
+//    (rango invertido: se conserva "desde" igualmente, no se rechaza
+//    todo el guardado del artículo por esto). La comparación es de
+//    texto (mismo formato, mismo orden cronológico), salvo que solo una
+//    de las dos lleve hora: entonces se compara solo la parte de fecha,
+//    para no descartar por ejemplo "hasta" = mismo día con hora si
+//    "desde" es ese mismo día sin hora.
+function normalizarPreferenciaFechas(body) {
+  const esValida = (v) => typeof v === "string"
+    && /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2})?$/.test(v)
+    && !Number.isNaN(new Date(`${v.includes("T") ? v : v + "T00:00"}:00Z`).getTime());
+  if (!body) return { desde: null, hasta: null };
+  const desde = esValida(body.fecha_preferencia_desde) ? body.fecha_preferencia_desde : null;
+  let hasta = esValida(body.fecha_preferencia_hasta) ? body.fecha_preferencia_hasta : null;
+  if (!desde) hasta = null;
+  else if (hasta) {
+    const soloFecha = (v) => v.slice(0, 10);
+    const comparable = (v) => (v.includes("T") && desde.includes("T")) ? v : soloFecha(v);
+    if (comparable(hasta) <= comparable(desde)) hasta = null;
+  }
+  return { desde, hasta };
+}
+
+// Formatea el rango { desde, hasta } de normalizarPreferenciaFechas como
+// texto legible en español (DD/MM/AAAA o DD/MM/AAAA a las HH:MM) para
+// el email que avisa a la redacción de que un borrador está
+// "terminado". Devuelve null si no hay preferencia (no se añade nada al
+// email en ese caso).
+function formatearPreferenciaFechasEmail({ desde, hasta } = {}) {
+  if (!desde) return null;
+  const legible = (v) => {
+    const [fecha, hora] = v.split("T");
+    const [a, m, d] = fecha.split("-");
+    return hora ? `${d}/${m}/${a} a las ${hora}` : `${d}/${m}/${a}`;
+  };
+  return hasta ? `entre el ${legible(desde)} y el ${legible(hasta)}` : `a partir del ${legible(desde)}`;
+}
+
 // Convierte una fecha guardada por SQLite o un ISO string al formato
 // RFC-822 que exige la especificación RSS 2.0 para <pubDate>
 // (p.ej. "Tue, 18 Aug 2026 10:00:00 GMT"). Si no hay fecha o no se
@@ -2628,9 +2685,9 @@ const CONTENIDO_MAX = 8000;
 // persona "ya está en condiciones de que la evalúen".
 const NIVELES_REQUISITOS = {
   1: null, // Principiante: nivel inicial, no requiere nada.
-  2: { noticia: 30, cronica: 15, opinion: 3, entrevista: 1 },
-  3: { noticia: 50, cronica: 25, opinion: 4, entrevista: 1 },
-  4: { noticia: 60, cronica: 30, opinion: 6, entrevista: 2 },
+  2: { noticia: 20, cronica: 10, opinion: 2, entrevista: 1 },
+  3: { noticia: 30, cronica: 15, opinion: 3, entrevista: 1 },
+  4: { noticia: 40, cronica: 20, opinion: 4, entrevista: 2 },
 };
 
 const NIVELES_INFO = {
@@ -8031,7 +8088,7 @@ async function handlePrimary(request, env, ctx) {
         // a tener contenido, sin transferir el HTML entero.
         let query = `SELECT id, slug, titulo, subtitulo, contenido, tipo, categoria, club, imagen_url, imagenes,
             resultado_id, autor_id, autor_nombre, coautor_id, coautor_nombre, destacado, publicado,
-            estado_borrador, programado_para, slug_congelado, fecha_publicacion, created_at, updated_at,
+            estado_borrador, programado_para, fecha_preferencia_desde, fecha_preferencia_hasta, slug_congelado, fecha_publicacion, created_at, updated_at,
             titulo_eu, LENGTH(contenido_eu) AS contenido_eu_len,
             titulo_ca, LENGTH(contenido_ca) AS contenido_ca_len,
             titulo_gl, LENGTH(contenido_gl) AS contenido_gl_len,
@@ -8145,6 +8202,14 @@ async function handlePrimary(request, env, ctx) {
           ? (body.estado_borrador === "terminado" ? "terminado" : "en_proceso")
           : null;
 
+        // Fecha de preferencia del redactor (solo junto a un borrador
+        // "terminado"; ver normalizarPreferenciaFechas). Un redactor de
+        // Nivel 1 está obligado a indicarla al mandar a revisión.
+        const preferenciaFechas = normalizarPreferenciaFechas(estadoBorrador === "terminado" ? body : null);
+        if (payload.rol !== "admin" && estadoBorrador === "terminado" && (nivelUsuario ?? 1) < 2 && !preferenciaFechas.desde) {
+          return json({ error: "Como redactor de nivel 1 debes indicar una fecha de preferencia para que la revisen" }, 400);
+        }
+
         // Un borrador guardado como "en proceso" (todavía se está
         // escribiendo) no tiene por qué cumplir los límites de longitud:
         // esos límites solo aplican a lo que se publica o se marca como
@@ -8234,15 +8299,15 @@ async function handlePrimary(request, env, ctx) {
         const activarBanner = puedeActivarBanner && body.banner_urgente === true;
 
         await env.DB.prepare(
-          `INSERT INTO articles (slug, titulo, subtitulo, contenido, tipo, categoria, club, imagen_url, imagenes, resultado_id, autor_id, autor_nombre, coautor_id, coautor_nombre, destacado, publicado, estado_borrador, programado_para, slug_congelado, fecha_publicacion, updated_at,
+          `INSERT INTO articles (slug, titulo, subtitulo, contenido, tipo, categoria, club, imagen_url, imagenes, resultado_id, autor_id, autor_nombre, coautor_id, coautor_nombre, destacado, publicado, estado_borrador, programado_para, fecha_preferencia_desde, fecha_preferencia_hasta, slug_congelado, fecha_publicacion, updated_at,
             titulo_eu, subtitulo_eu, contenido_eu, titulo_ca, subtitulo_ca, contenido_ca, titulo_gl, subtitulo_gl, contenido_gl, titulo_en, subtitulo_en, contenido_en, origin_write_id, ficha_tecnica, banner_urgente, banner_urgente_hasta)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${calcularBannerUrgenteHasta(activarBanner)})`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${calcularBannerUrgenteHasta(activarBanner)})`
         ).bind(
           slug, body.titulo, body.subtitulo || null, body.contenido,
           body.tipo || "noticia", body.categoria || "hypermotion", clubFinal,
           imagenPortada, imagenes.length ? JSON.stringify(imagenes) : null, resultadoId,
           autorId, autorNombre, coautorId, coautorNombre,
-          body.destacado ? 1 : 0, body.publicado === false ? 0 : 1, estadoBorrador, programadoPara, slugCongelado,
+          body.destacado ? 1 : 0, body.publicado === false ? 0 : 1, estadoBorrador, programadoPara, preferenciaFechas.desde, preferenciaFechas.hasta, slugCongelado,
           programadoPara || body.fecha_publicacion || new Date().toISOString(),
           traducciones.titulo_eu, traducciones.subtitulo_eu, traducciones.contenido_eu,
           traducciones.titulo_ca, traducciones.subtitulo_ca, traducciones.contenido_ca,
@@ -8288,6 +8353,7 @@ async function handlePrimary(request, env, ctx) {
             }),
           }));
         } else if (estadoBorrador === "terminado") {
+          const textoPreferenciaFechas = formatearPreferenciaFechasEmail(preferenciaFechas);
           // Los borradores marcados como "terminados" (el redactor ha
           // respondido que sí en la notificación de "¿está terminada la
           // noticia?" al guardar) avisan por correo, pero sin enlace
@@ -8298,7 +8364,7 @@ async function handlePrimary(request, env, ctx) {
           // manda ningún correo, para no generar avisos de más.
           ctx.waitUntil(enviarEmailNotificacion(env, {
             asunto: `Nuevo borrador terminado: ${body.titulo}`,
-            texto: `${payload.nombre} ha guardado el borrador "${body.titulo}" (${tipoLabel}) en ELOTROFÚTBOLTV, firmado por ${firmaAutores}, marcándolo como terminado. Todavía no está publicado.`,
+            texto: `${payload.nombre} ha guardado el borrador "${body.titulo}" (${tipoLabel}) en ELOTROFÚTBOLTV, firmado por ${firmaAutores}, marcándolo como terminado. Todavía no está publicado.${textoPreferenciaFechas ? ` Preferencia de fecha del redactor: ${textoPreferenciaFechas}.` : ""}`,
             html: plantillaEmail({
               etiqueta: "Borrador terminado",
               titulo: body.titulo,
@@ -8307,6 +8373,7 @@ async function handlePrimary(request, env, ctx) {
                 { etiqueta: "Autor", valor: firmaAutores },
                 { etiqueta: "Guardado por", valor: payload.nombre },
                 { etiqueta: "Categoría", valor: body.club || body.categoria },
+                ...(textoPreferenciaFechas ? [{ etiqueta: "Preferencia de fecha", valor: textoPreferenciaFechas }] : []),
               ],
             }),
           }));
@@ -8319,7 +8386,7 @@ async function handlePrimary(request, env, ctx) {
             : `Ha ${publicado ? "publicado" : "guardado el borrador de"} "${tipoLabel.toLowerCase()}": "${body.titulo}"${estadoBorrador ? ` (${estadoBorrador === "terminado" ? "terminado" : "en proceso"})` : ""}${esUltimaHora ? " (Última hora)" : ""}`,
         }));
 
-        return json({ ok: true, slug, publicado, fuera_calendario: fueraCalendario, estado_borrador: estadoBorrador, programado_para: programadoPara, avisos_traduccion: avisosTraduccion });
+        return json({ ok: true, slug, publicado, fuera_calendario: fueraCalendario, estado_borrador: estadoBorrador, programado_para: programadoPara, fecha_preferencia_desde: preferenciaFechas.desde, fecha_preferencia_hasta: preferenciaFechas.hasta, avisos_traduccion: avisosTraduccion });
       }
 
       // ---------- ARTICLE individual ----------
@@ -8641,6 +8708,14 @@ async function handlePrimary(request, env, ctx) {
           ? (body.estado_borrador === "terminado" ? "terminado" : "en_proceso")
           : null;
 
+        // Fecha de preferencia del redactor (solo junto a un borrador
+        // "terminado"; ver normalizarPreferenciaFechas). Un redactor de
+        // Nivel 1 está obligado a indicarla al mandar a revisión.
+        const preferenciaFechas = normalizarPreferenciaFechas(estadoBorrador === "terminado" ? body : null);
+        if (payload.rol !== "admin" && estadoBorrador === "terminado" && (nivelUsuario ?? 1) < 2 && !preferenciaFechas.desde) {
+          return json({ error: "Como redactor de nivel 1 debes indicar una fecha de preferencia para que la revisen" }, 400);
+        }
+
         // Un borrador "en proceso" no tiene por qué cumplir los límites de
         // longitud todavía (ver mismo criterio al crear la noticia).
         if (body.contenido !== undefined && estadoBorrador !== "en_proceso") {
@@ -8769,7 +8844,7 @@ async function handlePrimary(request, env, ctx) {
         }
 
         await env.DB.prepare(
-          `UPDATE articles SET slug=?, titulo=?, subtitulo=?, contenido=?, tipo=?, categoria=?, club=?, imagen_url=?, imagenes=?, resultado_id=?, autor_id=?, autor_nombre=?, coautor_id=?, coautor_nombre=?, destacado=?, publicado=?, estado_borrador=?, programado_para=?, slug_congelado=?, fecha_publicacion=?, updated_at=datetime('now'),
+          `UPDATE articles SET slug=?, titulo=?, subtitulo=?, contenido=?, tipo=?, categoria=?, club=?, imagen_url=?, imagenes=?, resultado_id=?, autor_id=?, autor_nombre=?, coautor_id=?, coautor_nombre=?, destacado=?, publicado=?, estado_borrador=?, programado_para=?, fecha_preferencia_desde=?, fecha_preferencia_hasta=?, slug_congelado=?, fecha_publicacion=?, updated_at=datetime('now'),
             titulo_eu=?, subtitulo_eu=?, contenido_eu=?, titulo_ca=?, subtitulo_ca=?, contenido_ca=?, titulo_gl=?, subtitulo_gl=?, contenido_gl=?, titulo_en=?, subtitulo_en=?, contenido_en=?, ficha_tecnica=?, banner_urgente=?${bannerUrgenteHastaSQL !== null ? `, banner_urgente_hasta=${bannerUrgenteHastaSQL}` : ""}
            WHERE id=?`
         ).bind(
@@ -8777,7 +8852,7 @@ async function handlePrimary(request, env, ctx) {
           categoriaFinal, clubFinal || null, imagenPortada,
           imagenes.length ? JSON.stringify(imagenes) : null, resultadoId,
           autorId, autorNombre, coautorId, coautorNombre,
-          body.destacado ? 1 : 0, body.publicado === false ? 0 : 1, estadoBorrador, programadoPara, slugCongeladoFinal,
+          body.destacado ? 1 : 0, body.publicado === false ? 0 : 1, estadoBorrador, programadoPara, preferenciaFechas.desde, preferenciaFechas.hasta, slugCongeladoFinal,
           fechaPublicacionFinal,
           traducciones.titulo_eu, traducciones.subtitulo_eu, traducciones.contenido_eu,
           traducciones.titulo_ca, traducciones.subtitulo_ca, traducciones.contenido_ca,
@@ -8833,9 +8908,10 @@ async function handlePrimary(request, env, ctx) {
         if (body.publicado === false && estadoBorrador === "terminado" && !yaEstabaTerminado) {
           const tipoLabel = { noticia: "Noticia", cronica: "Crónica", opinion: "Opinión", entrevista: "Entrevista" }[body.tipo] || "Artículo";
           const firmaAutores = coautorNombre ? `${autorNombre} y ${coautorNombre}` : autorNombre;
+          const textoPreferenciaFechas = formatearPreferenciaFechasEmail(preferenciaFechas);
           ctx.waitUntil(enviarEmailNotificacion(env, {
             asunto: `Borrador terminado: ${body.titulo}`,
-            texto: `${payload.nombre} ha editado y marcado como terminado el borrador "${body.titulo}" (${tipoLabel}) en ELOTROFÚTBOLTV, firmado por ${firmaAutores}. Todavía no está publicado.`,
+            texto: `${payload.nombre} ha editado y marcado como terminado el borrador "${body.titulo}" (${tipoLabel}) en ELOTROFÚTBOLTV, firmado por ${firmaAutores}. Todavía no está publicado.${textoPreferenciaFechas ? ` Preferencia de fecha del redactor: ${textoPreferenciaFechas}.` : ""}`,
             html: plantillaEmail({
               etiqueta: "Borrador terminado",
               titulo: body.titulo,
@@ -8844,6 +8920,7 @@ async function handlePrimary(request, env, ctx) {
                 { etiqueta: "Autor", valor: firmaAutores },
                 { etiqueta: "Guardado por", valor: payload.nombre },
                 { etiqueta: "Categoría", valor: body.club || body.categoria },
+                ...(textoPreferenciaFechas ? [{ etiqueta: "Preferencia de fecha", valor: textoPreferenciaFechas }] : []),
               ],
             }),
           }));
@@ -8853,7 +8930,7 @@ async function handlePrimary(request, env, ctx) {
           accion: "editar_articulo", entidad: "articulo", entidad_id: id,
           descripcion: `Ha editado la noticia/crónica "${body.titulo}"${estadoBorrador ? ` (${estadoBorrador === "terminado" ? "borrador terminado" : "borrador en proceso"})` : ""}${esEdicionAjenaPorNivel4 ? " (revisión de contenido ajeno, Nivel 4)" : ""}`,
         }));
-        return json({ ok: true, slug, publicado: body.publicado === false ? 0 : 1, fuera_calendario: fueraCalendario, estado_borrador: estadoBorrador, programado_para: programadoPara, avisos_traduccion: avisosTraduccion });
+        return json({ ok: true, slug, publicado: body.publicado === false ? 0 : 1, fuera_calendario: fueraCalendario, estado_borrador: estadoBorrador, programado_para: programadoPara, fecha_preferencia_desde: preferenciaFechas.desde, fecha_preferencia_hasta: preferenciaFechas.hasta, avisos_traduccion: avisosTraduccion });
       }
 
       if (articleMatch && method === "DELETE") {
