@@ -18,6 +18,12 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   max: 2,
   ssl: process.env.PGSSL === "disable" ? false : { rejectUnauthorized: false },
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 10000,
+});
+// Sin oyente, un error en una conexión inactiva tumba el proceso (ver postgres-db.js).
+pool.on("error", (err) => {
+  console.error("[pending-writes:pool] error en conexión inactiva (se descarta):", err?.message, err?.code || "");
 });
 
 // Solo estas rutas HTTP representan una escritura real de datos de
