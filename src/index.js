@@ -2541,14 +2541,21 @@ function textoPlanoFusion(html) {
   return normalizarTextoFusion(String(html ?? "").replace(/<[^>]*>/g, " ").replace(/&nbsp;/g, " "));
 }
 
+// Apodos muy usados que la raíz no cubre ("Barça" no empieza por "barcel").
+const FUSION_ALIAS_CLAVES = { barcelona: ["barca*"] };
+
 // Claves distintivas de un equipo: palabras de 3+ letras que no sean
-// genéricas ("club", "real"...). Las de 5+ letras se comparan por su raíz
-// de 4 (acabada en "*") para casar "Barça"/"Barcelona" o "gimnásticos".
+// genéricas ("club", "real"...). Las largas se comparan por una raíz de hasta
+// 6 letras ("castel*" y no "cast*", para no confundir "Castellón" con
+// "castigo" o "casta"); las de 5 letras por su raíz de 4 ("ceut*" cubre Ceuta,
+// ceutí, ceutíes). Acabadas en "*" = raíz.
 function clavesEquipoFusion(nombre) {
-  const claves = normalizarTextoFusion(nombre)
-    .split(/[^a-z0-9]+/)
-    .filter((t) => t.length >= 3 && !/^\d+$/.test(t) && !FUSION_PALABRAS_GENERICAS.has(t))
-    .map((t) => (t.length >= 5 ? `${t.slice(0, 4)}*` : t));
+  const claves = [];
+  for (const t of normalizarTextoFusion(nombre).split(/[^a-z0-9]+/)) {
+    if (t.length < 3 || /^\d+$/.test(t) || FUSION_PALABRAS_GENERICAS.has(t)) continue;
+    claves.push(t.length >= 6 ? `${t.slice(0, Math.min(t.length - 2, 6))}*` : t.length === 5 ? `${t.slice(0, 4)}*` : t);
+    if (FUSION_ALIAS_CLAVES[t]) claves.push(...FUSION_ALIAS_CLAVES[t]);
+  }
   return [...new Set(claves)];
 }
 
@@ -2563,19 +2570,84 @@ function clavesDistintivasFusion(local, visitante) {
   return { local: l.filter((c) => !sv.has(c)), visitante: v.filter((c) => !sl.has(c)) };
 }
 
-function contarClavesFusion(textoNormalizado, claves) {
+function contarClavesFusion(textoNormalizado, claves, tope = Infinity) {
   let total = 0;
   for (const c of claves) {
     const patron = c.endsWith("*") ? `${c.slice(0, -1)}[a-z0-9]*` : `${c}(?![a-z0-9])`;
     const m = textoNormalizado.match(new RegExp(`(?:^|[^a-z0-9])${patron}`, "g"));
-    if (m) total += m.length;
+    if (m) total += Math.min(m.length, tope);
   }
   return total;
 }
 
-// "local", "visitante" o null (sin señal clara).
-function ladoPorTextoFusion(art, claves) {
-  if (!claves.local.length && !claves.visitante.length) return null;
+// Apellido (última palabra) de cada jugador, sin tildes. Solo los de 4+ letras.
+function clavesJugadoresFusion(listaNombres) {
+  const claves = new Set();
+  for (const n of listaNombres || []) {
+    const toks = normalizarTextoFusion(n).split(/[^a-z0-9]+/).filter(Boolean);
+    const ap = toks[toks.length - 1];
+    if (ap && ap.length >= 4 && !/^\d+$/.test(ap)) claves.add(ap);
+  }
+  return claves;
+}
+
+// Pistas EXTRA para saber de qué equipo habla cada texto, sacadas de la base
+// de datos y dejadas en "nombres":
+//  - nombres.clavesJugadores = { local, visitante }: apellidos de los jugadores
+//    de cada equipo (alineaciones del partido + jugadores de los eventos del
+//    minuto a minuto). Nombrar a los jugadores de un equipo es una señal mucho
+//    más fiable que contar cuántas veces sale el nombre del club.
+//  - nombres.ladoAutor = { <autor_id>: "local"|"visitante" }: el equipo que
+//    sigue o cubre cada redactor (campo "equipo" de su perfil). Es solo un
+//    último recurso cuando el texto no deja claro nada.
+// Si algo falla no se rompe la página: simplemente se usan menos pistas.
+async function cargarPistasFusion(env, resultadoId, articulos, nombres) {
+  const norm = (x) => normalizarTextoFusion(x).trim();
+  const nl = norm(nombres.local);
+  const nv = norm(nombres.visitante);
+  try {
+    const jl = [];
+    const jv = [];
+    const { results: alin } = await env.DB.prepare("SELECT equipo, jugadores FROM alineaciones WHERE result_id = ?").bind(resultadoId).all();
+    for (const a of alin || []) {
+      const e = norm(a.equipo);
+      const lado = e === nl ? "local" : e === nv ? "visitante" : null;
+      if (!lado) continue;
+      let js = [];
+      try { js = JSON.parse(a.jugadores || "[]"); } catch { js = []; }
+      for (const j of js) (lado === "local" ? jl : jv).push(j && j.nombre);
+    }
+    const { results: evs } = await env.DB.prepare(
+      "SELECT equipo, jugador, jugador_sale, jugador_asistencia FROM match_events WHERE resultado_id = ? AND equipo IN ('local','visitante')"
+    ).bind(resultadoId).all();
+    for (const ev of evs || []) {
+      const dest = ev.equipo === "local" ? jl : jv;
+      dest.push(ev.jugador, ev.jugador_sale, ev.jugador_asistencia);
+    }
+    const kl = clavesJugadoresFusion(jl.filter(Boolean));
+    const kv = clavesJugadoresFusion(jv.filter(Boolean));
+    nombres.clavesJugadores = { local: [...kl].filter((k) => !kv.has(k)), visitante: [...kv].filter((k) => !kl.has(k)) };
+  } catch (e) {
+    console.error("Fusión: no se pudieron leer los jugadores", e);
+  }
+  try {
+    const ids = [...new Set(articulos.map((a) => a.autor_id).filter(Boolean))];
+    if (ids.length) {
+      const { results: us } = await env.DB.prepare(`SELECT id, equipo FROM users WHERE id IN (${ids.map(() => "?").join(",")})`).bind(...ids).all();
+      nombres.ladoAutor = {};
+      for (const u of us || []) {
+        const lados = new Set(parsearEquipos(u.equipo).map(norm).map((c) => (c === nl ? "local" : c === nv ? "visitante" : null)).filter(Boolean));
+        if (lados.size === 1) nombres.ladoAutor[u.id] = [...lados][0];
+      }
+    }
+  } catch (e) {
+    console.error("Fusión: no se pudo leer el equipo de los autores", e);
+  }
+}
+
+// { l, v }: puntos a favor de cada equipo. Cuentan el nombre del club (más
+// peso en título y subtítulo) y los apellidos de sus jugadores en el texto.
+function puntuarLadosFusion(art, claves, clavesJug) {
   const campos = [
     [normalizarTextoFusion(art.titulo), 6],
     [normalizarTextoFusion(art.subtitulo), 4],
@@ -2589,28 +2661,58 @@ function ladoPorTextoFusion(art, claves) {
     l += peso * contarClavesFusion(txt, claves.local);
     v += peso * contarClavesFusion(txt, claves.visitante);
   }
-  const total = l + v;
-  const diff = l - v;
-  if (total === 0 || Math.abs(diff) < Math.max(3, total * 0.35)) return null;
-  return diff > 0 ? "local" : "visitante";
+  if (clavesJug) {
+    const cuerpo = textoPlanoFusion(art.contenido);
+    // Tope por jugador para que uno solo (el del hat-trick) no decida todo.
+    l += 2 * contarClavesFusion(cuerpo, clavesJug.local || [], 4);
+    v += 2 * contarClavesFusion(cuerpo, clavesJug.visitante || [], 4);
+  }
+  return { l, v };
 }
 
-// Devuelve [{ art, i, lado }] en el orden en que irán las secciones.
+// Devuelve [{ art, i, lado, reparto }] en el orden en que irán las secciones.
+// "reparto" va de -1 (todo del visitante) a 1 (todo del local); null si el
+// texto no nombra a ninguno. Para decidir se COMPARAN los textos entre sí
+// (¿cuál se inclina más hacia el local?), no cada uno por separado: así, un
+// texto que habla del Castellón pero cita mucho al rival no se confunde, porque
+// el otro texto se inclina todavía más hacia el rival.
 function ordenarSeccionesFusion(articulos, nombres) {
   const claves = clavesDistintivasFusion(nombres.local, nombres.visitante);
-  const items = articulos.map((art, i) => ({ art, i, lado: ladoPorTextoFusion(art, claves) }));
+  const items = articulos.map((art, i) => {
+    const { l, v } = puntuarLadosFusion(art, claves, nombres.clavesJugadores);
+    const total = l + v;
+    return { art, i, lado: null, reparto: total > 0 ? (l - v) / total : null };
+  });
+  const contrario = (x) => (x === "local" ? "visitante" : "local");
+  const ladoDe = (r, umbral) => (r != null && Math.abs(r) >= umbral ? (r > 0 ? "local" : "visitante") : null);
+
   if (items.length === 2) {
     const [a, b] = items;
-    const contrario = (x) => (x === "local" ? "visitante" : "local");
-    if (a.lado && !b.lado) b.lado = contrario(a.lado);
-    else if (b.lado && !a.lado) a.lado = contrario(b.lado);
-    else if (a.lado && a.lado === b.lado) { a.lado = null; b.lado = null; }
+    if (a.reparto != null && b.reparto != null) {
+      const margen = a.reparto - b.reparto;
+      if (Math.abs(margen) >= 0.3) { a.lado = margen > 0 ? "local" : "visitante"; b.lado = contrario(a.lado); }
+    } else if (a.reparto != null || b.reparto != null) {
+      const [con, sin] = a.reparto != null ? [a, b] : [b, a];
+      const lado = ladoDe(con.reparto, 0.3);
+      if (lado) { con.lado = lado; sin.lado = contrario(lado); }
+    }
+  } else {
+    for (const x of items) x.lado = ladoDe(x.reparto, 0.4);
   }
-  // Toda sección lleva el nombre de un equipo: las que no se han podido
-  // identificar por el texto cogen el lado que falte, por orden de creación.
-  const usados = new Set(items.map((x) => x.lado).filter(Boolean));
-  const libres = ["local", "visitante"].filter((l) => !usados.has(l));
-  for (const x of items) { if (!x.lado && libres.length) x.lado = libres.shift(); }
+
+  // Último recurso, solo para lo que el texto no ha aclarado: el equipo que
+  // sigue el redactor. Nunca se inventa un reparto por orden de creación.
+  const delAutor = (x) => (nombres.ladoAutor && x.art.autor_id ? nombres.ladoAutor[x.art.autor_id] || null : null);
+  if (items.length === 2 && !items[0].lado && !items[1].lado) {
+    const [a, b] = items;
+    const pa = delAutor(a);
+    const pb = delAutor(b);
+    if (pa && (!pb || pb !== pa)) { a.lado = pa; b.lado = contrario(pa); }
+    else if (pb && !pa) { b.lado = pb; a.lado = contrario(pb); }
+  } else if (items.length > 2) {
+    for (const x of items) if (!x.lado) x.lado = delAutor(x);
+  }
+
   const rango = (x) => (x.lado === "local" ? 0 : x.lado === "visitante" ? 1 : 2);
   return items.sort((x, y) => rango(x) - rango(y) || x.i - y.i);
 }
@@ -2618,7 +2720,8 @@ function ordenarSeccionesFusion(articulos, nombres) {
 function tituloSeccionFusion(item, items, nombres, idioma) {
   const equipo = item.lado === "local" ? nombres.local : item.lado === "visitante" ? nombres.visitante : null;
   const autor = item.art.autor_nombre || "";
-  // Siempre el nombre del equipo (si no se sabe de cuál habla, el partido).
+  // Nunca se pone un equipo por suerte: si no se sabe de cuál habla, se
+  // titula con el partido, que no puede estar equivocado.
   const titulo = equipo || `${nombres.local} - ${nombres.visitante}`;
   const repetido = items.filter((x) => x.lado === item.lado).length > 1;
   return repetido && autor ? `${titulo} · ${autor}` : titulo;
@@ -2774,7 +2877,7 @@ function fusionarGrupoDePartido(base, otros, nombres) {
   base.fusionado_con_slug = otros[0] ? otros[0].slug : null;
   base.fusion = {
     total: secciones.length,
-    secciones: secciones.map((s) => ({ lado: s.lado, autor_nombre: s.art.autor_nombre || null, titulo: s.art.titulo, slug: s.art.slug })),
+    secciones: secciones.map((s) => ({ lado: s.lado, reparto: s.reparto == null ? null : Math.round(s.reparto * 100) / 100, autor_nombre: s.art.autor_nombre || null, titulo: s.art.titulo, slug: s.art.slug })),
   };
 }
 
@@ -8818,7 +8921,9 @@ async function handlePrimary(request, env, ctx) {
               ? await env.DB.prepare("SELECT equipo_local, equipo_visitante FROM results WHERE id = ?").bind(article.resultado_id).first()
               : null;
             if (partido) {
-              fusionarGrupoDePartido(article, otrosFusion, { local: partido.equipo_local, visitante: partido.equipo_visitante });
+              const nombresFusion = { local: partido.equipo_local, visitante: partido.equipo_visitante };
+              await cargarPistasFusion(env, article.resultado_id, [article, ...otrosFusion], nombresFusion);
+              fusionarGrupoDePartido(article, otrosFusion, nombresFusion);
               idsFusion = [article.id, ...otrosFusion.map((o) => o.id)];
             }
           }
