@@ -203,6 +203,31 @@ function cors(resp, origin) {
   resp.headers.set("Access-Control-Expose-Headers", "X-Failover-Backend,X-Failover-Test,X-Failover-Reason,X-Data-Staleness-Ms,X-Data-Staleness-Stale,X-Data-Staleness-Warning");
   return resp;
 }
+// ---------- Caché corta en memoria del isolate ----------
+// Cada isolate de Workers atiende muchas peticiones seguidas, así que una
+// caché de unos segundos colapsa las ráfagas (p. ej. decenas de lectores
+// refrescando el mismo partido cada 15 s) en una sola consulta a la base de
+// datos. Es por isolate: no se comparte entre instancias, así que la
+// frescura máxima es el TTL (pocos segundos). Guarda la promesa para que las
+// peticiones simultáneas también compartan una única consulta.
+const CACHE_CORTA = new Map();
+const CACHE_CORTA_MAX = 300;
+async function memoCorta(clave, ttlMs, cargar) {
+  const ahora = Date.now();
+  const e = CACHE_CORTA.get(clave);
+  if (e && e.exp > ahora) return e.valor;
+  if (CACHE_CORTA.size >= CACHE_CORTA_MAX) {
+    for (const [k, v] of CACHE_CORTA) { if (v.exp <= ahora) CACHE_CORTA.delete(k); }
+    if (CACHE_CORTA.size >= CACHE_CORTA_MAX) CACHE_CORTA.clear();
+  }
+  const valor = Promise.resolve().then(cargar);
+  CACHE_CORTA.set(clave, { exp: ahora + ttlMs, valor });
+  try { return await valor; } catch (err) { CACHE_CORTA.delete(clave); throw err; }
+}
+function invalidarCacheCorta(prefijo) {
+  for (const k of [...CACHE_CORTA.keys()]) { if (k.startsWith(prefijo)) CACHE_CORTA.delete(k); }
+}
+
 function json(data, status = 200) {
   return cors(new Response(JSON.stringify(data), {
     status,
@@ -1657,9 +1682,20 @@ async function requireAuth(request, env, url) {
   // este cambio) no llevan "sid"; se siguen aceptando hasta que caduquen
   // por sí solos, para no desconectar a todo el mundo de golpe.
   if (payload.sid) {
-    const sesion = await env.DB.prepare(
-      "SELECT id, last_seen_at FROM sessions WHERE id = ? AND user_id = ? AND revoked_at IS NULL"
-    ).bind(payload.sid, payload.uid).first();
+    // Caché de 20 s SOLO para sesiones válidas (la revocación tarda como
+        // máximo 20 s en notarse en este isolate). El panel hace decenas de
+        // peticiones por minuto y cada una validaba la sesión en la base.
+    const claveSesion = `sesion:${payload.sid}:${payload.uid}`;
+    const sesionEnCache = CACHE_CORTA.get(claveSesion);
+    const sesion = (sesionEnCache && sesionEnCache.exp > Date.now())
+      ? await sesionEnCache.valor
+      : await memoCorta(claveSesion, 20000, async () => {
+          const fila = await env.DB.prepare(
+            "SELECT id, last_seen_at FROM sessions WHERE id = ? AND user_id = ? AND revoked_at IS NULL"
+          ).bind(payload.sid, payload.uid).first();
+          if (!fila) CACHE_CORTA.delete(claveSesion); // no se cachea lo no encontrado
+          return fila;
+        });
     if (!sesion) {
       // Ver requireAuth en worker/src/index.js (D1) para la explicación
       // completa de esta tolerancia.
@@ -1677,6 +1713,7 @@ async function requireAuth(request, env, url) {
       if (!yaReciente) {
         env.DB.prepare("UPDATE sessions SET last_seen_at = datetime('now') WHERE id = ?")
           .bind(payload.sid).run().catch(() => {});
+        sesion.last_seen_at = new Date().toISOString().slice(0, 19).replace("T", " "); // evita repetir el UPDATE mientras la fila está en caché
       }
     }
   }
@@ -3276,7 +3313,7 @@ function normalizarHorarioPublicacion(raw) {
 }
 
 async function obtenerHorarioPublicacion(env) {
-  const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'horario_publicacion'").first();
+  const row = await memoCorta("horario_publicacion", 30000, () => env.DB.prepare("SELECT value FROM settings WHERE key = 'horario_publicacion'").first());
   let raw = null;
   if (row) { try { raw = JSON.parse(row.value); } catch { raw = null; } }
   return normalizarHorarioPublicacion(raw);
@@ -3342,12 +3379,65 @@ function fechaSqlADate(valor) {
   return isNaN(d.getTime()) ? null : d;
 }
 
+// Carga en lote (sin una consulta por crónica) lo necesario para saber si
+// varias crónicas son de una jornada ya terminada: los partidos por id (en
+// trozos, D1 limita a 100 parámetros por consulta) y el calendario de
+// jornadas entero (tabla pequeña, una sola lectura). Ver
+// aplicarFueraCalendarioEnLectura.
+function claveRangoJornada(competicion, grupo, jornada) {
+  return `${competicion}|${grupo ? "g:" + grupo : "-"}|${jornada}`;
+}
+
+async function cargarContextoJornadas(env, resultadoIds) {
+  const ids = [...new Set(resultadoIds.filter(Boolean))];
+  const partidos = new Map();
+  const rangos = new Map();
+  if (!ids.length) return { partidos, rangos };
+  for (let i = 0; i < ids.length; i += 80) {
+    const trozo = ids.slice(i, i + 80);
+    const { results } = await env.DB.prepare(
+      `SELECT id, competicion, grupo, jornada, fecha_partido FROM results WHERE id IN (${trozo.map(() => "?").join(",")})`
+    ).bind(...trozo).all();
+    for (const r of results || []) partidos.set(r.id, r);
+  }
+  if (partidos.size) {
+    const { results } = await env.DB.prepare(
+      "SELECT competicion, grupo, jornada, fecha_fin FROM jornadas_calendario"
+    ).all();
+    for (const r of results || []) {
+      const clave = claveRangoJornada(r.competicion, r.grupo, r.jornada);
+      if (!rangos.has(clave)) rangos.set(clave, r.fecha_fin);
+    }
+  }
+  return { partidos, rangos };
+}
+
+// Misma lógica que esCronicaDeJornadaAnterior, pero sobre datos ya cargados.
+function esCronicaDeJornadaAnteriorEnLote(ctx, resultadoId, hoyYmd) {
+  if (!resultadoId) return false;
+  const partido = ctx.partidos.get(resultadoId);
+  if (!partido) return false;
+  const fechaFin = ctx.rangos.get(claveRangoJornada(partido.competicion, partido.grupo || null, partido.jornada));
+  if (fechaFin) return fechaFin < hoyYmd;
+  const fechaPartido = String(partido.fecha_partido || "").slice(0, 10);
+  if (!fechaPartido) return false;
+  const limite = new Date(`${hoyYmd}T00:00:00Z`);
+  limite.setUTCDate(limite.getUTCDate() - 3);
+  return fechaPartido < limite.toISOString().slice(0, 10);
+}
+
 async function aplicarFueraCalendarioEnLectura(env, articulos) {
   let horario;
   try { horario = await obtenerHorarioPublicacion(env); } catch (err) { console.error("horario_publicacion:", err); return articulos; }
   if (!horario.activo) return articulos;
-  const cacheAnterior = new Map();
-  return Promise.all(articulos.map(async (a) => {
+  const idsCronicas = articulos
+    .filter((a) => !a.fuera_calendario && (a.publicado || a.programado_para) && (a.tipo || "noticia") === "cronica" && a.resultado_id)
+    .map((a) => a.resultado_id);
+  let ctx = { partidos: new Map(), rangos: new Map() };
+  if (idsCronicas.length) {
+    try { ctx = await cargarContextoJornadas(env, idsCronicas); } catch (err) { console.error("horario_publicacion (jornadas):", err); }
+  }
+  return articulos.map((a) => {
     if (a.fuera_calendario) return a;
     if (!a.publicado && !a.programado_para) return a; // borrador: aún no se publica
     const fecha = fechaSqlADate(a.publicado ? a.fecha_publicacion : a.programado_para);
@@ -3356,13 +3446,11 @@ async function aplicarFueraCalendarioEnLectura(env, articulos) {
     const tipoArticulo = a.tipo || "noticia";
     let tipoHorario = tipoArticulo;
     if (tipoArticulo === "cronica") {
-      const clave = `${a.resultado_id || 0}|${ymd}`;
-      if (!cacheAnterior.has(clave)) cacheAnterior.set(clave, await esCronicaDeJornadaAnterior(env, a.resultado_id, ymd).catch(() => false));
-      tipoHorario = cacheAnterior.get(clave) ? "cronica_anterior" : "cronica_actual";
+      tipoHorario = esCronicaDeJornadaAnteriorEnLote(ctx, a.resultado_id, ymd) ? "cronica_anterior" : "cronica_actual";
     }
     if (!IDS_TIPOS_HORARIO.includes(tipoHorario)) return a;
     return horario.dias[dia].includes(tipoHorario) ? a : { ...a, fuera_calendario: 1 };
-  }));
+  });
 }
 
 // ---------- Permisos por autor + solicitudes de edición ----------
@@ -6934,6 +7022,7 @@ async function handlePrimary(request, env, ctx) {
         await env.DB.prepare(
           "UPDATE sessions SET revoked_at = datetime('now') WHERE user_id = ? AND revoked_at IS NULL"
         ).bind(user.id).run();
+        invalidarCacheCorta("sesion:");
 
         ctx.waitUntil(registrarActividad(env, request, { uid: user.id, nombre: user.nombre, rol: user.rol }, {
           accion: "recuperar_password", entidad: "usuario", entidad_id: user.id,
@@ -7100,6 +7189,7 @@ async function handlePrimary(request, env, ctx) {
         await env.DB.prepare(
           "UPDATE sessions SET revoked_at = datetime('now') WHERE user_id = ? AND id != ? AND revoked_at IS NULL"
         ).bind(user.id, payload.sid || "").run();
+        invalidarCacheCorta("sesion:");
 
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "cambiar_password_propia", entidad: "usuario", entidad_id: payload.uid,
@@ -7141,6 +7231,7 @@ async function handlePrimary(request, env, ctx) {
         await env.DB.prepare(
           "UPDATE sessions SET revoked_at = datetime('now') WHERE user_id = ? AND id != ? AND revoked_at IS NULL"
         ).bind(payload.uid, payload.sid || "").run();
+        invalidarCacheCorta("sesion:");
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "cerrar_otras_sesiones", entidad: "sesion",
           descripcion: `${payload.nombre} ha cerrado el resto de sus sesiones abiertas`,
@@ -7161,6 +7252,7 @@ async function handlePrimary(request, env, ctx) {
         ).bind(id, payload.uid).first();
         if (!sesion) return json({ error: "Sesión no encontrada" }, 404);
         await env.DB.prepare("UPDATE sessions SET revoked_at = datetime('now') WHERE id = ?").bind(id).run();
+        invalidarCacheCorta("sesion:");
         const eraLaActual = id === payload.sid;
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "cerrar_sesion", entidad: "sesion", entidad_id: id,
@@ -7390,6 +7482,7 @@ async function handlePrimary(request, env, ctx) {
           `INSERT INTO settings (key, value, updated_at) VALUES ('horario_publicacion', ?, datetime('now'))
            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
         ).bind(JSON.stringify(horario)).run();
+        invalidarCacheCorta("horario_publicacion");
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "editar_settings", entidad: "settings",
           descripcion: `Ha ${horario.activo ? "actualizado" : "desactivado"} el horario de publicación`,
@@ -11429,6 +11522,12 @@ async function handlePrimary(request, env, ctx) {
       }
 
       if (path === "/api/results" && method === "GET") {
+        // Lista pública (sin credenciales): 8 s de caché por isolate.
+        const claveListaPublica = (request.headers.get("Authorization") || url.searchParams.get("token")) ? null : `lista:${url.search}`;
+        if (claveListaPublica) {
+          const enCache = CACHE_CORTA.get(claveListaPublica);
+          if (enCache && enCache.exp > Date.now()) return json({ results: enCache.valor });
+        }
         const competicion = url.searchParams.get("competicion");
         const estado = url.searchParams.get("estado");
         const grupo = url.searchParams.get("grupo");
@@ -11543,6 +11642,7 @@ async function handlePrimary(request, env, ctx) {
             r.segunda_parte_iniciada = mapaSegundaParte[r.id] || 0;
           });
         }
+        if (claveListaPublica) CACHE_CORTA.set(claveListaPublica, { exp: Date.now() + 8000, valor: results });
         return json({ results });
       }
 
@@ -11843,8 +11943,17 @@ async function handlePrimary(request, env, ctx) {
       // límite y orden propios, y podía dejar el resultado fuera).
       if (resultMatch && method === "GET") {
         const id = parseInt(resultMatch[1]);
-        const resultado = await env.DB.prepare("SELECT * FROM results WHERE id = ?").bind(id).first();
+        // ?ligero=1: lo usa el refresco automático de la web pública (cada
+        // 15 s por lector y partido en vivo). Devuelve solo la fila del
+        // partido, sin alineaciones, noticias vinculadas ni galería (que no
+        // cambian en directo y cuestan 3 consultas más), y la comparte
+        // 3 s entre todas las peticiones del isolate.
+        const ligero = url.searchParams.get("ligero") === "1";
+        const resultado = ligero
+          ? await memoCorta(`res:${id}`, 3000, () => env.DB.prepare("SELECT * FROM results WHERE id = ?").bind(id).first())
+          : await env.DB.prepare("SELECT * FROM results WHERE id = ?").bind(id).first();
         if (!resultado) return json({ error: "Resultado no encontrado" }, 404);
+        if (ligero) return json({ resultado });
         resultado.alineaciones = await obtenerAlineaciones(env, "result_id", id);
         // Si hay una (o varias) noticia ya publicada vinculada a este
         // partido (crónica, previa...), se adjunta aquí para poder
