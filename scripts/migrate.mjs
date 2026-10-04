@@ -40,11 +40,30 @@ export async function ejecutarMigraciones() {
     throw new Error("Falta DATABASE_URL en las variables de entorno.");
   }
 
-  const client = new Client({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.PGSSL === "disable" ? false : { rejectUnauthorized: false },
-  });
-  await client.connect();
+  // La primera conexión tras un deploy falla a veces con ECONNRESET (proxy
+  // TCP de Railway / Postgres aún ocupado), y como el arranque no espera a
+  // reintentar, la migración se quedaba sin aplicar hasta el siguiente
+  // deploy. Se reintenta la conexión unas cuantas veces con espera creciente.
+  const ESPERAS_MS = [1000, 2000, 4000, 8000];
+  let client;
+  for (let intento = 0; ; intento++) {
+    client = new Client({
+      connectionString: process.env.DATABASE_URL,
+      ssl: process.env.PGSSL === "disable" ? false : { rejectUnauthorized: false },
+      connectionTimeoutMillis: 10000,
+    });
+    // Sin oyente, un error en la conexión (p. ej. un corte a mitad) tumba el proceso.
+    client.on("error", (err) => console.error("[migrate] error de conexión:", err.message));
+    try {
+      await client.connect();
+      break;
+    } catch (err) {
+      try { await client.end(); } catch { /* ya estaba cerrada */ }
+      if (intento >= ESPERAS_MS.length) throw err;
+      console.warn(`[migrate] no se pudo conectar (${err.message}); reintento ${intento + 1}/${ESPERAS_MS.length} en ${ESPERAS_MS[intento] / 1000}s`);
+      await new Promise((r) => setTimeout(r, ESPERAS_MS[intento]));
+    }
+  }
 
   try {
     await asegurarTablaControl(client);
