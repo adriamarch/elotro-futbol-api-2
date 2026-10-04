@@ -2734,7 +2734,7 @@ function tituloSeccionFusion(item, items, nombres, idioma) {
 async function buscarGrupoFusionPartido(env, article) {
   if (!article || !article.resultado_id || !FUSION_TIPOS.includes(article.tipo)) return null;
   const { results } = await env.DB.prepare(
-    `SELECT id, slug FROM articles WHERE resultado_id = ? AND tipo = ? AND publicado = 1 ORDER BY id ASC LIMIT ?`
+    `SELECT id, slug, categoria FROM articles WHERE resultado_id = ? AND tipo = ? AND publicado = 1 ORDER BY id ASC LIMIT ?`
   ).bind(article.resultado_id, article.tipo, FUSION_MAX_ARTICULOS).all();
   if (!results || results.length < 2) return null;
   if (!results.some((r) => r.id === article.id)) return null;
@@ -8549,7 +8549,17 @@ async function handlePrimary(request, env, ctx) {
               ? `CASE WHEN publicado = 1 AND tipo IN ('previa', 'cronica') AND resultado_id IS NOT NULL
                    THEN (SELECT COUNT(*) FROM articles b WHERE b.resultado_id = articles.resultado_id AND b.tipo = articles.tipo AND b.publicado = 1)
                    ELSE 0 END`
-              : "0"} AS fusion_total
+              : "0"} AS fusion_total,
+            ${admin
+              ? `CASE WHEN publicado = 1 AND tipo IN ('previa', 'cronica') AND resultado_id IS NOT NULL
+                   THEN (SELECT b.slug FROM articles b WHERE b.resultado_id = articles.resultado_id AND b.tipo = articles.tipo AND b.publicado = 1 ORDER BY b.id ASC LIMIT 1)
+                   ELSE NULL END`
+              : "NULL"} AS fusion_slug,
+            ${admin
+              ? `CASE WHEN publicado = 1 AND tipo IN ('previa', 'cronica') AND resultado_id IS NOT NULL
+                   THEN (SELECT b.categoria FROM articles b WHERE b.resultado_id = articles.resultado_id AND b.tipo = articles.tipo AND b.publicado = 1 ORDER BY b.id ASC LIMIT 1)
+                   ELSE NULL END`
+              : "NULL"} AS fusion_categoria
           FROM articles WHERE 1=1`;
         const binds = [];
         if (!admin) {
@@ -8910,7 +8920,7 @@ async function handlePrimary(request, env, ctx) {
         if (isNaN(key) && article.publicado) {
           const grupoFusion = await buscarGrupoFusionPartido(env, article);
           if (grupoFusion && grupoFusion.rol === "otro") {
-            return json({ redirect: grupoFusion.primero.slug });
+            return json({ redirect: grupoFusion.primero.slug, categoria: grupoFusion.primero.categoria || null });
           }
           if (grupoFusion && grupoFusion.rol === "primero") {
             const idsOtros = grupoFusion.grupo.filter((r) => r.id !== article.id).map((r) => r.id);
