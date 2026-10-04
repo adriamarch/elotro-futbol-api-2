@@ -2477,9 +2477,10 @@ function normalizarImagenes(raw) {
 // ---------- Fusión de las previas / crónicas del mismo partido (v2) ----------
 // Cuando hay DOS O MÁS previas (o crónicas) PUBLICADAS del mismo partido, la
 // web las muestra automáticamente como UNA sola página, dividida en una
-// sección por redactor: cada sección con su <h3> (el nombre del equipo del que
-// habla, o "La visión de <autor>" si no se sabe), sus fotos recolocadas, y la
-// firma conjunta de todos los autores. Es una fusión al LEER (no se toca la
+// sección por redactor: cada sección con su <h2> (SIEMPRE el nombre del equipo del
+// que habla; nunca "La visión de..."), sus fotos recolocadas DENTRO de su sección
+// (todas las imágenes de una sección terminan antes de empezar la siguiente), y
+// la firma conjunta de todos los autores. Es una fusión al LEER (no se toca la
 // base de datos, así que NO hace falta ninguna migración): cada redactor sigue
 // teniendo su artículo propio (y sus publicaciones cuentan para su nivel), y si
 // una se despublica o se borra, las demás vuelven a verse como correspondan.
@@ -2605,6 +2606,11 @@ function ordenarSeccionesFusion(articulos, nombres) {
     else if (b.lado && !a.lado) a.lado = contrario(b.lado);
     else if (a.lado && a.lado === b.lado) { a.lado = null; b.lado = null; }
   }
+  // Toda sección lleva el nombre de un equipo: las que no se han podido
+  // identificar por el texto cogen el lado que falte, por orden de creación.
+  const usados = new Set(items.map((x) => x.lado).filter(Boolean));
+  const libres = ["local", "visitante"].filter((l) => !usados.has(l));
+  for (const x of items) { if (!x.lado && libres.length) x.lado = libres.shift(); }
   const rango = (x) => (x.lado === "local" ? 0 : x.lado === "visitante" ? 1 : 2);
   return items.sort((x, y) => rango(x) - rango(y) || x.i - y.i);
 }
@@ -2612,13 +2618,10 @@ function ordenarSeccionesFusion(articulos, nombres) {
 function tituloSeccionFusion(item, items, nombres, idioma) {
   const equipo = item.lado === "local" ? nombres.local : item.lado === "visitante" ? nombres.visitante : null;
   const autor = item.art.autor_nombre || "";
-  if (equipo) {
-    const repetido = items.filter((x) => x.lado === item.lado).length > 1;
-    return repetido && autor ? `${equipo} · ${autor}` : equipo;
-  }
-  if (!autor) return `${nombres.local} - ${nombres.visitante}`;
-  // En las traducciones solo el nombre, para no dejar texto en castellano.
-  return idioma ? autor : `La visión de ${autor}`;
+  // Siempre el nombre del equipo (si no se sabe de cuál habla, el partido).
+  const titulo = equipo || `${nombres.local} - ${nombres.visitante}`;
+  const repetido = items.filter((x) => x.lado === item.lado).length > 1;
+  return repetido && autor ? `${titulo} · ${autor}` : titulo;
 }
 
 // ----- Búsqueda del grupo de un partido -----
@@ -2675,7 +2678,7 @@ async function remapearSlugsFusion(env, articulos) {
 // nombres = { local, visitante }.
 function fusionarGrupoDePartido(base, otros, nombres) {
   const secciones = ordenarSeccionesFusion([base, ...otros], nombres);
-  const h3 = (nombre) => `<h3>${escaparHtmlFusion(nombre)}</h3>`;
+  const h2 = (nombre) => `<h2>${escaparHtmlFusion(nombre)}</h2>`;
 
   // Texto: una sección por artículo. Todo se calcula ANTES de tocar base.
   const offsets = [];
@@ -2683,7 +2686,7 @@ function fusionarGrupoDePartido(base, otros, nombres) {
   let contenido = "";
   for (const s of secciones) {
     offsets.push(offset);
-    contenido += h3(tituloSeccionFusion(s, secciones, nombres, null)) + (s.art.contenido || "");
+    contenido += h2(tituloSeccionFusion(s, secciones, nombres, null)) + (s.art.contenido || "");
     offset += 1 + contarBloquesHtmlFusion(s.art.contenido);
   }
   // En cada idioma solo se ofrece la traducción si TODAS están traducidas
@@ -2692,36 +2695,55 @@ function fusionarGrupoDePartido(base, otros, nombres) {
   for (const idioma of IDIOMAS_TRADUCCION) {
     const campo = `contenido_${idioma}`;
     traducciones[campo] = secciones.every((s) => s.art[campo])
-      ? secciones.map((s) => h3(tituloSeccionFusion(s, secciones, nombres, idioma)) + s.art[campo]).join("")
+      ? secciones.map((s) => h2(tituloSeccionFusion(s, secciones, nombres, idioma)) + s.art[campo]).join("")
       : null;
   }
 
-  // Fotos: las de cada sección se desplazan por los bloques anteriores (más
-  // el <h3> propio). Las "al inicio" de las secciones que no abren la página
-  // pasan a ir justo tras su <h3>. Los collages de cada sección cambian de
-  // grupo para no mezclarse con los de otra.
+  // Fotos: las de cada sección se colocan DENTRO de su propia sección
+  // (nunca se cuelan en la siguiente): "tras el párrafo N" se limita a los
+  // párrafos de esa sección, y las "al final" / "galería" de una sección que
+  // no es la última se cierran al final de su texto, antes del <h2> de la
+  // siguiente. Solo la galería de la última sección va en el carrusel final.
+  // Las "al inicio" de las secciones que no abren la página pasan a ir justo
+  // tras su <h2>. Los collages de cada sección cambian de grupo para no
+  // mezclarse con los de otra.
   const vistas = new Set([base.imagen_url].filter(Boolean));
   const todas = [];
   let portada = base.imagen_url || null;
+  const ultima = secciones.length - 1;
   secciones.forEach((s, k) => {
     const off = offsets[k];
+    const nb = contarBloquesHtmlFusion(s.art.contenido);
+    const tras = (t) => off + 1 + (nb > 0 ? Math.min(Math.max(Number(t) || 1, 1), nb) : 0);
+    const alFinal = off + 1 + nb;
     const imgs = parseImagenesFusion(s.art.imagenes).map((f) => {
       const g = { ...f };
-      const colocable = (g.posicion === "personalizada" || g.posicion === "collage") && g.trasParrafo;
-      if (k === 0) {
-        if (colocable) g.trasParrafo = g.trasParrafo + 1;
-      } else {
-        if (g.posicion === "inicio") { g.posicion = "personalizada"; g.trasParrafo = off + 1; }
-        else if (colocable) g.trasParrafo = g.trasParrafo + off + 1;
-        if (g.posicion === "collage" && g.grupo) g.grupo = `fusion${k}-${g.grupo}`;
+      const pos = g.posicion;
+      if (pos === "inicio") {
+        if (k > 0) {
+          g.posicion = g.grupo ? "collage" : "personalizada";
+          g.trasParrafo = off + 1;
+        }
+      } else if (pos === "personalizada" || pos === "collage") {
+        g.trasParrafo = tras(g.trasParrafo);
+      } else if (pos === "medio") {
+        g.posicion = "personalizada";
+        g.trasParrafo = tras(g.trasParrafo || Math.ceil(nb / 2));
+      } else if (pos === "final") {
+        g.posicion = "personalizada";
+        g.trasParrafo = alFinal;
+      } else if (pos === "galeria" && k < ultima) {
+        g.posicion = g.grupo ? "collage" : "personalizada";
+        g.trasParrafo = alFinal;
       }
+      if (g.posicion === "collage" && g.grupo && k > 0) g.grupo = `fusion${k}-${g.grupo}`;
       return g;
     });
     for (const f of imgs) { if (!vistas.has(f.url)) { vistas.add(f.url); todas.push(f); } }
     if (s.art !== base && s.art.imagen_url && !vistas.has(s.art.imagen_url)) {
       vistas.add(s.art.imagen_url);
       if (!portada) portada = s.art.imagen_url;
-      else todas.push({ url: s.art.imagen_url, posicion: "galeria", foco: "50% 50%" });
+      else todas.push({ url: s.art.imagen_url, posicion: "personalizada", trasParrafo: off + 1, foco: "50% 50%" });
     }
   });
 
