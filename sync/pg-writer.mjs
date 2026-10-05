@@ -380,6 +380,14 @@ export async function desacoplarUsuarioHuerfano(client, userId) {
   await client.query('UPDATE club_info_solicitudes SET resuelta_por_id = NULL WHERE resuelta_por_id = $1', [userId]);
   await client.query('UPDATE activity_log SET usuario_id = NULL WHERE usuario_id = $1', [userId]);
   await client.query('UPDATE nivel_historial SET cambiado_por_id = NULL WHERE cambiado_por_id = $1', [userId]);
+  // FKs a users(id) añadidas por migraciones posteriores (encuestas, tienda,
+  // galería de partido, noticias rápidas). Faltaban aquí y el DELETE del
+  // usuario huérfano fallaba (p. ej. "polls_autor_id_fkey"), lo que a su vez
+  // impedía insertar un usuario nuevo con el mismo username.
+  await client.query('UPDATE polls SET autor_id = NULL WHERE autor_id = $1', [userId]);
+  await client.query('UPDATE noticias_rapidas SET autor_id = NULL WHERE autor_id = $1', [userId]);
+  await client.query('UPDATE match_gallery SET vinculado_por_id = NULL WHERE vinculado_por_id = $1', [userId]);
+  await client.query('UPDATE tienda_pedidos SET gestionado_por = NULL WHERE gestionado_por = $1', [userId]);
 
   // DELETE: columnas NOT NULL, no se pueden dejar a NULL (igual que D1 con
   // sessions y nivel_historial).
