@@ -47,6 +47,7 @@ import {
   desacoplarUsuarioHuerfano,
   desacoplarResultadoHuerfano,
   sincronizarSecuencia,
+  escaparIdentificador,
 } from "./pg-writer.mjs";
 
 // Antes de borrar una fila huérfana (existe en Postgres pero ya no en D1)
@@ -80,6 +81,108 @@ function pkValuesFromRow(row, pk) {
 }
 function pkKey(row, pk) {
   return pk.map((c) => String(row[c])).join("\u0000");
+}
+
+// Columnas UNIQUE (aparte de la PK) cuyo conflicto se resuelve borrando la fila
+// obsoleta de Postgres. Caso real: un usuario se borra en D1 y se vuelve a
+// crear con el mismo username (id nuevo). Postgres todavía tiene la fila
+// vieja con ese username, así que el upsert de la fila nueva falla con
+// "users_username_key" y, como el borrado de huérfanos va DESPUÉS del upsert,
+// la tabla se quedaba en error pasada tras pasada.
+const UNICOS_RESOLUBLES = { users: ["username"] };
+
+// Devuelve el nombre de la columna UNIQUE implicada si el error es un
+// conflicto resoluble (23505 sobre una columna de UNICOS_RESOLUBLES); si no, null.
+function columnaUnicaEnConflicto(error, table) {
+  if (error?.code !== "23505") return null;
+  const candidatas = UNICOS_RESOLUBLES[table];
+  if (!candidatas) return null;
+  for (const col of candidatas) {
+    if (error.constraint === `${table}_${col}_key`) return col;
+  }
+  // Fallback por el detalle ("Key (username)=(ana) already exists."); el
+  // patrón también vale con mensajes localizados de Postgres.
+  const m = /\(([^)]+)\)=\(/.exec(error.detail || "");
+  return m && candidatas.includes(m[1]) ? m[1] : null;
+}
+
+/**
+ * Borra de Postgres las filas que ocupan el mismo valor UNIQUE (p.ej. el
+ * username) que \`row\` pero con OTRA PK, siempre que esa PK ya no exista en
+ * D1 (D1 es la autoridad). Desacopla antes las FKs que apuntan a la fila
+ * (desacoplarHuerfanoSiAplica) y todo va en una transacción: o se desacopla
+ * y borra, o no cambia nada. Devuelve cuántas filas se borraron.
+ *
+ * Si la PK "obsoleta" sigue viva en D1 (p.ej. dos usuarios intercambian
+ * username y el orden de procesado choca a mitad de pasada), NO se borra
+ * nada y se lanza un error explicativo: se arreglará solo cuando esa fila
+ * se sincronice.
+ */
+export async function eliminarFilaObsoletaPorUnico(client, table, row, pk, column, { runId, leerD1 = ejecutarD1 } = {}) {
+  const pkCols = pk.map(escaparIdentificador).join(", ");
+  const mismaPk = pk.map((c, i) => `${escaparIdentificador(c)} = $${i + 2}`).join(" AND ");
+  const obsoletas = await client.query(
+    `SELECT ${pkCols} FROM ${escaparIdentificador(table)} WHERE ${escaparIdentificador(column)} = $1 AND NOT (${mismaPk});`,
+    [row[column], ...pkValuesFromRow(row, pk)]
+  );
+  if (obsoletas.rows.length === 0) return 0;
+
+  let borradas = 0;
+  for (const obsoleta of obsoletas.rows) {
+    const pkObsoleta = pkValuesFromRow(obsoleta, pk);
+    const clave = pkKey(obsoleta, pk);
+
+    const condD1 = pk.map((c, i) => `${c} = ${escaparValorD1(pkObsoleta[i])}`).join(" AND ");
+    const enD1 = await leerD1(`SELECT ${pk.join(", ")} FROM ${table} WHERE ${condD1} LIMIT 1;`);
+    if (enD1.length > 0) {
+      throw new Error(
+        `Conflicto de ${column}="${row[column]}" en ${table}: Postgres lo tiene en la fila ${clave} y D1 ` +
+        `lo asigna a ${pkKey(row, pk)}, pero la fila ${clave} sigue existiendo en D1 (¿cambio de ${column} entre ` +
+        `filas vivas?). No se borra nada; se resolverá cuando se sincronice la fila ${clave}.`
+      );
+    }
+
+    await client.query("BEGIN");
+    try {
+      await desacoplarHuerfanoSiAplica(client, table, pkObsoleta);
+      if (await eliminarFila(client, table, pk, pkObsoleta)) borradas++;
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    }
+    console.warn(
+      `[${table}] conflicto de ${column}="${row[column]}": borrada la fila obsoleta ${clave} de Postgres ` +
+      `(ya no existe en D1) para poder insertar ${pkKey(row, pk)}.`
+    );
+    if (runId) {
+      // Constancia en sync_deletions, igual que los borrados de huérfanos.
+      // Best-effort: ya está commiteado, un fallo aquí no debe tumbar la fila.
+      await client.query(
+        `INSERT INTO sync_deletions (table_name, record_id, run_id) VALUES ($1, $2, $3);`,
+        [table, clave, runId]
+      ).catch((e) => console.warn(`[${table}] no se pudo registrar el borrado en sync_deletions: ${e.message}`));
+    }
+  }
+  return borradas;
+}
+
+/**
+ * upsertFila que, ante un conflicto UNIQUE resoluble (ver UNICOS_RESOLUBLES),
+ * borra la fila obsoleta de Postgres y reintenta UNA vez. Cualquier otro
+ * error (o un segundo fallo) se propaga tal cual.
+ */
+export async function upsertFilaResolviendoConflicto(client, table, row, columnas, pk, { runId, detalle, leerD1 } = {}) {
+  try {
+    return await upsertFila(client, table, row, columnas, pk, { onConflictAction: "update" });
+  } catch (error) {
+    const columna = columnaUnicaEnConflicto(error, table);
+    if (!columna) throw error;
+    const borradas = await eliminarFilaObsoletaPorUnico(client, table, row, pk, columna, { runId, leerD1 });
+    if (borradas === 0) throw error; // el conflicto no era con una fila obsoleta: no es cosa nuestra
+    if (detalle) detalle.deleted += borradas;
+    return upsertFila(client, table, row, columnas, pk, { onConflictAction: "update" });
+  }
 }
 
 // Límite de filas por lote (ya existía: 250) MÁS un límite de bytes
@@ -291,7 +394,7 @@ async function sincronizarTablaSinSecuencia(client, tableConfig, { runId }) {
             console.warn(`[${name}] página falló; reintentando fila a fila: ${paginaError.message}`);
             for (const row of pagina) {
               try {
-                const resultado = await conReintentos(() => upsertFila(client, name, row, columnasUtilizables, pk, { onConflictAction: "update" }));
+                const resultado = await conReintentos(() => upsertFilaResolviendoConflicto(client, name, row, columnasUtilizables, pk, { runId, detalle }));
                 if (resultado === "inserted") detalle.inserted++;
                 else if (resultado === "updated") detalle.updated++;
               } catch (error) {
@@ -446,7 +549,7 @@ async function sincronizarTablaSinSecuencia(client, tableConfig, { runId }) {
       console.warn(`[${name}] lote ${etiquetaLote} falló; reintentando fila a fila: ${batchError.message}`);
       for (const row of lote) {
         try {
-          const resultado = await conReintentos(() => upsertFila(client, name, row, columnasUtilizables, pk, { onConflictAction: "update" }));
+          const resultado = await conReintentos(() => upsertFilaResolviendoConflicto(client, name, row, columnasUtilizables, pk, { runId, detalle }));
           if (resultado === "inserted") detalle.inserted++;
           else if (resultado === "updated") detalle.updated++;
           if (row[cursorColumn] && (!ultimoCursorValor || row[cursorColumn] > ultimoCursorValor)) ultimoCursorValor = row[cursorColumn];
