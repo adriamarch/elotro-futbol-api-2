@@ -1,0 +1,59 @@
+name: Sincronizador D1 -> PostgreSQL
+
+# Sustituye al servicio permanente de Railway (npm run sync:scheduler).
+# Cada ejecución hace una sola pasada (npm run sync:once) y termina.
+# GitHub puede retrasar unos minutos los cron en horas de mucha carga.
+on:
+  schedule:
+    # Cada 10 minutos. Si el repo es privado y cada pasada tarda >20 s,
+    # pasar a */15 para no superar los 2.000 min/mes de GitHub Free.
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sincronizador-d1-postgres
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Ejecutar sincronización
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    defaults:
+      run:
+        working-directory: worker-secondary
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Instalar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: worker-secondary/package-lock.json
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Ejecutar sincronización
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PGSSL: ${{ secrets.PGSSL }}
+
+          # Necesarios para el drain (reproducir en D1 las escrituras
+          # hechas en la secundaria durante un failover).
+          INTERNAL_SYNC_SECRET: ${{ secrets.INTERNAL_SYNC_SECRET }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+
+          # Necesarios para que wrangler acceda a D1 en remoto.
+          D1_DATABASE_NAME: ${{ secrets.D1_DATABASE_NAME }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+          D1_TIMEOUT_MS: "120000"
+          D1_MAX_BUFFER_BYTES: "20971520"
+          SYNC_RSS_WARN_MB: "400"
+        run: npm run sync:once
