@@ -7423,7 +7423,17 @@ async function handlePrimary(request, env, ctx) {
         const user = await env.DB.prepare("SELECT id, nivel, nivel_nota, rol FROM users WHERE id = ?").bind(payload.uid).first();
         if (!user) return json({ error: "Usuario no encontrado" }, 404);
         const progreso = await construirProgresoNivel(env, user);
-        return json(progreso);
+        // Lista de TODOS los niveles con sus requisitos (la misma fuente que
+        // usa el cálculo del progreso: NIVELES_REQUISITOS) para que "Mi
+        // progreso" pueda dibujar el pase de niveles completo sin duplicar
+        // las cifras en el frontend. Solo va en este endpoint, no en el
+        // listado de usuarios, para no engordar esa respuesta.
+        const niveles = Object.keys(NIVELES_INFO).map((n) => ({
+          nivel: Number(n),
+          ...NIVELES_INFO[n],
+          requisitos: NIVELES_REQUISITOS[n] || null,
+        }));
+        return json({ ...progreso, niveles });
       }
 
       // ---------- SETTINGS (redes sociales y otros ajustes del medio) ----------
