@@ -17,6 +17,7 @@
     "sync:incremental": "node sync/incremental.mjs",
     "sync:compare": "node sync/comparator.mjs",
     "sync:scheduler": "node sync/scheduler.mjs",
+    "sync:once": "node sync/run-once.mjs",
     "test:sync": "node --test sync/test/*.test.mjs",
     "sync:unlock": "node sync/unlock.mjs"
   },
