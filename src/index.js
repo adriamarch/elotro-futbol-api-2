@@ -5601,6 +5601,26 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
     // sostenida en el primario, se salta el intento y se va directo a
     // Railway, en vez de sumar un intento fallido al primario en CADA
     // petición mientras dura el problema.
+    // Dentro de Railway (server-railway.js, RUNNING_IN_RAILWAY) no hay a
+    // dónde hacer failover: Railway ya ES el destino. Antes, un fallo de
+    // Postgres (p. ej. ECONNRESET) -> 500 -> fetchRailway lanzaba "No se
+    // puede hacer failover a Railway", el catch de abajo lo volvía a
+    // intentar (PRIMARY_EXCEPTION) y lanzaba otra vez, y el error acababa
+    // sin capturar en Hono (stack de fetchRailway en los logs). Aquí se
+    // atiende la petición directamente y se devuelve su respuesta tal cual
+    // (el 500 original con su detalle, o un 500 JSON si hay excepción).
+    if (env.RUNNING_IN_RAILWAY) {
+      try {
+        return await handlePrimary(request, env, ctx);
+      } catch (err) {
+        console.error("[RAILWAY] Error atendiendo la petición:", err);
+        return new Response(
+          JSON.stringify({ error: "Error del servidor", detail: err?.message || String(err) }),
+          { status: 500, headers: { "Content-Type": "application/json" } }
+        );
+      }
+    }
+
     const circuitoInfo = await circuitoEstaAbierto(env, method, path);
     if (circuitoInfo.abierto) {
       return await fetchRailway(
