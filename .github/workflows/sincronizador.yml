@@ -20,9 +20,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
 
-    defaults:
-      run:
-        working-directory: worker-secondary
 
     steps:
       - name: Descargar repositorio
@@ -33,7 +30,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: worker-secondary/package-lock.json
+          cache-dependency-path: package-lock.json
 
       - name: Instalar dependencias
         run: npm ci
