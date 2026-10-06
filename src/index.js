@@ -6260,7 +6260,7 @@ async function borrarDatosAnaliticas(env, { todo, dias }) {
  *   - Aviso 1 al cumplirse 30 días desde esa referencia.
  *   - Avisos 2, 3, 4 y 5: uno cada 5 días desde el aviso anterior.
  *   - El aviso 5 lleva además el texto de incumplimiento de las normas
- *     del medio (apartado 2.1.5, "Compromiso", de la guía del medio).
+ *     del medio (apartado 3.6, "Compromiso", de la guía del medio).
  *   - 5 días después del aviso 5, si sigue sin subir nada, se manda UN
  *     correo a los admins diciendo que hay que expulsar a ese usuario
  *     (no se expulsa automáticamente: la decisión sigue siendo de un admin).
@@ -6326,12 +6326,12 @@ function construirEmailRecordatorioInactividad({ nombre, diasSinSubir, numeroAvi
 
   if (numeroAviso >= INACTIVIDAD_AVISOS_HASTA_INCUMPLIMIENTO) {
     // Último aviso: tono amable, pero aquí sí va la referencia al apartado
-    // 2.1.5 (Compromiso) de la guía del medio y lo que pasará si no hay
+    // 3.6 (Compromiso) de la guía del medio y lo que pasará si no hay
     // respuesta (a los 5 días se avisa a los admins, ver más abajo).
     asunto = "Sobre tu colaboración en El Otro Fútbol";
     parrafos = [
       `Llevamos ${diasSinSubir} días sin ver ninguna noticia tuya y ya te hemos escrito varias veces. Sabemos que colaboras de forma totalmente voluntaria y que no es ninguna obligación, así que no queremos agobiarte.`,
-      "Aun así, tenemos que comentarte que una inactividad tan prolongada no encaja con el compromiso que aceptaste al unirte al medio, recogido en el apartado 2.1.5 (Compromiso) de la guía del medio.",
+      "Aun así, tenemos que comentarte que una inactividad tan prolongada no encaja con el compromiso que aceptaste al unirte al medio, recogido en el apartado 3.6 (Compromiso) de la guía del medio.",
       "Si no puedes o ya no te apetece seguir colaborando, no pasa nada: dínoslo y lo dejamos hablado sin ningún problema. Si prefieres seguir, nos encantaría verte publicar de nuevo. Si en los próximos " + INACTIVIDAD_DIAS_HASTA_AVISAR_ADMINS + " días no sabemos nada de ti, la administración tendrá que valorar tu continuidad en el medio.",
       `Puedes entrar al panel cuando quieras: ${enlacePanel}`,
     ];
@@ -6475,13 +6475,13 @@ async function avisarAdminsDeExpulsion(env, usuarios, ahora) {
     ? `Se debe expulsar a ${usuarios[0].nombre} por inactividad`
     : `Se debe expulsar a ${usuarios.length} redactores por inactividad`;
   const texto = [
-    "Los siguientes redactores han incumplido las normativas del medio (apartado 2.1.5, Compromiso, de la guía del medio): han recibido los 5 avisos de inactividad y siguen sin subir ninguna noticia.",
+    "Los siguientes redactores han incumplido las normativas del medio (apartado 3.6, Compromiso, de la guía del medio): han recibido los 5 avisos de inactividad y siguen sin subir ninguna noticia.",
     "",
     ...lineas,
     "",
     "Se tiene que expulsar a estos usuarios. La expulsión no es automática: hay que hacerla desde el panel de Usuarios.",
   ].join("\n");
-  const html = `<p>Los siguientes redactores han incumplido las normativas del medio (apartado 2.1.5, Compromiso, de la guía del medio): han recibido los ${INACTIVIDAD_AVISOS_HASTA_INCUMPLIMIENTO} avisos de inactividad y siguen sin subir ninguna noticia.</p><ul>` +
+  const html = `<p>Los siguientes redactores han incumplido las normativas del medio (apartado 3.6, Compromiso, de la guía del medio): han recibido los ${INACTIVIDAD_AVISOS_HASTA_INCUMPLIMIENTO} avisos de inactividad y siguen sin subir ninguna noticia.</p><ul>` +
     usuarios.map((u) => `<li><strong>${escapeHtmlEmail(u.nombre)}</strong> (${escapeHtmlEmail(u.email)}): ${u.diasSinSubir} días sin subir nada.</li>`).join("") +
     `</ul><p><strong>Se tiene que expulsar a estos usuarios.</strong> La expulsión no es automática: hay que hacerla desde el panel de Usuarios.</p>`;
 
