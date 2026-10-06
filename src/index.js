@@ -10794,7 +10794,7 @@ async function handlePrimary(request, env, ctx) {
             subida.publicId, subida.resourceType, subida.url,
             titulo, descripcion || null, esFoto ? "foto" : "video",
             file.name, file.type, file.size, payload.uid, payload.nombre, club || null, hashArchivo,
-            esFoto ? null : portadaSegundo, esFoto ? null : portadaFoco, visibilidad
+            esFoto ? null : portadaSegundo, portadaFoco, visibilidad
           ).run();
         } catch (err) {
           // visibilidad es una columna añadida por una migración manual
@@ -10815,7 +10815,7 @@ async function handlePrimary(request, env, ctx) {
                 subida.publicId, subida.resourceType, subida.url,
                 titulo, descripcion || null, esFoto ? "foto" : "video",
                 file.name, file.type, file.size, payload.uid, payload.nombre, club || null, hashArchivo,
-                esFoto ? null : portadaSegundo, esFoto ? null : portadaFoco
+                esFoto ? null : portadaSegundo, portadaFoco
               ).run();
             } catch (err2) {
               ctx.waitUntil(borrarDeCloudinary(env, subida.publicId, subida.resourceType, subida.cloudName));
