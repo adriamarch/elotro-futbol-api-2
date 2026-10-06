@@ -113,7 +113,7 @@ try {
   else ok("16 tablas esperadas");
 
   const requiredColumns = {
-    users: ["id", "username", "password_hash", "salt", "nombre", "rol", "activo", "email", "bio", "experiencia", "avatar_url", "redes_sociales", "equipo", "notif_visto_at", "reset_token", "reset_token_expira", "created_at", "nivel", "nivel_nota", "ultima_hora_hash", "ultima_hora_salt"],
+    users: ["id", "username", "password_hash", "salt", "nombre", "rol", "activo", "email", "bio", "experiencia", "avatar_url", "avatar_foco", "redes_sociales", "equipo", "notif_visto_at", "reset_token", "reset_token_expira", "created_at", "nivel", "nivel_nota", "ultima_hora_hash", "ultima_hora_salt"],
     articles: ["id", "slug", "titulo", "subtitulo", "contenido", "tipo", "categoria", "resultado_id", "autor_id", "autor_nombre", "coautor_id", "coautor_nombre", "destacado", "publicado", "estado_borrador", "programado_para", "slug_congelado", "fecha_publicacion", "created_at", "updated_at"],
     results: ["id", "competicion", "grupo", "jornada", "equipo_local", "equipo_visitante", "goles_local", "goles_visitante", "fecha_partido", "estado", "ubicacion", "flashscore_url", "autor_id", "autor_nombre", "inicio_cronometro_at", "cronometro_pausado_en", "ajuste_cronometro_minutos", "penaltis_local", "penaltis_visitante", "mvp_jugador", "mvp_equipo"],
     comments: ["id", "article_id", "nombre", "email", "texto", "estado", "ip", "created_at", "moderado_por_id", "moderado_at"],

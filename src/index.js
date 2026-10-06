@@ -441,7 +441,111 @@ function focoDePortada(article) {
   // tabla.
   if (!portada) portada = imagenes.find((img) => img && img.tipo !== "tweet");
 
-  return (portada && portada.foco) || "50% 50%";
+  return normalizarFoco(portada && portada.foco);
+}
+
+// ---------- FOCO DE IMAGEN: validador ÚNICO del backend ----------
+// Espejo de public/js/foco.js (EOF_FOCO.normalizar / texto). TODO foco que
+// entra o sale por la API pasa por aquí, para que lo guardado en la BD sea
+// siempre "X% Y%" con X e Y entre 0 y 100 (un decimal como máximo). Antes
+// había 4 regex distintas repartidas por el archivo que aceptaban cosas
+// como "999% 999%" sin límite.
+// Acepta "62% 30%", "62 30", "62.5% 30%", "center top", {x, y} y [x, y].
+// Cualquier otra cosa (vacío, texto raro, intento de inyección) cae al
+// centro o, en normalizarFocoOpcional, a null ("sin foco elegido").
+const FOCO_CENTRO = "50% 50%";
+const FOCO_PALABRAS_X = { left: 0, center: 50, right: 100 };
+const FOCO_PALABRAS_Y = { top: 0, center: 50, bottom: 100 };
+
+function focoANumero(token, palabras) {
+  if (token === null || token === undefined) return null;
+  const t = String(token).trim().toLowerCase();
+  if (!t) return null;
+  if (Object.prototype.hasOwnProperty.call(palabras, t)) return palabras[t];
+  const m = t.match(/^(-?\d{1,3}(?:\.\d+)?)%?$/);
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  return Number.isFinite(n) ? Math.min(100, Math.max(0, n)) : null;
+}
+
+function focoComoPar(valor) {
+  if (valor === null || valor === undefined || valor === "") return null;
+  let x = null;
+  let y = null;
+  if (typeof valor === "object") {
+    if (Array.isArray(valor)) {
+      x = focoANumero(valor[0], FOCO_PALABRAS_X);
+      y = focoANumero(valor[1], FOCO_PALABRAS_Y);
+    } else {
+      x = focoANumero(valor.x, FOCO_PALABRAS_X);
+      y = focoANumero(valor.y, FOCO_PALABRAS_Y);
+    }
+  } else if (typeof valor === "string" || typeof valor === "number") {
+    const texto = String(valor).trim();
+    if (texto.length > 40) return null;
+    const partes = texto.split(/\s+/);
+    if (partes.length === 1) {
+      const unico = partes[0].toLowerCase();
+      if (unico === "top" || unico === "bottom") {
+        x = 50;
+        y = FOCO_PALABRAS_Y[unico];
+      } else {
+        x = focoANumero(unico, FOCO_PALABRAS_X);
+        y = 50;
+      }
+    } else if (partes.length === 2) {
+      const a = partes[0].toLowerCase();
+      const b = partes[1].toLowerCase();
+      if ((a === "top" || a === "bottom") && (b === "left" || b === "right" || b === "center")) {
+        x = focoANumero(b, FOCO_PALABRAS_X);
+        y = focoANumero(a, FOCO_PALABRAS_Y);
+      } else {
+        x = focoANumero(a, FOCO_PALABRAS_X);
+        y = focoANumero(b, FOCO_PALABRAS_Y);
+      }
+    }
+  }
+  if (x === null || y === null) return null;
+  return [Math.round(x * 10) / 10, Math.round(y * 10) / 10];
+}
+
+// Siempre devuelve un foco válido en formato "X% Y%" (centro si no lo es).
+function normalizarFoco(valor) {
+  const par = focoComoPar(valor);
+  return par ? `${par[0]}% ${par[1]}%` : FOCO_CENTRO;
+}
+
+// Igual, pero devuelve null cuando no hay un foco válido: para columnas
+// donde NULL significa "sin foco elegido" (media.portada_foco).
+function normalizarFocoOpcional(valor) {
+  const par = focoComoPar(valor);
+  return par ? `${par[0]}% ${par[1]}%` : null;
+}
+
+// true si el error es por una columna que aún no existe en esta BD (migración
+// manual sin ejecutar). Cubre SQLite/D1 ("no such column", "has no column
+// named") y PostgreSQL (código 42703 / "column ... does not exist").
+function esErrorColumnaFaltante(err, columna) {
+  const msg = (err && err.message) || "";
+  const esColumna = (err && err.code === "42703") || /no such column|no column named|column .* does not exist/i.test(msg);
+  return esColumna && (!columna || msg.toLowerCase().includes(String(columna).toLowerCase()));
+}
+
+// Prueba las consultas de "variantes" en orden (de la más completa a la más
+// básica) y devuelve el resultado de la primera que no falle por una columna
+// sin migrar. Cualquier otro error se relanza tal cual.
+async function consultaConAlternativas(env, variantes, binds) {
+  let ultimoError = null;
+  for (const sql of variantes) {
+    try {
+      const st = env.DB.prepare(sql);
+      return await (binds && binds.length ? st.bind(...binds) : st).all();
+    } catch (err) {
+      if (!esErrorColumnaFaltante(err)) throw err;
+      ultimoError = err;
+    }
+  }
+  throw ultimoError;
 }
 
 // ---------- Notificaciones por correo ----------
@@ -2567,8 +2671,7 @@ function validarNoticiaRapida(body) {
   }
   // Punto de foco de la foto ("X% Y%"): qué parte no se debe recortar
   // nunca en las tarjetas. Si falta o no es válido, se centra.
-  const focoRaw = body && typeof body.imagen_foco === "string" ? body.imagen_foco.trim() : "";
-  const imagenFoco = /^\d{1,3}%\s\d{1,3}%$/.test(focoRaw) ? focoRaw.replace(/\s+/, " ") : "50% 50%";
+  const imagenFoco = normalizarFoco(body && body.imagen_foco);
   return { titulo, subtitulo, imagenUrl, imagenFoco };
 }
 
@@ -3404,7 +3507,7 @@ function normalizarImagenes(raw) {
         const url = item.url.trim();
         if (!url) return null;
         const posicion = POSICIONES_IMAGEN_VALIDAS.includes(item.posicion) ? item.posicion : "galeria";
-        const foco = typeof item.foco === "string" && /^\d{1,3}% \d{1,3}%$/.test(item.foco.trim()) ? item.foco.trim() : "50% 50%";
+        const foco = normalizarFoco(item.foco);
         const resultado = { url, posicion, foco };
         if (posicion === "personalizada" || posicion === "collage") {
           const n = parseInt(item.trasParrafo, 10);
@@ -9722,9 +9825,11 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/me/perfil" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        const user = await env.DB.prepare(
-          "SELECT id, username, nombre, rol, email, bio, experiencia, avatar_url, equipo, redes_sociales FROM users WHERE id = ?"
-        ).bind(payload.uid).first();
+        const { results: filasPerfil } = await consultaConAlternativas(env, [
+          "SELECT id, username, nombre, rol, email, bio, experiencia, avatar_url, avatar_foco, equipo, redes_sociales FROM users WHERE id = ?",
+          "SELECT id, username, nombre, rol, email, bio, experiencia, avatar_url, equipo, redes_sociales FROM users WHERE id = ?",
+        ], [payload.uid]);
+        const user = filasPerfil[0] || null;
         if (!user) return json({ error: "Usuario no encontrado" }, 404);
         let redes = {};
         if (user.redes_sociales) {
@@ -9735,7 +9840,7 @@ async function handlePrimary(request, env, ctx) {
         // muestre igual en todos los casos. Es de solo lectura aqui: la
         // propia persona lo ve pero no puede cambiarlo (ver PUT abajo).
         const equipos = parsearEquipos(user.equipo);
-        return json({ user: { ...user, equipo: equipos, redes_sociales: undefined, redes } });
+        return json({ user: { ...user, avatar_foco: normalizarFoco(user.avatar_foco), equipo: equipos, redes_sociales: undefined, redes } });
       }
 
       // ---------- EDITAR MI PERFIL (nombre / correo / bio / avatar / redes) ----------
@@ -9767,6 +9872,9 @@ async function handlePrimary(request, env, ctx) {
           avatarUrl = urlHttpsSegura(body.avatar_url);
           if (!avatarUrl) return json({ error: "La foto de perfil debe ser una URL https válida" }, 400);
         }
+        // Encuadre de la foto (qué parte no se recorta en el avatar redondo).
+        // Sin foto no hay encuadre: se deja centrado.
+        const avatarFoco = avatarUrl ? normalizarFoco(body.avatar_foco) : FOCO_CENTRO;
         // El equipo NO se puede editar desde el propio perfil: es de solo
         // lectura para la persona (se muestra bloqueado en "Mis datos") y
         // solo un admin puede cambiarlo, desde "Usuarios" (PUT /api/users/:id).
@@ -9801,10 +9909,21 @@ async function handlePrimary(request, env, ctx) {
         if ((user.bio || null) !== bio) cambios.push("biografía");
         if ((user.experiencia || null) !== experiencia) cambios.push("experiencia");
         if ((user.avatar_url || null) !== avatarUrl) cambios.push("foto de perfil");
+        else if (avatarUrl && normalizarFoco(user.avatar_foco) !== avatarFoco) cambios.push("encuadre de la foto de perfil");
         if (JSON.stringify(redesAnteriores) !== JSON.stringify(redesLimpias)) cambios.push("redes sociales");
 
-        await env.DB.prepare("UPDATE users SET nombre = ?, email = ?, bio = ?, experiencia = ?, avatar_url = ?, redes_sociales = ? WHERE id = ?")
-          .bind(nombre, email, bio, experiencia, avatarUrl, Object.keys(redesLimpias).length ? JSON.stringify(redesLimpias) : null, user.id).run();
+        const redesJson = Object.keys(redesLimpias).length ? JSON.stringify(redesLimpias) : null;
+        try {
+          await env.DB.prepare("UPDATE users SET nombre = ?, email = ?, bio = ?, experiencia = ?, avatar_url = ?, avatar_foco = ?, redes_sociales = ? WHERE id = ?")
+            .bind(nombre, email, bio, experiencia, avatarUrl, avatarFoco, redesJson, user.id).run();
+        } catch (err) {
+          // Columna avatar_foco aún sin migrar: se guarda el resto del perfil
+          // igualmente (el encuadre quedará centrado hasta ejecutar la migración).
+          if (!esErrorColumnaFaltante(err, "avatar_foco")) throw err;
+          console.error("No se pudo guardar avatar_foco (falta migracion_users_avatar_foco.sql):", err.message);
+          await env.DB.prepare("UPDATE users SET nombre = ?, email = ?, bio = ?, experiencia = ?, avatar_url = ?, redes_sociales = ? WHERE id = ?")
+            .bind(nombre, email, bio, experiencia, avatarUrl, redesJson, user.id).run();
+        }
 
         // Mantenemos el mismo "sid": es la misma sesión de antes, solo
         // cambia el nombre incrustado en el JWT, así que no tiene sentido
@@ -9821,7 +9940,7 @@ async function handlePrimary(request, env, ctx) {
         return json({
           ok: true,
           token,
-          user: { id: user.id, username: user.username, nombre, rol: user.rol, email, bio, experiencia, avatar_url: avatarUrl, equipo: parsearEquipos(user.equipo), redes: redesLimpias },
+          user: { id: user.id, username: user.username, nombre, rol: user.rol, email, bio, experiencia, avatar_url: avatarUrl, avatar_foco: avatarFoco, equipo: parsearEquipos(user.equipo), redes: redesLimpias },
         });
       }
 
@@ -9970,9 +10089,11 @@ async function handlePrimary(request, env, ctx) {
       const autorPublicoMatch = path.match(/^\/api\/autores\/(\d+)$/);
       if (autorPublicoMatch && method === "GET") {
         const id = parseInt(autorPublicoMatch[1], 10);
-        const autor = await env.DB.prepare(
-          "SELECT id, nombre, bio, experiencia, avatar_url, equipo, redes_sociales FROM users WHERE id = ? AND activo = 1"
-        ).bind(id).first();
+        const { results: filasAutor } = await consultaConAlternativas(env, [
+          "SELECT id, nombre, bio, experiencia, avatar_url, avatar_foco, equipo, redes_sociales FROM users WHERE id = ? AND activo = 1",
+          "SELECT id, nombre, bio, experiencia, avatar_url, equipo, redes_sociales FROM users WHERE id = ? AND activo = 1",
+        ], [id]);
+        const autor = filasAutor[0] || null;
         if (!autor) return json({ error: "Autor no encontrado" }, 404);
 
         let redes = {};
@@ -9987,7 +10108,7 @@ async function handlePrimary(request, env, ctx) {
         const articulosAutor = await remapearSlugsFusion(env, articulos);
 
         return json({
-          autor: { id: autor.id, nombre: autor.nombre, bio: autor.bio || "", experiencia: autor.experiencia || "", avatar_url: autor.avatar_url || "", equipo: parsearEquipos(autor.equipo), redes },
+          autor: { id: autor.id, nombre: autor.nombre, bio: autor.bio || "", experiencia: autor.experiencia || "", avatar_url: autor.avatar_url || "", avatar_foco: normalizarFoco(autor.avatar_foco), equipo: parsearEquipos(autor.equipo), redes },
           articulos: articulosAutor.map((a) => ({ ...a, imagen_foco: focoDePortada(a), imagenes: undefined })),
         });
       }
@@ -10557,8 +10678,7 @@ async function handlePrimary(request, env, ctx) {
         // parte de la imagen no se debe recortar nunca), mismo formato
         // "50% 50%" que ya usan las fotos de contenido. Opcional: si no
         // se manda, se sigue centrando como hasta ahora.
-        const portadaFocoRaw = (form.get("portadaFoco") || "").toString().trim();
-        const portadaFoco = /^\d{1,3}%\s\d{1,3}%$/.test(portadaFocoRaw) ? portadaFocoRaw : null;
+        const portadaFoco = normalizarFocoOpcional((form.get("portadaFoco") || "").toString());
         // Visibilidad elegida por quien sube el contenido: "publico" (por
         // defecto, aparece en las galerías del sitio) o "privado" (queda
         // solo en la mediateca del panel, nunca se expone en ningún
@@ -10999,10 +11119,7 @@ async function handlePrimary(request, env, ctx) {
         // ambos casos: el campo llega como "portadaFoco" o "imagenFoco"
         // según el tipo, pero es el mismo dato.
         const focoRaw = registro.tipo === "video" ? body.portadaFoco : body.imagenFoco;
-        let portadaFoco = null;
-        if (typeof focoRaw === "string" && /^\d{1,3}%\s\d{1,3}%$/.test(focoRaw.trim())) {
-          portadaFoco = focoRaw.trim();
-        }
+        const portadaFoco = normalizarFocoOpcional(focoRaw);
         // Si se vincula a un partido, el club de texto libre se anula (el
         // equipo ya se deduce del partido), igual que al subir.
         const clubGuardado = resultId ? null : (club || null);
@@ -11357,31 +11474,22 @@ async function handlePrimary(request, env, ctx) {
         // "publico". Lo marcado como "privado" existe igualmente en
         // match_gallery (para que el equipo de redacción lo siga viendo
         // y gestionando desde el panel), pero nunca sale por aquí.
-        let filas;
-        try {
-          ({ results: filas } = await env.DB.prepare(
-            `SELECT mg.equipo, m.id AS media_id, m.cloudinary_url, m.titulo, m.descripcion,
-                    m.tipo, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre
+        // Se prueba de la consulta más completa (visibilidad + foco) a la más
+        // básica: "visibilidad" y "portada_foco" son columnas añadidas por
+        // migraciones manuales y puede que aún no existan en esta BD (sin
+        // "visibilidad" todo se trata como público, como antes de la función).
+        const consultaGaleria = (conVisibilidad, conFoco) => `SELECT mg.equipo, m.id AS media_id, m.cloudinary_url, m.titulo, m.descripcion,
+                    m.tipo, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre${conFoco ? ", m.portada_foco" : ""}
              FROM match_gallery mg
              JOIN media m ON m.id = mg.media_id
              LEFT JOIN users u ON u.id = m.autor_id
-             WHERE mg.result_id = ? AND m.visibilidad = 'publico'
-             ORDER BY mg.orden ASC, mg.created_at ASC`
-          ).bind(resultado.id).all());
-        } catch (err) {
-          // Columna "visibilidad" aún no migrada en esta base de datos:
-          // se reintenta sin el filtro (todo se trata como público, que
-          // es el comportamiento que había antes de esta función).
-          ({ results: filas } = await env.DB.prepare(
-            `SELECT mg.equipo, m.id AS media_id, m.cloudinary_url, m.titulo, m.descripcion,
-                    m.tipo, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre
-             FROM match_gallery mg
-             JOIN media m ON m.id = mg.media_id
-             LEFT JOIN users u ON u.id = m.autor_id
-             WHERE mg.result_id = ?
-             ORDER BY mg.orden ASC, mg.created_at ASC`
-          ).bind(resultado.id).all());
-        }
+             WHERE mg.result_id = ?${conVisibilidad ? " AND m.visibilidad = 'publico'" : ""}
+             ORDER BY mg.orden ASC, mg.created_at ASC`;
+        const { results: filasBrutas } = await consultaConAlternativas(env, [
+          consultaGaleria(true, true), consultaGaleria(true, false),
+          consultaGaleria(false, true), consultaGaleria(false, false),
+        ], [resultado.id]);
+        const filas = filasBrutas.map((f) => ({ ...f, portada_foco: normalizarFocoOpcional(f.portada_foco) }));
         // Agrupado en servidor: "local"/"visitante" con su nombre de
         // equipo ya resuelto, y "general" para fotos sin equipo asignado
         // (p.ej. del estadio o del ambiente, no de un equipo en concreto).
@@ -11422,30 +11530,19 @@ async function handlePrimary(request, env, ctx) {
         const condicionTipo = tipoFiltro === "foto" || tipoFiltro === "video" ? "AND m.tipo = ?" : "";
         const bindsBase = tipoFiltro === "foto" || tipoFiltro === "video" ? [tipoFiltro] : [];
 
-        let filas;
-        try {
-          ({ results: filas } = await env.DB.prepare(
-            `SELECT m.id, m.cloudinary_url, m.titulo, m.descripcion, m.tipo, m.club, m.created_at,
-                    COALESCE(u.nombre, m.autor_nombre) AS autor_nombre
+        // Misma estrategia que la galería de partido: de la consulta más
+        // completa (visibilidad + foco) a la más básica.
+        const consultaMediaPublica = (conVisibilidad, conFoco) => `SELECT m.id, m.cloudinary_url, m.titulo, m.descripcion, m.tipo, m.club, m.created_at,
+                    COALESCE(u.nombre, m.autor_nombre) AS autor_nombre${conFoco ? ", m.portada_foco" : ""}
              FROM media m
              LEFT JOIN users u ON u.id = m.autor_id
-             WHERE m.visibilidad = 'publico' ${condicionTipo}
-             ORDER BY m.created_at DESC LIMIT ? OFFSET ?`
-          ).bind(...bindsBase, TAM_PAGINA + 1, offset).all());
-        } catch (err) {
-          // Columna "visibilidad" aún no migrada en esta base de datos:
-          // se reintenta sin el filtro, igual criterio que en el resto
-          // de sitios que ya tocan esta columna (todo se trata como
-          // público, que es el comportamiento previo a la migración).
-          ({ results: filas } = await env.DB.prepare(
-            `SELECT m.id, m.cloudinary_url, m.titulo, m.descripcion, m.tipo, m.club, m.created_at,
-                    COALESCE(u.nombre, m.autor_nombre) AS autor_nombre
-             FROM media m
-             LEFT JOIN users u ON u.id = m.autor_id
-             WHERE 1=1 ${condicionTipo}
-             ORDER BY m.created_at DESC LIMIT ? OFFSET ?`
-          ).bind(...bindsBase, TAM_PAGINA + 1, offset).all());
-        }
+             WHERE ${conVisibilidad ? "m.visibilidad = 'publico'" : "1=1"} ${condicionTipo}
+             ORDER BY m.created_at DESC LIMIT ? OFFSET ?`;
+        const { results: filasBrutas } = await consultaConAlternativas(env, [
+          consultaMediaPublica(true, true), consultaMediaPublica(true, false),
+          consultaMediaPublica(false, true), consultaMediaPublica(false, false),
+        ], [...bindsBase, TAM_PAGINA + 1, offset]);
+        const filas = filasBrutas.map((f) => ({ ...f, portada_foco: normalizarFocoOpcional(f.portada_foco) }));
 
         const hayMas = filas.length > TAM_PAGINA;
         if (hayMas) filas.length = TAM_PAGINA;
@@ -14056,15 +14153,20 @@ async function handlePrimary(request, env, ctx) {
       // Público: últimas noticias rápidas, de más nueva a más antigua.
       if (path === "/api/noticias-rapidas" && method === "GET") {
         const limite = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "20", 10) || 20, 1), 50);
-        const { results } = await env.DB.prepare(
-          `SELECT nr.id, nr.titulo, nr.subtitulo, nr.imagen_url, nr.imagen_foco, nr.created_at,
-                  u.nombre AS autor_nombre, u.avatar_url AS autor_avatar_url
+        const consultaNr = (conFoco) => `SELECT nr.id, nr.titulo, nr.subtitulo, nr.imagen_url, nr.imagen_foco, nr.created_at,
+                  u.nombre AS autor_nombre, u.avatar_url AS autor_avatar_url${conFoco ? ", u.avatar_foco AS autor_avatar_foco" : ""}
            FROM noticias_rapidas nr
            LEFT JOIN users u ON u.id = nr.autor_id
            ORDER BY nr.created_at DESC, nr.id DESC
-           LIMIT ?`
-        ).bind(limite).all();
-        return json({ noticias_rapidas: results });
+           LIMIT ?`;
+        const { results } = await consultaConAlternativas(env, [consultaNr(true), consultaNr(false)], [limite]);
+        return json({
+          noticias_rapidas: results.map((n) => ({
+            ...n,
+            imagen_foco: normalizarFoco(n.imagen_foco),
+            autor_avatar_foco: normalizarFocoOpcional(n.autor_avatar_foco),
+          })),
+        });
       }
 
       // Panel: listado completo (cualquier redactor/admin ve todas, pero
@@ -14075,13 +14177,12 @@ async function handlePrimary(request, env, ctx) {
         if (!puedeGestionarContenidoEditorial(payload)) {
           return json({ error: "Un fotógrafo no puede gestionar noticias rápidas" }, 403);
         }
-        const { results } = await env.DB.prepare(
-          `SELECT nr.*, u.nombre AS autor_nombre, u.avatar_url AS autor_avatar_url
+        const consultaNrPanel = (conFoco) => `SELECT nr.*, u.nombre AS autor_nombre, u.avatar_url AS autor_avatar_url${conFoco ? ", u.avatar_foco AS autor_avatar_foco" : ""}
            FROM noticias_rapidas nr
            LEFT JOIN users u ON u.id = nr.autor_id
            ORDER BY nr.created_at DESC, nr.id DESC
-           LIMIT 200`
-        ).all();
+           LIMIT 200`;
+        const { results } = await consultaConAlternativas(env, [consultaNrPanel(true), consultaNrPanel(false)], []);
         return json({ noticias_rapidas: results });
       }
 

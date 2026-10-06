@@ -26,6 +26,8 @@ CREATE TABLE users (
   bio TEXT,
   experiencia TEXT,
   avatar_url TEXT,
+  -- Encuadre "X% Y%" de la foto de perfil (ver migracion_users_avatar_foco.sql).
+  avatar_foco TEXT,
   redes_sociales TEXT,
   -- Equipo(s) de futbol que sigue o cubre habitualmente el redactor o
   -- admin: hasta 3 clubes de public/js/clubs.js, guardados como un

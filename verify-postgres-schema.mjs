@@ -2,7 +2,7 @@
 import pg from "pg";
 const { Client } = pg;
 const expected = {
- users:["id","username","password_hash","salt","nombre","rol","activo","email","bio","experiencia","avatar_url","redes_sociales","equipo","notif_visto_at","reset_token","reset_token_expira","created_at","nivel","nivel_nota"],
+ users:["id","username","password_hash","salt","nombre","rol","activo","email","bio","experiencia","avatar_url","avatar_foco","redes_sociales","equipo","notif_visto_at","reset_token","reset_token_expira","created_at","nivel","nivel_nota"],
  articles:["id","slug","titulo","subtitulo","contenido","tipo","categoria","club","imagen_url","imagenes","resultado_id","autor_id","autor_nombre","coautor_id","coautor_nombre","destacado","publicado","estado_borrador","programado_para","slug_congelado","fecha_publicacion","created_at","updated_at","titulo_eu","subtitulo_eu","contenido_eu","titulo_ca","subtitulo_ca","contenido_ca","titulo_gl","subtitulo_gl","contenido_gl","titulo_en","subtitulo_en","contenido_en","imagen_post_url"],
  results:["id","competicion","grupo","jornada","equipo_local","equipo_visitante","goles_local","goles_visitante","fecha_partido","estado","ubicacion","flashscore_url","escudo_local_url","escudo_visitante_url","autor_id","autor_nombre","created_at","inicio_cronometro_at","cronometro_pausado_en","ajuste_cronometro_minutos","fecha_partido_retrasado","penaltis_local","penaltis_visitante","aviso_desatendido_mitad","mvp_jugador","mvp_equipo","aviso_desatendido_enviado"],
  match_events:["id","resultado_id","tipo","equipo","jugador","jugador_sale","jugador_asistencia","minuto","minuto_extra","orden","bajar_gol","var_motivo","var_decision","created_at"],
