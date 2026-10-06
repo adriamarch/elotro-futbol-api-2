@@ -6496,6 +6496,50 @@ async function avisarAdminsDeExpulsion(env, usuarios, ahora) {
   await env.DB.batch(marcas);
 }
 
+// Estado de los avisos de inactividad de cada redactor, para que los admins
+// lo vean en Usuarios (GET /api/users). Aplica la MISMA lógica de ciclo que
+// enviarRecordatoriosInactividadSiToca: si el redactor ha subido algo después
+// de la referencia guardada, el ciclo se reinicia y no tiene avisos vigentes.
+// Solo lectura. Si la tabla aún no existe (migración sin aplicar) devuelve un
+// mapa vacío y el listado de usuarios sigue funcionando.
+async function cargarEstadoInactividadUsuarios(env, usuarios) {
+  const mapa = new Map();
+  try {
+    const [estados, ultimas] = await Promise.all([
+      env.DB.prepare(
+        "SELECT user_id, ref_actividad, avisos_enviados, ultimo_aviso_at, admins_avisados_at FROM recordatorios_inactividad"
+      ).all(),
+      env.DB.prepare(
+        "SELECT autor_id, MAX(fecha_publicacion) AS ultima_noticia FROM articles WHERE autor_id IS NOT NULL GROUP BY autor_id"
+      ).all(),
+    ]);
+    const estadoPorUsuario = new Map((estados.results || []).map((f) => [Number(f.user_id), f]));
+    const ultimaPorUsuario = new Map((ultimas.results || []).map((f) => [Number(f.autor_id), f.ultima_noticia]));
+    const ahoraMs = Date.now();
+
+    for (const u of usuarios) {
+      if (u.rol !== "redactor") continue; // admins y fotógrafos no entran en el ciclo
+      const ultimaNoticia = ultimaPorUsuario.get(Number(u.id)) || null;
+      const refMs = Math.max(msDesdeFechaBD(u.created_at) ?? 0, msDesdeFechaBD(ultimaNoticia) ?? 0);
+      const f = estadoPorUsuario.get(Number(u.id));
+      const refGuardadaMs = f ? msDesdeFechaBD(f.ref_actividad) : null;
+      const hayCicloVigente = !!f && refGuardadaMs !== null && refMs > 0 && refMs <= refGuardadaMs;
+      mapa.set(Number(u.id), {
+        dias_sin_subir: refMs ? Math.max(0, Math.floor((ahoraMs - refMs) / INACTIVIDAD_DIA_MS)) : null,
+        ultima_noticia: ultimaNoticia,
+        avisos_enviados: hayCicloVigente ? (Number(f.avisos_enviados) || 0) : 0,
+        avisos_maximo: INACTIVIDAD_AVISOS_HASTA_INCUMPLIMIENTO,
+        dias_hasta_primer_aviso: INACTIVIDAD_DIAS_HASTA_PRIMER_AVISO,
+        ultimo_aviso_at: hayCicloVigente ? (f.ultimo_aviso_at || null) : null,
+        admins_avisados_at: hayCicloVigente ? (f.admins_avisados_at || null) : null,
+      });
+    }
+  } catch (err) {
+    console.log("No se pudo cargar el estado de inactividad de los usuarios:", err.message);
+  }
+  return mapa;
+}
+
 
 /*
  * ================================================================
@@ -10342,11 +10386,15 @@ async function handlePrimary(request, env, ctx) {
         // vuelve a tocar la base de datos, así que resolver todo en
         // paralelo aquí ya no dispara ninguna consulta extra.
         const conteos = await contarPublicacionesPorTipoDeVarios(env, results.map((u) => u.id));
+        // Avisos de inactividad enviados a cada redactor (ver
+        // cargarEstadoInactividadUsuarios): se muestran en la tabla de Usuarios.
+        const inactividad = await cargarEstadoInactividadUsuarios(env, results);
         const users = await Promise.all(results.map(async (u) => ({
           ...u,
           equipo: parsearEquipos(u.equipo),
           categorias_fijas: parsearCategoriasFijas(u.categorias_fijas),
           progreso_nivel: await construirProgresoNivel(env, u, conteos.get(u.id)),
+          inactividad: inactividad.get(Number(u.id)) || null,
         })));
         return json({ users });
       }
