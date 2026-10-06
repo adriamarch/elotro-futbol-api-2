@@ -2565,7 +2565,11 @@ function validarNoticiaRapida(body) {
   if (imagenUrl.length > 1000 || !/^https?:\/\//i.test(imagenUrl)) {
     return { error: "La foto no es válida: súbela de nuevo" };
   }
-  return { titulo, subtitulo, imagenUrl };
+  // Punto de foco de la foto ("X% Y%"): qué parte no se debe recortar
+  // nunca en las tarjetas. Si falta o no es válido, se centra.
+  const focoRaw = body && typeof body.imagen_foco === "string" ? body.imagen_foco.trim() : "";
+  const imagenFoco = /^\d{1,3}%\s\d{1,3}%$/.test(focoRaw) ? focoRaw.replace(/\s+/, " ") : "50% 50%";
+  return { titulo, subtitulo, imagenUrl, imagenFoco };
 }
 
 // Galería/imágenes: tabla "media" y (fases siguientes) galería de
@@ -14053,7 +14057,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/noticias-rapidas" && method === "GET") {
         const limite = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "20", 10) || 20, 1), 50);
         const { results } = await env.DB.prepare(
-          `SELECT nr.id, nr.titulo, nr.subtitulo, nr.imagen_url, nr.created_at,
+          `SELECT nr.id, nr.titulo, nr.subtitulo, nr.imagen_url, nr.imagen_foco, nr.created_at,
                   u.nombre AS autor_nombre, u.avatar_url AS autor_avatar_url
            FROM noticias_rapidas nr
            LEFT JOIN users u ON u.id = nr.autor_id
@@ -14091,8 +14095,8 @@ async function handlePrimary(request, env, ctx) {
         if (v.error) return json({ error: v.error }, 400);
 
         const { meta } = await env.DB.prepare(
-          "INSERT INTO noticias_rapidas (titulo, subtitulo, imagen_url, autor_id) VALUES (?, ?, ?, ?)"
-        ).bind(v.titulo, v.subtitulo, v.imagenUrl, payload.uid).run();
+          "INSERT INTO noticias_rapidas (titulo, subtitulo, imagen_url, imagen_foco, autor_id) VALUES (?, ?, ?, ?, ?)"
+        ).bind(v.titulo, v.subtitulo, v.imagenUrl, v.imagenFoco, payload.uid).run();
         const nuevoId = meta.last_row_id;
 
         ctx.waitUntil(registrarActividad(env, request, payload, {
@@ -14120,8 +14124,8 @@ async function handlePrimary(request, env, ctx) {
         if (v.error) return json({ error: v.error }, 400);
 
         await env.DB.prepare(
-          "UPDATE noticias_rapidas SET titulo = ?, subtitulo = ?, imagen_url = ?, updated_at = datetime('now') WHERE id = ?"
-        ).bind(v.titulo, v.subtitulo, v.imagenUrl, id).run();
+          "UPDATE noticias_rapidas SET titulo = ?, subtitulo = ?, imagen_url = ?, imagen_foco = ?, updated_at = datetime('now') WHERE id = ?"
+        ).bind(v.titulo, v.subtitulo, v.imagenUrl, v.imagenFoco, id).run();
 
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "editar_noticia_rapida", entidad: "noticia_rapida", entidad_id: id,

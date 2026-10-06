@@ -781,6 +781,7 @@ CREATE TABLE noticias_rapidas (
   titulo TEXT NOT NULL,
   subtitulo TEXT NOT NULL,
   imagen_url TEXT NOT NULL,
+  imagen_foco TEXT DEFAULT '50% 50%',
   autor_id INTEGER REFERENCES users(id),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
