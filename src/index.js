@@ -6527,6 +6527,7 @@ async function cargarEstadoInactividadUsuarios(env, usuarios) {
       mapa.set(Number(u.id), {
         dias_sin_subir: refMs ? Math.max(0, Math.floor((ahoraMs - refMs) / INACTIVIDAD_DIA_MS)) : null,
         ultima_noticia: ultimaNoticia,
+        referencia_at: refMs ? new Date(refMs).toISOString() : null, // última noticia o, si no hay, alta de la cuenta
         avisos_enviados: hayCicloVigente ? (Number(f.avisos_enviados) || 0) : 0,
         avisos_maximo: INACTIVIDAD_AVISOS_HASTA_INCUMPLIMIENTO,
         dias_hasta_primer_aviso: INACTIVIDAD_DIAS_HASTA_PRIMER_AVISO,
