@@ -4444,7 +4444,7 @@ async function estaFueraDeCalendario(env, { tipo, resultado_id, fecha }) {
 async function marcarFueraDeCalendario(env, articuloId, datos) {
   let fuera = false;
   try { fuera = await estaFueraDeCalendario(env, datos); } catch (err) { console.error("horario_publicacion:", err); }
-  await env.DB.prepare("UPDATE articles SET fuera_calendario = ? WHERE id = ?").bind(fuera ? 1 : 0, articuloId).run();
+  await env.DB.prepare("UPDATE articles SET fuera_calendario = ?, updated_at = datetime('now') WHERE id = ?").bind(fuera ? 1 : 0, articuloId).run();
   return fuera;
 }
 
@@ -10592,14 +10592,14 @@ async function handlePrimary(request, env, ctx) {
         // referencian users(id): se limpia o reasigna la referencia
         // antes de borrar, si no D1 rechaza el DELETE por FOREIGN KEY.
         await env.DB.prepare("UPDATE activity_log SET usuario_id = NULL WHERE usuario_id = ?").bind(id).run();
-        await env.DB.prepare("UPDATE articles SET autor_id = NULL WHERE autor_id = ?").bind(id).run();
-        await env.DB.prepare("UPDATE articles SET coautor_id = NULL WHERE coautor_id = ?").bind(id).run();
+        await env.DB.prepare("UPDATE articles SET autor_id = NULL, updated_at = datetime('now') WHERE autor_id = ?").bind(id).run();
+        await env.DB.prepare("UPDATE articles SET coautor_id = NULL, updated_at = datetime('now') WHERE coautor_id = ?").bind(id).run();
         await env.DB.prepare("UPDATE media SET autor_id = NULL WHERE autor_id = ?").bind(id).run();
         await env.DB.prepare("UPDATE results SET autor_id = NULL WHERE autor_id = ?").bind(id).run();
         await env.DB.prepare("UPDATE custom_clubs SET autor_id = NULL WHERE autor_id = ?").bind(id).run();
-        await env.DB.prepare("UPDATE alineaciones SET autor_id = NULL WHERE autor_id = ?").bind(id).run();
+        await env.DB.prepare("UPDATE alineaciones SET autor_id = NULL, updated_at = datetime('now') WHERE autor_id = ?").bind(id).run();
         await env.DB.prepare("UPDATE comments SET moderado_por_id = NULL WHERE moderado_por_id = ?").bind(id).run();
-        await env.DB.prepare("UPDATE club_info SET autor_id = NULL WHERE autor_id = ?").bind(id).run();
+        await env.DB.prepare("UPDATE club_info SET autor_id = NULL, updated_at = datetime('now') WHERE autor_id = ?").bind(id).run();
         // solicitante_id es NOT NULL en club_info_solicitudes: no se puede
         // poner a NULL (mismo caso que nivel_historial.usuario_id más
         // abajo), así que se borran las solicitudes que hizo esta persona.
@@ -12762,7 +12762,7 @@ async function handlePrimary(request, env, ctx) {
                 // partido: se descarta la de la noticia para no duplicar.
                 await env.DB.prepare("DELETE FROM alineaciones WHERE id = ?").bind(a.id).run();
               } else {
-                await env.DB.prepare("UPDATE alineaciones SET article_id = NULL, result_id = ? WHERE id = ?").bind(resultadoId, a.id).run();
+                await env.DB.prepare("UPDATE alineaciones SET article_id = NULL, result_id = ?, updated_at = datetime('now') WHERE id = ?").bind(resultadoId, a.id).run();
               }
             }
           }
