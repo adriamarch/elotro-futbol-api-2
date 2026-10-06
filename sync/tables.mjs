@@ -429,6 +429,60 @@ export const TABLES = [
     syncMode: "authoritative",
     ordenFisicaPorClave: true,
   },
+  {
+    name: "jornadas_calendario",
+    pk: ["id"],
+    order: 3.1,
+    changeStrategy: "updated_at",
+    cursorColumn: "updated_at",
+    deleteDetection: true,
+    syncMode: "authoritative", // se edita/borra desde el panel y los UPDATE no tocan updated_at
+  },
+  {
+    name: "equipo_alias_externo",
+    pk: ["id"],
+    order: 3.2,
+    changeStrategy: "immutable",
+    cursorColumn: "created_at",
+    deleteDetection: true,
+    syncMode: "authoritative",
+  },
+  {
+    name: "newsletter_envios",
+    pk: ["id"],
+    order: 3.3,
+    changeStrategy: "updated_at",
+    cursorColumn: "ultimo_envio_at",
+    deleteDetection: false, // fila única (id = 1)
+    syncMode: "authoritative",
+  },
+  {
+    name: "sync_partidos_auto",
+    pk: ["id"],
+    order: 3.4,
+    changeStrategy: "updated_at",
+    cursorColumn: "ultimo_sync_at",
+    deleteDetection: false, // fila única (id = 1)
+    syncMode: "authoritative",
+  },
+  {
+    name: "recordatorios_inactividad",
+    pk: ["user_id"],
+    order: 3.6,
+    changeStrategy: "updated_at",
+    cursorColumn: "updated_at",
+    deleteDetection: true,
+    syncMode: "authoritative",
+  },
+  {
+    name: "article_media",
+    pk: ["id"],
+    order: 5.7,
+    changeStrategy: "immutable",
+    cursorColumn: "created_at",
+    deleteDetection: true, // se reemplaza entera por noticia (DELETE + INSERT)
+    syncMode: "authoritative",
+  },
 ];
 
 export function getTable(name) {
@@ -451,6 +505,7 @@ export const DEPENDENCIAS_FK = {
   articles: ["users", "results"],
   match_events: ["results"],
   alineaciones: ["results"],
+  article_media: ["articles", "media"],
   article_slug_redirects: ["articles"],
   comments: ["articles", "users", "readers"],
   reader_sessions: ["readers"],

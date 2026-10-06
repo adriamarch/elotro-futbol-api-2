@@ -46,6 +46,13 @@ test("todas las tablas sincronizadas están configuradas (17 de Fase 4 + las añ
     "votaciones_internas_participacion",
     "votaciones_internas_urna",
     "votaciones_internas_votos",
+    // failover: tablas que existían en PG pero no se replicaban
+    "article_media",
+    "equipo_alias_externo",
+    "jornadas_calendario",
+    "newsletter_envios",
+    "recordatorios_inactividad",
+    "sync_partidos_auto",
   ].sort();
   assert.deepEqual(nombres, esperadas);
 });
