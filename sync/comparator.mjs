@@ -20,7 +20,7 @@ import { TABLES_IN_ORDER } from "./tables.mjs";
 import { obtenerColumnasPostgres, existeTablaPostgres } from "./pg-writer.mjs";
 
 const { Client } = pg;
-import { CAMPOS_VOLATILES_COMPARADOR } from "./comparator-config.mjs";
+import { CAMPOS_VOLATILES_COMPARADOR, TABLAS_PRIVADAS_COMPARADOR } from "./comparator-config.mjs";
 
 function pkKey(row, pk) {
   return pk.map((c) => String(row[c])).join("\u0000");
@@ -38,6 +38,22 @@ function normalizar(value) {
   return String(value);
 }
 
+// true si el orden físico de la tabla en PostgreSQL (ctid) coincide con el
+// orden de su PK; null si la tabla está vacía. Solo se usa en las tablas de
+// voto secreto (ordenFisicaPorClave): si no coincide, el orden de llegada de
+// los votos es deducible (ver reordenarTablaPorClave en pg-writer.mjs).
+async function ordenFisicoEsPorClave(pgClient, name, pk) {
+  const col = (c) => `"${c}"::text`;
+  const clave = pk.map(col).join(` || '|' || `);
+  const orden = pk.map((c) => `"${c}"`).join(", ");
+  const r = await pgClient.query(
+    `SELECT (SELECT string_agg(${clave}, ',' ORDER BY ctid) FROM "${name}")
+          = (SELECT string_agg(${clave}, ',' ORDER BY ${orden}) FROM "${name}") AS ok,
+            (SELECT COUNT(*) FROM "${name}") AS n;`
+  );
+  return Number(r.rows[0].n) === 0 ? null : r.rows[0].ok === true;
+}
+
 async function compararTabla(pgClient, tableConfig) {
   const { name, pk } = tableConfig;
   const reporte = {
@@ -49,6 +65,7 @@ async function compararTabla(pgClient, tableConfig) {
     valoresDiferentes: [],
     columnasFaltanEnPostgres: [],
     columnasSobranEnPostgres: [],
+    avisos: [],
     estado: "OK",
   };
 
@@ -109,6 +126,25 @@ async function compararTabla(pgClient, tableConfig) {
     reporte.columnasFaltanEnPostgres.length === 0;
 
   reporte.estado = sinDiferencias ? "OK" : "DIFERENCIAS";
+
+  if (tableConfig.ordenFisicaPorClave) {
+    const ordenado = await ordenFisicoEsPorClave(pgClient, name, pk);
+    reporte.ordenFisicoPorClave = ordenado;
+    if (ordenado === false) {
+      reporte.avisos.push(
+        "AVISO PRIVACIDAD: el orden físico en PostgreSQL no es el de la PK (el orden de llegada de los votos sería deducible). " +
+          "Se corrige solo en la próxima pasada con cambios, o ejecutando npm run sync:initial (idempotente) (ver FASE5)."
+      );
+    }
+  }
+
+  // Voto secreto: nunca se listan claves (ver comparator-config.mjs).
+  if (TABLAS_PRIVADAS_COMPARADOR.has(name)) {
+    const oculto = "[clave omitida]";
+    reporte.faltanEnPostgres = reporte.faltanEnPostgres.map(() => oculto);
+    reporte.sobranEnPostgres = reporte.sobranEnPostgres.map(() => oculto);
+    reporte.valoresDiferentes = reporte.valoresDiferentes.map((v) => ({ id: oculto, columnas: v.columnas }));
+  }
   return reporte;
 }
 
@@ -151,6 +187,10 @@ export async function ejecutarComparacion() {
       if (reporte.columnasFaltanEnPostgres.length > 0) {
         console.log(`  Columnas D1 sin equivalente en PG: ${reporte.columnasFaltanEnPostgres.join(", ")}`);
       }
+      if (reporte.ordenFisicoPorClave === true) {
+        console.log("  Orden físico en PG = orden de la PK (anonimato del voto secreto preservado)");
+      }
+      for (const aviso of reporte.avisos) console.log(`  ${aviso}`);
     }
 
     const conDiferencias = reportes.filter((r) => r.estado !== "OK");

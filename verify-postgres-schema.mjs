@@ -13,7 +13,16 @@ const expected = {
  comments:["id","article_id","nombre","email","texto","estado","ip","created_at","moderado_por_id","moderado_at"], club_info:["club","entrenador","estadio","fundacion","ciudad","autor_id","autor_nombre","created_at","updated_at"],
  club_info_solicitudes:["id","club","entrenador","estadio","fundacion","ciudad","solicitante_id","solicitante_nombre","estado","resuelta_por_id","resuelta_por_nombre","resuelta_at","created_at"],
  activity_log:["id","usuario_id","usuario_nombre","usuario_rol","accion","entidad","entidad_id","descripcion","detalle","ip","created_at"], nivel_historial:["id","usuario_id","usuario_nombre","nivel_anterior","nivel_nuevo","motivo","cambiado_por_id","cambiado_por_nombre","created_at"],
-newsletter_suscriptores:["id","email","baja_token","activo","created_at","baja_at"], newsletter_envios:["id","ultimo_envio_at"]
+newsletter_suscriptores:["id","email","baja_token","activo","created_at","baja_at"], newsletter_envios:["id","ultimo_envio_at"],
+ // Fase 1 (paridad con el worker principal)
+ votaciones_internas:["id","titulo","descripcion","multiple","anonima","obligatoria","resultados_visibles","cierra_en","estado","creado_por","creado_por_nombre","created_at","cerrada_en"],
+ votaciones_internas_opciones:["id","votacion_id","texto","orden"],
+ votaciones_internas_votos:["id","votacion_id","opcion_id","usuario_id","created_at"],
+ votaciones_internas_participacion:["votacion_id","usuario_id"],
+ votaciones_internas_urna:["token","votacion_id","opcion_id"],
+ push_subscriptions:["id","endpoint","p256dh","auth","noticias","partidos","user_agent","created_at","updated_at"],
+ match_gallery:["id","result_id","media_id","orden","vinculado_por_id","equipo","created_at"],
+ recordatorios_inactividad:["user_id","ref_actividad","avisos_enviados","ultimo_aviso_at","admins_avisados_at","updated_at"]
 };
 const client = new Client({connectionString: process.env.DATABASE_URL});
 await client.connect();

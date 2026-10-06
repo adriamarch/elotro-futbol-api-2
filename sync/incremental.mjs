@@ -47,6 +47,7 @@ import {
   desacoplarUsuarioHuerfano,
   desacoplarResultadoHuerfano,
   sincronizarSecuencia,
+  reordenarTablaPorClave,
   escaparIdentificador,
 } from "./pg-writer.mjs";
 
@@ -89,21 +90,46 @@ function pkKey(row, pk) {
 // vieja con ese username, así que el upsert de la fila nueva falla con
 // "users_username_key" y, como el borrado de huérfanos va DESPUÉS del upsert,
 // la tabla se quedaba en error pasada tras pasada.
-const UNICOS_RESOLUBLES = { users: ["username"] };
+//
+// Cada entrada es el nombre de una columna o un array de columnas (UNIQUE
+// compuesto):
+//  - users.username: ver arriba.
+//  - push_subscriptions.endpoint: un lector se da de baja (DELETE) y se
+//    vuelve a suscribir con el mismo endpoint -> id nuevo en D1; Postgres
+//    aún tiene la fila vieja.
+//  - votaciones_internas_votos (opcion_id, usuario_id): cambiar un voto
+//    nominal en D1 es DELETE + INSERT con id nuevo para la misma pareja;
+//    el upsert llega a Postgres ANTES de que el borrado de huérfanos
+//    retire la fila vieja y chocaría con el UNIQUE.
+const UNICOS_RESOLUBLES = {
+  users: ["username"],
+  push_subscriptions: ["endpoint"],
+  votaciones_internas_votos: [["opcion_id", "usuario_id"]],
+};
 
-// Devuelve el nombre de la columna UNIQUE implicada si el error es un
-// conflicto resoluble (23505 sobre una columna de UNICOS_RESOLUBLES); si no, null.
+// Devuelve la columna (o array de columnas) UNIQUE implicada si el error es
+// un conflicto resoluble (23505 sobre una entrada de UNICOS_RESOLUBLES); si
+// no, null.
 function columnaUnicaEnConflicto(error, table) {
   if (error?.code !== "23505") return null;
   const candidatas = UNICOS_RESOLUBLES[table];
   if (!candidatas) return null;
   for (const col of candidatas) {
-    if (error.constraint === `${table}_${col}_key`) return col;
+    const cols = Array.isArray(col) ? col : [col];
+    if (error.constraint === `${table}_${cols.join("_")}_key`) return col;
   }
-  // Fallback por el detalle ("Key (username)=(ana) already exists."); el
-  // patrón también vale con mensajes localizados de Postgres.
+  // Fallback por el detalle ("Key (username)=(ana) already exists." o
+  // "Key (opcion_id, usuario_id)=(3, 7) already exists."); el patrón
+  // también vale con mensajes localizados de Postgres.
   const m = /\(([^)]+)\)=\(/.exec(error.detail || "");
-  return m && candidatas.includes(m[1]) ? m[1] : null;
+  if (!m) return null;
+  const enDetalle = m[1].split(",").map((c) => c.trim());
+  return (
+    candidatas.find((col) => {
+      const cols = Array.isArray(col) ? col : [col];
+      return cols.length === enDetalle.length && cols.every((c, i) => c === enDetalle[i]);
+    }) ?? null
+  );
 }
 
 /**
@@ -119,11 +145,15 @@ function columnaUnicaEnConflicto(error, table) {
  * se sincronice.
  */
 export async function eliminarFilaObsoletaPorUnico(client, table, row, pk, column, { runId, leerD1 = ejecutarD1 } = {}) {
+  // "column" es una columna o un array de columnas (UNIQUE compuesto).
+  const columnas = Array.isArray(column) ? column : [column];
+  const etiqueta = columnas.map((c) => `${c}="${row[c]}"`).join(", ");
   const pkCols = pk.map(escaparIdentificador).join(", ");
-  const mismaPk = pk.map((c, i) => `${escaparIdentificador(c)} = $${i + 2}`).join(" AND ");
+  const mismoUnico = columnas.map((c, i) => `${escaparIdentificador(c)} = $${i + 1}`).join(" AND ");
+  const mismaPk = pk.map((c, i) => `${escaparIdentificador(c)} = $${columnas.length + i + 1}`).join(" AND ");
   const obsoletas = await client.query(
-    `SELECT ${pkCols} FROM ${escaparIdentificador(table)} WHERE ${escaparIdentificador(column)} = $1 AND NOT (${mismaPk});`,
-    [row[column], ...pkValuesFromRow(row, pk)]
+    `SELECT ${pkCols} FROM ${escaparIdentificador(table)} WHERE ${mismoUnico} AND NOT (${mismaPk});`,
+    [...columnas.map((c) => row[c]), ...pkValuesFromRow(row, pk)]
   );
   if (obsoletas.rows.length === 0) return 0;
 
@@ -136,8 +166,8 @@ export async function eliminarFilaObsoletaPorUnico(client, table, row, pk, colum
     const enD1 = await leerD1(`SELECT ${pk.join(", ")} FROM ${table} WHERE ${condD1} LIMIT 1;`);
     if (enD1.length > 0) {
       throw new Error(
-        `Conflicto de ${column}="${row[column]}" en ${table}: Postgres lo tiene en la fila ${clave} y D1 ` +
-        `lo asigna a ${pkKey(row, pk)}, pero la fila ${clave} sigue existiendo en D1 (¿cambio de ${column} entre ` +
+        `Conflicto de ${etiqueta} en ${table}: Postgres lo tiene en la fila ${clave} y D1 ` +
+        `lo asigna a ${pkKey(row, pk)}, pero la fila ${clave} sigue existiendo en D1 (¿cambio de ${columnas.join(", ")} entre ` +
         `filas vivas?). No se borra nada; se resolverá cuando se sincronice la fila ${clave}.`
       );
     }
@@ -152,7 +182,7 @@ export async function eliminarFilaObsoletaPorUnico(client, table, row, pk, colum
       throw error;
     }
     console.warn(
-      `[${table}] conflicto de ${column}="${row[column]}": borrada la fila obsoleta ${clave} de Postgres ` +
+      `[${table}] conflicto de ${etiqueta}: borrada la fila obsoleta ${clave} de Postgres ` +
       `(ya no existe en D1) para poder insertar ${pkKey(row, pk)}.`
     );
     if (runId) {
@@ -279,6 +309,18 @@ async function hayEjecucionEnCurso(client) {
 // Un fallo aquí no invalida la sincronización de la tabla: se avisa y sigue.
 async function sincronizarTabla(client, tableConfig, opts) {
   const detalle = await sincronizarTablaSinSecuencia(client, tableConfig, opts);
+  // Tablas de voto secreto: si la pasada cambió algo, se reordenan por PK
+  // para que el orden físico no delate el orden de llegada (ver
+  // reordenarTablaPorClave en pg-writer.mjs). Un fallo no invalida la
+  // sincronización, pero queda anotado como aviso visible.
+  if (tableConfig.ordenFisicaPorClave && detalle.inserted + detalle.updated + detalle.deleted > 0) {
+    try {
+      await reordenarTablaPorClave(client, tableConfig.name);
+    } catch (error) {
+      console.error(`[${tableConfig.name}] AVISO PRIVACIDAD: no se pudo reordenar la tabla por su PK: ${error.message}`);
+      (detalle.warnings ??= []).push(`reordenado por PK: ${error.message}`);
+    }
+  }
   try {
     if (tableConfig.pk && tableConfig.pk.length === 1) {
       await sincronizarSecuencia(client, tableConfig.name, tableConfig.pk[0]);
@@ -331,7 +373,7 @@ async function sincronizarTablaSinSecuencia(client, tableConfig, { runId }) {
     try {
       await ejecutarD1Paginado(
         name,
-        pk[0], // todas las tablas "authoritative" actuales tienen PK de una columna, ver tables.mjs
+        pk, // una columna o PK compuesta (votaciones_internas_participacion); ver ejecutarD1Paginado
         async (pagina) => {
           totalFilas += pagina.length;
 
@@ -355,7 +397,7 @@ async function sincronizarTablaSinSecuencia(client, tableConfig, { runId }) {
           }
           if (erroresColumnas) return;
 
-          for (const row of pagina) idsVistosEnD1.add(String(row[pk[0]]));
+          for (const row of pagina) idsVistosEnD1.add(pkKey(row, pk));
 
           // Igual que en la rama incremental: resuelve primero huérfanas de
           // failover por origin_write_id antes del upsert normal por PK
@@ -438,9 +480,9 @@ async function sincronizarTablaSinSecuencia(client, tableConfig, { runId }) {
       // compararlos contra idsVistosEnD1; se compara página a página.
       await obtenerIdsPostgresPaginado(client, name, pk, async (paginaPG) => {
         for (const row of paginaPG) {
-          const key = String(row[pk[0]]);
+          const key = pkKey(row, pk);
           if (!idsVistosEnD1.has(key)) {
-            const pkValues = [row[pk[0]]];
+            const pkValues = pkValuesFromRow(row, pk);
             try {
               await conReintentos(
                 async () => {

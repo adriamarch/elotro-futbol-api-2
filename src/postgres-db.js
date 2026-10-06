@@ -73,7 +73,10 @@ try {
 const TABLES_WITH_ID = new Set([
   "users","articles","results","match_events","media","custom_clubs",
   "edit_requests","comments","club_info_solicitudes","activity_log",
-  "nivel_historial","alineaciones"
+  "nivel_historial","alineaciones",
+  // Fase 1 (paridad con el worker principal): tablas con id autogenerado
+  // cuyo last_row_id lee el código portado.
+  "votaciones_internas","votaciones_internas_opciones","push_subscriptions"
 ]);
 
 import { translateSql } from "./sql-compat.js";

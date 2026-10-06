@@ -5,9 +5,10 @@ import { conReintentos } from "../retry.mjs";
 import { escaparValorD1 } from "../d1-client.mjs";
 import { CAMPOS_VOLATILES_COMPARADOR } from "../comparator-config.mjs";
 
-test("las 17 tablas del documento de Fase 4 están configuradas", () => {
+test("todas las tablas sincronizadas están configuradas (17 de Fase 4 + las añadidas después)", () => {
   const nombres = TABLES.map((t) => t.name).sort();
   const esperadas = [
+    // 17 originales de Fase 4
     "activity_log",
     "alineaciones",
     "article_slug_redirects",
@@ -25,6 +26,26 @@ test("las 17 tablas del documento de Fase 4 están configuradas", () => {
     "sessions",
     "settings",
     "users",
+    // añadidas después (lectores, porras, encuestas, tienda, galería...)
+    "comment_reports",
+    "comment_votes",
+    "match_gallery",
+    "noticias_rapidas",
+    "poll_options",
+    "poll_votes",
+    "polls",
+    "porras",
+    "reader_sessions",
+    "readers",
+    "tienda_pedidos",
+    "tienda_productos",
+    // Fase 2 de la sincronización completa (paridad de datos del failover)
+    "push_subscriptions",
+    "votaciones_internas",
+    "votaciones_internas_opciones",
+    "votaciones_internas_participacion",
+    "votaciones_internas_urna",
+    "votaciones_internas_votos",
   ].sort();
   assert.deepEqual(nombres, esperadas);
 });
@@ -48,8 +69,12 @@ test("el orden de sincronización no repite posiciones y respeta dependencias b�
   assert.ok(indice.users < indice.sessions);
 });
 
-test("toda tabla con changeStrategy updated_at tiene cursorColumn = updated_at", () => {
+test("toda tabla NO autoritativa con changeStrategy updated_at/immutable usa el cursor esperado", () => {
+  // Las autoritativas releen la tabla entera en cada pasada: su cursor es
+  // solo informativo (p. ej. readers usa created_at, reader_sessions
+  // last_seen_at, poll_options id), así que no se les exige nada.
   for (const t of TABLES) {
+    if (t.syncMode === "authoritative") continue;
     if (t.changeStrategy === "updated_at") {
       assert.equal(t.cursorColumn, "updated_at", `${t.name} debería usar updated_at como cursor`);
     }

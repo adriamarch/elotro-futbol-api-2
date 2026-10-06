@@ -236,6 +236,43 @@ export async function sincronizarSecuencia(client, table, column = "id") {
 export { escaparIdentificador };
 
 /**
+ * Reordena físicamente una tabla por su clave primaria (CLUSTER ... USING
+ * <índice de la PK>).
+ *
+ * Por qué: en D1, votaciones_internas_participacion y
+ * votaciones_internas_urna son WITHOUT ROWID (ver
+ * worker/migracion_votaciones_privadas.sql): el motor las guarda ordenadas
+ * por clave, así que NO existe forma de recuperar el orden de llegada de
+ * los votos y, por tanto, de emparejar "quién ha votado" con "qué se ha
+ * votado". PostgreSQL no tiene WITHOUT ROWID: guarda las filas en un
+ * montón donde cada fila nueva va al final, y dos filas insertadas en la
+ * misma pasada de sincronización (una de participación, otra de urna)
+ * quedarían contiguas en el mismo orden relativo (visible con ctid o con un
+ * SELECT sin ORDER BY). CLUSTER por la PK reescribe la tabla ordenada por
+ * clave (usuario_id / token aleatorio) y descarta la versión anterior del
+ * archivo, que es lo más cercano a WITHOUT ROWID que ofrece PostgreSQL.
+ *
+ * Adquiere un bloqueo ACCESS EXCLUSIVE durante la reescritura (tablas de
+ * decenas de filas: milisegundos). Requiere ser propietario de la tabla.
+ * Devuelve el nombre del índice usado.
+ */
+export async function reordenarTablaPorClave(client, table) {
+  const r = await client.query(
+    `SELECT ic.relname AS indice
+       FROM pg_index i
+       JOIN pg_class tc ON tc.oid = i.indrelid
+       JOIN pg_namespace n ON n.oid = tc.relnamespace
+       JOIN pg_class ic ON ic.oid = i.indexrelid
+      WHERE n.nspname = 'public' AND tc.relname = $1 AND i.indisprimary;`,
+    [table]
+  );
+  const indice = r.rows[0]?.indice;
+  if (!indice) throw new Error(`la tabla ${table} no tiene clave primaria`);
+  await client.query(`CLUSTER ${escaparIdentificador(table)} USING ${escaparIdentificador(indice)};`);
+  return indice;
+}
+
+/**
  * Reconciliación de filas creadas durante un failover (ver
  * worker/migracion_origin_write_id.sql y
  * worker-secondary/db/migrations/003_pending_writes.sql para el contexto
@@ -388,6 +425,14 @@ export async function desacoplarUsuarioHuerfano(client, userId) {
   await client.query('UPDATE noticias_rapidas SET autor_id = NULL WHERE autor_id = $1', [userId]);
   await client.query('UPDATE match_gallery SET vinculado_por_id = NULL WHERE vinculado_por_id = $1', [userId]);
   await client.query('UPDATE tienda_pedidos SET gestionado_por = NULL WHERE gestionado_por = $1', [userId]);
+  // Votaciones internas (migración 039). En D1 un usuario con votos o
+  // votaciones creadas NO se puede borrar (el DELETE devuelve 409 por FK),
+  // pero Postgres puede ir por detrás de D1: si se borró la votación
+  // (cascada de sus votos/participación) y luego el usuario, esta pasada de
+  // "users" -que va ANTES que las tablas de votaciones- encontraría aún las
+  // filas viejas en Postgres y el DELETE fallaría por FK, bloqueando en
+  // cascada a todas las tablas hijas (DEPENDENCIAS_FK) pasada tras pasada.
+  await client.query('UPDATE votaciones_internas SET creado_por = NULL WHERE creado_por = $1', [userId]);
 
   // DELETE: columnas NOT NULL, no se pueden dejar a NULL (igual que D1 con
   // sessions y nivel_historial).
@@ -395,6 +440,9 @@ export async function desacoplarUsuarioHuerfano(client, userId) {
   await client.query('DELETE FROM edit_requests WHERE solicitante_id = $1', [userId]);
   await client.query('DELETE FROM club_info_solicitudes WHERE solicitante_id = $1', [userId]);
   await client.query('DELETE FROM nivel_historial WHERE usuario_id = $1', [userId]);
+  // usuario_id NOT NULL en ambas tablas de votos/participación.
+  await client.query('DELETE FROM votaciones_internas_votos WHERE usuario_id = $1', [userId]);
+  await client.query('DELETE FROM votaciones_internas_participacion WHERE usuario_id = $1', [userId]);
 }
 
 /**

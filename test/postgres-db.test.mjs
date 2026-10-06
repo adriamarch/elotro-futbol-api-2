@@ -12,3 +12,12 @@ console.log("postgres-db translation tests: OK");
 const d=translateSql("SELECT * FROM articles WHERE slug = ?1 AND publicado = ?2");
 assert.equal(d.sql,"SELECT * FROM articles WHERE slug = $1 AND publicado = $2");
 console.log("numbered placeholder test: OK");
+
+// Fase 1 (paridad con el worker principal): "INSERT OR IGNORE" de SQLite.
+const e=translateSql("INSERT OR IGNORE INTO votaciones_internas_participacion (votacion_id, usuario_id) VALUES (?, ?)");
+assert.equal(e.sql,"INSERT INTO votaciones_internas_participacion (votacion_id, usuario_id) VALUES ($1, $2) ON CONFLICT DO NOTHING");
+const f=translateSql("INSERT OR IGNORE INTO x (a) VALUES (?) RETURNING id");
+assert.equal(f.sql,"INSERT INTO x (a) VALUES ($1) ON CONFLICT DO NOTHING RETURNING id");
+const g=translateSql("INSERT INTO a (b) VALUES (?) ON CONFLICT(b) DO NOTHING");
+assert.equal(g.sql,"INSERT INTO a (b) VALUES ($1) ON CONFLICT(b) DO NOTHING"); // no se duplica
+console.log("insert-or-ignore translation tests: OK");

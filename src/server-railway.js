@@ -38,7 +38,7 @@ app.use(
       "http://127.0.0.1:5173",
       "http://127.0.0.1:8788",
     ],
-    allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowHeaders: ["Content-Type", "Authorization"],
   })
 );
@@ -97,6 +97,18 @@ const env = {
   // ese mismo endpoint para decidir si debe actuar. Si no se define, usa
   // el dominio workers.dev por defecto (ver src/index.js).
   PRIMARY_HEALTH_URL: process.env.PRIMARY_HEALTH_URL,
+  // --- Paridad con worker/src/index.js (sincronización Fase 1) ---
+  // Notificaciones push (Web Push + VAPID): clave PRIVADA en formato JWK
+  // (JSON) y "subject" (mailto:/https:). Mismos valores que en el Worker
+  // principal; sin ellos las rutas /api/push/* y los avisos push no
+  // funcionan durante un failover.
+  VAPID_PRIVATE_JWK: process.env.VAPID_PRIVATE_JWK,
+  VAPID_SUBJECT: process.env.VAPID_SUBJECT,
+  // Login de lectores con X (OAuth 2.0, ver /api/readers/x/*).
+  X_CLIENT_ID: process.env.X_CLIENT_ID,
+  X_CLIENT_SECRET: process.env.X_CLIENT_SECRET,
+  // IndexNow (aviso a buscadores al publicar). Opcional.
+  INDEXNOW_KEY: process.env.INDEXNOW_KEY,
 };
 
 // Fallo rápido y con mensaje claro si falta JWT_SECRET: sin validar esto
@@ -232,7 +244,11 @@ app.post("/api/internal/cron-respaldo", async (c) => {
     return c.json({ ok: false, error: "INTERNAL_CRON_SECRET no configurado en este servicio" }, 503);
   }
   const secretoRecibido = c.req.header("X-Internal-Cron-Secret");
-  if (!secretoRecibido || secretoRecibido !== secretoEsperado) {
+  // SEGURIDAD: comparación en tiempo constante (evita ataques de temporización
+  // para ir adivinando el secreto carácter a carácter).
+  const bufA = Buffer.from(String(secretoRecibido ?? ""));
+  const bufB = Buffer.from(String(secretoEsperado));
+  if (!secretoRecibido || bufA.length !== bufB.length || !crypto.timingSafeEqual(bufA, bufB)) {
     return c.json({ ok: false, error: "No autorizado" }, 401);
   }
 

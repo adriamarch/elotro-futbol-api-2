@@ -30,6 +30,7 @@ import {
   contarPostgres,
   upsertFila,
   reconciliarTablaAutoritativa,
+  reordenarTablaPorClave,
 } from "./pg-writer.mjs";
 import { conReintentos } from "./retry.mjs";
 import { nuevoRunId, registrarInicio, registrarFin } from "./state.mjs";
@@ -93,6 +94,15 @@ async function migrarTabla(client, tableConfig) {
       } catch (error) {
         detalle.errors.push(`${JSON.stringify(pk.map((c) => row[c]))}: ${error.message}`);
       }
+    }
+  }
+
+  // Tablas de voto secreto: orden físico por PK (ver reordenarTablaPorClave).
+  if (tableConfig.ordenFisicaPorClave) {
+    try {
+      await reordenarTablaPorClave(client, name);
+    } catch (error) {
+      console.error(`[${name}] AVISO PRIVACIDAD: no se pudo reordenar la tabla por su PK: ${error.message}`);
     }
   }
 

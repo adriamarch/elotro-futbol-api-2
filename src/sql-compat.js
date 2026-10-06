@@ -66,6 +66,18 @@ export function translateSql(sql, params = []) {
   // Se captura la palabra/columna inmediatamente anterior a "COLLATE
   // NOCASE" (nombres de columna válidos: letras, dígitos, guión bajo).
   out = out.replace(/(\w+)\s+COLLATE\s+NOCASE/gi, "LOWER($1)");
+  // "INSERT OR IGNORE INTO t ..." (SQLite) -> "INSERT INTO t ... ON CONFLICT
+  // DO NOTHING" (Postgres). Sin esto Postgres lanza un error de sintaxis.
+  // Si la sentencia ya lleva RETURNING (lo añade maybeAddReturning), la
+  // cláusula ON CONFLICT debe ir ANTES de RETURNING.
+  if (/^\s*INSERT\s+OR\s+IGNORE\s+INTO\b/i.test(out)) {
+    out = out.replace(/^(\s*)INSERT\s+OR\s+IGNORE\s+INTO\b/i, "$1INSERT INTO");
+    out = /\bON\s+CONFLICT\b/i.test(out)
+      ? out
+      : /\bRETURNING\b/i.test(out)
+        ? out.replace(/\s+RETURNING\b/i, " ON CONFLICT DO NOTHING RETURNING")
+        : `${out.replace(/;\s*$/, "")} ON CONFLICT DO NOTHING`;
+  }
   out = out.replace(/\?(\d+)/g, (_, index) => { n = Math.max(n, Number(index)); return `$${index}`; });
   out = out.replace(/\?/g, () => `$${++n}`);
   return { sql: out, params };

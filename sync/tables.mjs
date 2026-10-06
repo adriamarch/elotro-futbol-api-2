@@ -22,6 +22,11 @@
 // "updated_at". Las que son de solo-inserción usan "immutable" con
 // created_at como cursor -no necesitan trigger ni columna nueva-.
 //
+// "ordenFisicaPorClave": (solo tablas de voto secreto) tras cada pasada con
+//   cambios, PostgreSQL reordena físicamente la tabla por su PK (CLUSTER)
+//   para que el orden del montón no revele el orden de llegada de los votos.
+//   D1 lo evita con WITHOUT ROWID; PostgreSQL no tiene equivalente.
+//
 // "deleteDetection": si D1 permite borrar filas de esta tabla, hay que
 // comparar el conjunto de IDs D1 vs PostgreSQL en cada pasada para poder
 // aplicar el DELETE también en PostgreSQL (D1 no tiene una tabla de
@@ -142,7 +147,7 @@ export const TABLES = [
     // esos cambios.
     name: "readers",
     pk: ["id"],
-    order: 10.1,
+    order: 9.5, // antes de "comments" (10): comments.reader_id -> readers(id) (FK real, comments_reader_id_fkey)
     changeStrategy: "updated_at",
     cursorColumn: "created_at",
     deleteDetection: true,
@@ -152,7 +157,7 @@ export const TABLES = [
     // Sesiones de lectores (mismo patrón que "sessions" para redactores).
     name: "reader_sessions",
     pk: ["id"],
-    order: 10.2,
+    order: 9.6, // depende de readers
     changeStrategy: "updated_at",
     cursorColumn: "last_seen_at",
     deleteDetection: true,
@@ -329,6 +334,98 @@ export const TABLES = [
     deleteDetection: true, // el panel permite borrar noticias rápidas
     syncMode: "authoritative", // D1 es la autoridad; tabla pequeña
   },
+  {
+    // ---------------------------------------------------------------
+    // FASE 2 (paridad de datos del failover): push_subscriptions y las 5
+    // tablas de votaciones internas. Esquema en db/migrations/036 y 039.
+    // ---------------------------------------------------------------
+    //
+    // Suscripciones Web Push (una fila por navegador). D1 las toca con
+    // INSERT ... ON CONFLICT(endpoint) DO UPDATE (que sí refresca
+    // updated_at) y las borra con DELETE (baja del usuario o 404/410 del
+    // servicio push), así que cursor por updated_at + deleteDetection.
+    // Tabla potencialmente grande (una fila por lector suscrito): NO es
+    // authoritative para no releerla entera cada pasada (cuota de lecturas
+    // de D1). Un lector que se da de baja y se vuelve a suscribir recibe un
+    // id nuevo con el MISMO endpoint: ese choque UNIQUE se resuelve en
+    // incremental.mjs (UNICOS_RESOLUBLES.push_subscriptions).
+    name: "push_subscriptions",
+    pk: ["id"],
+    order: 24,
+    changeStrategy: "updated_at",
+    cursorColumn: "updated_at",
+    deleteDetection: true,
+  },
+  {
+    // Votaciones internas del panel (cabecera). No tiene updated_at pero
+    // cambia tras crearse (estado/cerrada_en al cerrar o reabrir), y D1 la
+    // borra junto a sus hijas -> authoritative. Tabla diminuta.
+    name: "votaciones_internas",
+    pk: ["id"],
+    order: 25,
+    changeStrategy: "immutable",
+    cursorColumn: "created_at",
+    deleteDetection: true,
+    syncMode: "authoritative",
+  },
+  {
+    name: "votaciones_internas_opciones",
+    pk: ["id"],
+    order: 26,
+    changeStrategy: "immutable",
+    cursorColumn: "id", // sin created_at; mismo criterio que poll_options
+    deleteDetection: true,
+    syncMode: "authoritative",
+  },
+  {
+    // Votos NOMINALES (con usuario). En las votaciones anónimas esta tabla
+    // no se usa (D1 las guarda en participacion + urna). Cambiar el voto =
+    // DELETE + INSERT con id nuevo, así que authoritative (y ver
+    // UNICOS_RESOLUBLES: UNIQUE(opcion_id, usuario_id) puede chocar con la
+    // fila vieja de PG dentro de la misma pasada).
+    name: "votaciones_internas_votos",
+    pk: ["id"],
+    order: 27,
+    changeStrategy: "immutable",
+    cursorColumn: "created_at",
+    deleteDetection: true,
+    syncMode: "authoritative",
+  },
+  {
+    // PRIVACIDAD (voto secreto). QUIÉN ha votado, sin opción ni fecha. En
+    // D1 es WITHOUT ROWID: no hay orden de inserción recuperable. PK
+    // compuesta (votacion_id, usuario_id).
+    //  - authoritative y SIN cursor temporal: no hay created_at y no se
+    //    debe introducir ninguna marca de tiempo aquí.
+    //  - "ordenFisicaPorClave": en PostgreSQL (tabla de montón normal) el
+    //    orden físico delataría el orden de llegada; tras cada cambio se
+    //    reordena con CLUSTER por la PK, que es el equivalente a WITHOUT
+    //    ROWID (ver reordenarTablaPorClave en pg-writer.mjs).
+    //  - el comparador no lista sus claves (TABLAS_PRIVADAS_COMPARADOR en
+    //    comparator-config.mjs) y verifica ese orden físico.
+    name: "votaciones_internas_participacion",
+    pk: ["votacion_id", "usuario_id"],
+    order: 28,
+    changeStrategy: "immutable",
+    cursorColumn: "votacion_id", // solo informativo (cursor de authoritative); nunca una fecha
+    deleteDetection: true,
+    syncMode: "authoritative",
+    ordenFisicaPorClave: true,
+  },
+  {
+    // PRIVACIDAD (voto secreto). QUÉ se ha votado, sin usuario ni fecha;
+    // la clave es un token aleatorio. Misma política que participacion. NO
+    // debe unirse nunca con participacion (ni aquí, ni en el comparador, ni
+    // en logs): son tablas separadas a propósito.
+    name: "votaciones_internas_urna",
+    pk: ["token"],
+    order: 29,
+    changeStrategy: "immutable",
+    cursorColumn: "votacion_id", // solo informativo; nunca una fecha
+    deleteDetection: true,
+    syncMode: "authoritative",
+    ordenFisicaPorClave: true,
+  },
 ];
 
 export function getTable(name) {
@@ -361,4 +458,9 @@ export const DEPENDENCIAS_FK = {
   poll_options: ["polls"],
   poll_votes: ["polls", "poll_options", "readers"],
   tienda_pedidos: ["users", "tienda_productos"],
+  votaciones_internas: ["users"],
+  votaciones_internas_opciones: ["votaciones_internas"],
+  votaciones_internas_votos: ["votaciones_internas", "votaciones_internas_opciones", "users"],
+  votaciones_internas_participacion: ["votaciones_internas", "users"],
+  votaciones_internas_urna: ["votaciones_internas", "votaciones_internas_opciones"],
 };

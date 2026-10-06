@@ -172,22 +172,32 @@ export async function ejecutarD1PaginadoSoloIds(table, pkColumns, onPagina, { ta
  * array con la tabla entera en memoria); onPagina normalmente hace el
  * upsert de esa página contra Postgres antes de pedir la siguiente.
  *
- * Solo soporta PK de una columna (todas las tablas "authoritative"
- * actuales cumplen esto -ver tables.mjs-); si en el futuro alguna
- * necesitara PK compuesta, esta función tendría que extenderse primero.
+ * Acepta PK de una columna (string) o compuesta (array de columnas). Con PK
+ * compuesta se pagina por "valores de fila" de SQLite, p. ej.
+ * "WHERE (votacion_id, usuario_id) > (2, 7) ORDER BY votacion_id,
+ * usuario_id": paginar solo por la primera columna saltaría filas que
+ * comparten su valor (todas las de una misma votación). Hace falta para
+ * votaciones_internas_participacion (tables.mjs).
  */
 export async function ejecutarD1Paginado(table, pkColumn, onPagina, { tamanoPagina = 500 } = {}) {
-  let ultimoValor = null;
+  const cols = Array.isArray(pkColumn) ? pkColumn : [pkColumn];
+  const listaCols = cols.join(", ");
+  let ultimaFila = null;
   let totalFilas = 0;
   for (;;) {
-    const where = ultimoValor === null ? "" : `WHERE ${pkColumn} > ${escaparValorD1(ultimoValor)} `;
-    const sql = `SELECT * FROM ${table} ${where}ORDER BY ${pkColumn} ASC LIMIT ${tamanoPagina};`;
+    let where = "";
+    if (ultimaFila !== null) {
+      where = cols.length === 1
+        ? `WHERE ${cols[0]} > ${escaparValorD1(ultimaFila[cols[0]])} `
+        : `WHERE (${listaCols}) > (${cols.map((c) => escaparValorD1(ultimaFila[c])).join(", ")}) `;
+    }
+    const sql = `SELECT * FROM ${table} ${where}ORDER BY ${listaCols} ASC LIMIT ${tamanoPagina};`;
     const pagina = await ejecutarD1(sql);
     if (pagina.length === 0) break;
 
     await onPagina(pagina);
     totalFilas += pagina.length;
-    ultimoValor = pagina[pagina.length - 1][pkColumn];
+    ultimaFila = pagina[pagina.length - 1];
 
     if (pagina.length < tamanoPagina) break; // última página
   }
