@@ -76,6 +76,7 @@ export const TABLES = [
     changeStrategy: "immutable",
     cursorColumn: "created_at",
     deleteDetection: true, // se puede borrar media desde el panel
+    syncMode: "authoritative", // se editan filas ya creadas: un cursor por created_at no las detecta
   },
   {
     // Galería de partido: vincula "media" con "results" (Bloque B,
@@ -95,6 +96,7 @@ export const TABLES = [
     changeStrategy: "immutable",
     cursorColumn: "created_at",
     deleteDetection: true,
+    syncMode: "authoritative", // se editan filas ya creadas: un cursor por created_at no las detecta
   },
   {
     name: "custom_clubs",
@@ -120,6 +122,7 @@ export const TABLES = [
     changeStrategy: "immutable",
     cursorColumn: "created_at",
     deleteDetection: true, // se pueden borrar/corregir eventos desde Minuto a Minuto
+    syncMode: "authoritative", // se editan filas ya creadas: un cursor por created_at no las detecta
   },
   {
     name: "alineaciones",

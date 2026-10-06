@@ -10,6 +10,7 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { conReintentos } from "./retry.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -100,6 +101,19 @@ export async function ejecutarD1(sql) {
   }
 }
 
+// Lectura con reintentos: Cloudflare devuelve a veces errores transitorios
+// (p. ej. code 7403 en la primera consulta de una pasada) que desaparecen al
+// reintentar. Sin esto, un fallo puntual dejaba users con error y omitía en
+// cascada las ~15 tablas que dependen de ella.
+function ejecutarD1ConReintentos(sql, etiqueta) {
+  return conReintentos(() => ejecutarD1(sql), {
+    intentos: 4,
+    esperaBaseMs: 2000,
+    onRetry: ({ intento, error, esperaMs }) =>
+      console.warn(`[${etiqueta}] reintento lectura D1 (${intento}) en ${esperaMs}ms: ${String(error.message).split("\n")[0].slice(0, 200)}`),
+  });
+}
+
 /**
  * Escapa un valor literal para incluirlo en SQL de D1 (SQLite).
  * Se usa solo para construir sentencias de solo lectura (SELECT ... WHERE
@@ -141,7 +155,7 @@ export async function ejecutarD1PaginadoSoloIds(table, pkColumns, onPagina, { ta
   for (;;) {
     const where = ultimoValor === null ? "" : `WHERE ${colOrden} > ${escaparValorD1(ultimoValor)} `;
     const sql = `SELECT ${cols.join(", ")} FROM ${table} ${where}ORDER BY ${colOrden} ASC LIMIT ${tamanoPagina};`;
-    const pagina = await ejecutarD1(sql);
+    const pagina = await ejecutarD1ConReintentos(sql, table);
     if (pagina.length === 0) break;
 
     await onPagina(pagina);
@@ -192,7 +206,7 @@ export async function ejecutarD1Paginado(table, pkColumn, onPagina, { tamanoPagi
         : `WHERE (${listaCols}) > (${cols.map((c) => escaparValorD1(ultimaFila[c])).join(", ")}) `;
     }
     const sql = `SELECT * FROM ${table} ${where}ORDER BY ${listaCols} ASC LIMIT ${tamanoPagina};`;
-    const pagina = await ejecutarD1(sql);
+    const pagina = await ejecutarD1ConReintentos(sql, table);
     if (pagina.length === 0) break;
 
     await onPagina(pagina);

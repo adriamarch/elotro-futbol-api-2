@@ -343,7 +343,8 @@ async function sincronizarTablaSinSecuencia(client, tableConfig, { runId }) {
     return detalle;
   }
 
-  const cursor = await leerCursor(client, name);
+  // SYNC_FULL=1 ignora el cursor y relee la tabla entera (resincronización completa puntual).
+  const cursor = process.env.SYNC_FULL === "1" ? null : await leerCursor(client, name);
   const columnasPG = await obtenerColumnasPostgres(client, name);
 
   // Estas tablas son autoritativas: en cada pasada D1 se considera la copia
@@ -607,17 +608,23 @@ async function sincronizarTablaSinSecuencia(client, tableConfig, { runId }) {
     if (cursor?.last_synced_at) {
       const cursorInicial = escaparValorD1(cursor.last_synced_at);
       let ultimoValorPagina = null;
+      let sinAvance = false;
       for (;;) {
+        // ">=" y no ">": created_at/updated_at tienen resolución de segundo y varias filas
+        // comparten valor; con ">" se perdían las que empataban con el cursor. El upsert es
+        // idempotente. Si una página entera empata y no avanza se usa ">" para no hacer bucle.
         const condicion = ultimoValorPagina === null
-          ? `${cursorColumn} > ${cursorInicial}`
-          : `${cursorColumn} > ${escaparValorD1(ultimoValorPagina)}`;
+          ? `${cursorColumn} >= ${cursorInicial}`
+          : `${cursorColumn} ${sinAvance ? ">" : ">="} ${escaparValorD1(ultimoValorPagina)}`;
         const sql = `SELECT * FROM ${name} WHERE ${condicion} ORDER BY ${cursorColumn} ASC LIMIT ${TAMANO_PAGINA_INCREMENTAL};`;
         const pagina = await conReintentos(() => ejecutarD1(sql), {
           onRetry: ({ intento, error }) => console.warn(`[${name}] reintento lectura D1 (${intento}): ${error.message}`),
         });
         if (pagina.length === 0) break;
         await procesarPaginaIncremental(pagina);
-        ultimoValorPagina = pagina[pagina.length - 1][cursorColumn];
+        const nuevoValorPagina = pagina[pagina.length - 1][cursorColumn];
+        sinAvance = nuevoValorPagina === ultimoValorPagina;
+        ultimoValorPagina = nuevoValorPagina;
         console.log(`[${name}] progreso ${totalFilasLeidas} leídos de D1`);
         if (pagina.length < TAMANO_PAGINA_INCREMENTAL) break;
       }
@@ -626,15 +633,18 @@ async function sincronizarTablaSinSecuencia(client, tableConfig, { runId }) {
       // inicial: se pagina igual por cursorColumn desde el principio, en
       // vez de "SELECT * FROM tabla ORDER BY cursorColumn ASC;" sin LIMIT.
       let ultimoValorPagina = null;
+      let sinAvance = false;
       for (;;) {
-        const where = ultimoValorPagina === null ? "" : `WHERE ${cursorColumn} > ${escaparValorD1(ultimoValorPagina)} `;
+        const where = ultimoValorPagina === null ? "" : `WHERE ${cursorColumn} ${sinAvance ? ">" : ">="} ${escaparValorD1(ultimoValorPagina)} `;
         const sql = `SELECT * FROM ${name} ${where}ORDER BY ${cursorColumn} ASC LIMIT ${TAMANO_PAGINA_INCREMENTAL};`;
         const pagina = await conReintentos(() => ejecutarD1(sql), {
           onRetry: ({ intento, error }) => console.warn(`[${name}] reintento lectura D1 (${intento}): ${error.message}`),
         });
         if (pagina.length === 0) break;
         await procesarPaginaIncremental(pagina);
-        ultimoValorPagina = pagina[pagina.length - 1][cursorColumn];
+        const nuevoValorPagina = pagina[pagina.length - 1][cursorColumn];
+        sinAvance = nuevoValorPagina === ultimoValorPagina;
+        ultimoValorPagina = nuevoValorPagina;
         console.log(`[${name}] progreso ${totalFilasLeidas} leídos de D1`);
         if (pagina.length < TAMANO_PAGINA_INCREMENTAL) break;
       }
