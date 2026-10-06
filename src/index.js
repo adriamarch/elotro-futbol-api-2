@@ -6445,6 +6445,7 @@ async function enviarRecordatoriosInactividadSiToca(env) {
            admins_avisados_at = NULL,
            updated_at = excluded.updated_at`
       ).bind(u.id, new Date(refMs).toISOString(), numeroAviso, ahora.toISOString()).run();
+      await registrarHistorialAviso(env, { userId: u.id, cicloPrevio: hayCicloPrevio, numeroAviso, enviadoAtIso: ahora.toISOString(), diasSinSubir });
       // Pausa entre correos: Resend limita el ritmo de envío (unas 2 peticiones
       // por segundo por defecto) y un 429 por ritmo se trataría como fallo de
       // cuenta, gastando la secundaria sin necesidad.
@@ -6496,6 +6497,46 @@ async function avisarAdminsDeExpulsion(env, usuarios, ahora) {
   await env.DB.batch(marcas);
 }
 
+// Historial de avisos de inactividad: una entrada por aviso enviado en el ciclo
+// actual ({ numero, enviado_at, dias_sin_subir }), guardada como JSON en
+// recordatorios_inactividad.historial_avisos. Sirve para que los admins vean
+// el detalle de cada aviso en Usuarios. Es "best effort": si la columna aún no
+// existe (migracion_recordatorios_inactividad_historial.sql sin aplicar) se
+// ignora el error y los avisos se envían igual.
+function parsearHistorialAvisos(valor) {
+  if (!valor) return [];
+  try {
+    const lista = typeof valor === "string" ? JSON.parse(valor) : valor;
+    if (!Array.isArray(lista)) return [];
+    return lista
+      .filter((h) => h && Number.isFinite(Number(h.numero)) && typeof h.enviado_at === "string")
+      .map((h) => ({
+        numero: Number(h.numero),
+        enviado_at: h.enviado_at,
+        dias_sin_subir: Number.isFinite(Number(h.dias_sin_subir)) ? Number(h.dias_sin_subir) : null,
+      }));
+  } catch {
+    return [];
+  }
+}
+
+async function registrarHistorialAviso(env, { userId, cicloPrevio, numeroAviso, enviadoAtIso, diasSinSubir }) {
+  try {
+    let historial = [];
+    if (cicloPrevio) {
+      const fila = await env.DB.prepare("SELECT historial_avisos FROM recordatorios_inactividad WHERE user_id = ?").bind(userId).first();
+      historial = parsearHistorialAvisos(fila?.historial_avisos);
+    }
+    historial = historial.filter((h) => h.numero !== numeroAviso);
+    historial.push({ numero: numeroAviso, enviado_at: enviadoAtIso, dias_sin_subir: diasSinSubir });
+    await env.DB.prepare(
+      "UPDATE recordatorios_inactividad SET historial_avisos = ?, updated_at = datetime('now') WHERE user_id = ?"
+    ).bind(JSON.stringify(historial), userId).run();
+  } catch (err) {
+    console.log("No se pudo guardar el historial del aviso de inactividad:", err.message);
+  }
+}
+
 // Estado de los avisos de inactividad de cada redactor, para que los admins
 // lo vean en Usuarios (GET /api/users). Aplica la MISMA lógica de ciclo que
 // enviarRecordatoriosInactividadSiToca: si el redactor ha subido algo después
@@ -6513,6 +6554,15 @@ async function cargarEstadoInactividadUsuarios(env, usuarios) {
         "SELECT autor_id, MAX(fecha_publicacion) AS ultima_noticia FROM articles WHERE autor_id IS NOT NULL GROUP BY autor_id"
       ).all(),
     ]);
+    // El historial va en una consulta aparte: si la columna aún no existe, el
+    // resto del estado sigue funcionando.
+    const historialPorUsuario = new Map();
+    try {
+      const { results: hist } = await env.DB.prepare("SELECT user_id, historial_avisos FROM recordatorios_inactividad").all();
+      for (const h of hist || []) historialPorUsuario.set(Number(h.user_id), h.historial_avisos);
+    } catch (err) {
+      console.log("Historial de avisos de inactividad no disponible todavía:", err.message);
+    }
     const estadoPorUsuario = new Map((estados.results || []).map((f) => [Number(f.user_id), f]));
     const ultimaPorUsuario = new Map((ultimas.results || []).map((f) => [Number(f.autor_id), f.ultima_noticia]));
     const ahoraMs = Date.now();
@@ -6532,6 +6582,7 @@ async function cargarEstadoInactividadUsuarios(env, usuarios) {
         avisos_maximo: INACTIVIDAD_AVISOS_HASTA_INCUMPLIMIENTO,
         dias_hasta_primer_aviso: INACTIVIDAD_DIAS_HASTA_PRIMER_AVISO,
         ultimo_aviso_at: hayCicloVigente ? (f.ultimo_aviso_at || null) : null,
+        avisos: hayCicloVigente ? parsearHistorialAvisos(historialPorUsuario.get(Number(u.id))) : [],
         admins_avisados_at: hayCicloVigente ? (f.admins_avisados_at || null) : null,
       });
     }
