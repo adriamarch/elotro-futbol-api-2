@@ -1680,7 +1680,14 @@ async function enviarBoletinALista(env, { destinatarios, articulos, clasificacio
 // "scheduled" en cada ejecución del cron junto con las demás tareas
 // programadas; como el cron ya corre cada minuto para otras cosas, aquí
 // solo se decide si ESTA ejecución concreta debe disparar el envío.
+// Guardia en memoria del cron por minuto: mientras no toque, no se vuelve a
+// leer newsletter_envios en cada tick. Como mucho 1 lectura por hora y
+// por isolate (el tope de 1h evita que un cambio manual de
+// ultimo_envio_at quede ignorado durante dias).
+let BOLETIN_PROXIMA_COMPROBACION_MS = 0;
+
 async function enviarBoletinSemanalSiToca(env) {
+  if (Date.now() < BOLETIN_PROXIMA_COMPROBACION_MS) return;
   try {
     const fila = await env.DB.prepare(
       "SELECT ultimo_envio_at FROM newsletter_envios WHERE id = 1"
@@ -1688,7 +1695,11 @@ async function enviarBoletinSemanalSiToca(env) {
     const ultimo = fila && fila.ultimo_envio_at ? new Date(fila.ultimo_envio_at + "Z") : null;
     const ahora = new Date();
     const SIETE_DIAS_MS = 7 * 24 * 60 * 60 * 1000;
-    if (ultimo && ahora - ultimo < SIETE_DIAS_MS) return; // aún no toca
+    if (ultimo && ahora - ultimo < SIETE_DIAS_MS) {
+      // aún no toca: no volver a mirar hasta que toque (como mucho 1h)
+      BOLETIN_PROXIMA_COMPROBACION_MS = Math.min(ultimo.getTime() + SIETE_DIAS_MS, Date.now() + 60 * 60 * 1000);
+      return;
+    }
 
     const { results: destinatarios } = await env.DB.prepare(
       "SELECT email, baja_token FROM newsletter_suscriptores WHERE activo = 1"
@@ -4685,14 +4696,26 @@ async function iniciarPartidosProgramadosCuyaHoraHaLlegado(env) {
   // UNO no impide que los demás arranquen en la misma pasada, y además
   // queda logueado para poder ver en el dashboard de Cloudflare (Logs)
   // si D1 está fallando de verdad y por qué.
+  // Cota superior para no leer TODOS los partidos programados de la
+  // temporada en cada tick del cron (1440/dia). fecha_partido es hora de
+  // Madrid como texto "YYYY-MM-DDTHH:MM"; Madrid va como mucho 2h por
+  // delante de UTC, asi que un partido solo puede haber llegado a su hora
+  // si su texto es <= (ahora UTC + 2h). Se usa +3h de margen y la
+  // comparacion fina (con el offset real) sigue haciendose en JS mas
+  // abajo. No hay cota inferior: un partido que se quedo sin arrancar
+  // (caida, error transitorio) se sigue recuperando igual que antes.
+  // Los indices (estado, fecha) de migracion_indice_arranque_partidos.sql
+  // hacen que esta consulta lea solo los partidos ya vencidos.
+  const limiteLocalArranque = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString().slice(0, 16);
   let candidatosProgramados = [];
   let candidatosRetrasados = [];
   try {
     ({ results: candidatosProgramados = [] } = await env.DB.prepare(
       `SELECT id, fecha_partido FROM results
        WHERE estado = 'programado' AND fecha_partido IS NOT NULL
-         AND length(fecha_partido) = 16` // "YYYY-MM-DDTHH:MM": solo si se conoce la hora, no solo la fecha
-    ).all());
+         AND length(fecha_partido) = 16
+         AND fecha_partido <= ?` // "YYYY-MM-DDTHH:MM": solo si se conoce la hora, no solo la fecha
+    ).bind(limiteLocalArranque).all());
   } catch (err) {
     console.error("[arranque automático] fallo leyendo partidos 'programado':", err.message);
   }
@@ -4700,8 +4723,9 @@ async function iniciarPartidosProgramadosCuyaHoraHaLlegado(env) {
     ({ results: candidatosRetrasados = [] } = await env.DB.prepare(
       `SELECT id, fecha_partido_retrasado AS fecha_partido FROM results
        WHERE estado = 'retrasado' AND fecha_partido_retrasado IS NOT NULL
-         AND length(fecha_partido_retrasado) = 16`
-    ).all());
+         AND length(fecha_partido_retrasado) = 16
+         AND fecha_partido_retrasado <= ?`
+    ).bind(limiteLocalArranque).all());
   } catch (err) {
     console.error("[arranque automático] fallo leyendo partidos 'retrasado':", err.message);
   }
@@ -5543,7 +5567,12 @@ async function publicarArticulosProgramados(env) {
 const LIMITE_DIARIO_D1_FILAS_LEIDAS = 5_000_000;
 const UMBRAL_AVISO_CUOTA_D1 = 0.8; // avisa al superar el 80% del límite
 
+// Guardia en memoria: la comprobacion es cada 15 min (marca en settings), asi
+// que no hace falta leer settings en cada tick del cron por minuto.
+let CUOTA_D1_PROXIMA_COMPROBACION_MS = 0;
+
 async function comprobarCuotaD1SiToca(env) {
+  if (Date.now() < CUOTA_D1_PROXIMA_COMPROBACION_MS) return;
   if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID) {
     // Sin credenciales configuradas: no es un error, simplemente esta
     // comprobación está desactivada hasta que se configuren los
@@ -5562,8 +5591,12 @@ async function comprobarCuotaD1SiToca(env) {
       // por email llegaba tarde para servir de nada. 15 min reduce ese
       // margen sin disparar demasiadas llamadas a la API de Cloudflare
       // (esta llamada no consume cuota de D1, solo tráfico normal).
-      if (minutosDesde < 15) return;
+      if (minutosDesde < 15) {
+        CUOTA_D1_PROXIMA_COMPROBACION_MS = new Date(ultimaComprobacion.value).getTime() + 15 * 60000;
+        return;
+      }
     }
+    CUOTA_D1_PROXIMA_COMPROBACION_MS = Date.now() + 15 * 60000;
 
     // Guardamos la marca de "comprobado ahora" ANTES de llamar a la API
     // externa: si la llamada falla o tarda, no queremos que el próximo
