@@ -11594,6 +11594,13 @@ async function handlePrimary(request, env, ctx) {
           // (no gestiona noticias/crónicas/artículos), así que para él
           // también se degrada a la vista pública.
           const payload = await requireAuth(request, env);
+          // Si se envió credencial pero no es válida (sesión no replicada,
+          // JWT_SECRET distinto, caducada...) se responde 401 en vez de
+          // degradar EN SILENCIO a la vista pública: antes el panel mostraba
+          // la lista sin borradores ni noticias en revisión, sin ningún error.
+          if (!payload && (request.headers.get("Authorization") || "").startsWith("Bearer ")) {
+            return json({ error: "No autorizado" }, 401);
+          }
           if (!payload || !puedeGestionarContenidoEditorial(payload)) admin = false;
         }
 

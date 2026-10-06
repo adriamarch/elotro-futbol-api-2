@@ -506,6 +506,7 @@ export const DEPENDENCIAS_FK = {
   match_events: ["results"],
   alineaciones: ["results"],
   article_media: ["articles", "media"],
+  porras: ["readers", "results"],
   article_slug_redirects: ["articles"],
   comments: ["articles", "users", "readers"],
   reader_sessions: ["readers"],
