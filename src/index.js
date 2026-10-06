@@ -15734,7 +15734,7 @@ async function handlePrimary(request, env, ctx) {
           // el partido (aunque sea para dejarlo igual), ya lo está
           // "cubriendo" -- el aviso solo tiene sentido mientras nadie ha
           // vuelto a tocar el partido desde que lo cerró el cron.
-          `UPDATE results SET competicion=?, grupo=?, jornada=?, equipo_local=?, equipo_visitante=?, goles_local=?, goles_visitante=?, penaltis_local=?, penaltis_visitante=?, fecha_partido=?, estado=?, ubicacion=?, flashscore_url=?, escudo_local_url=?, escudo_visitante_url=?, fecha_partido_retrasado=?, finalizado_no_cubierto=0 WHERE id=?`
+          `UPDATE results SET competicion=?, grupo=?, jornada=?, equipo_local=?, equipo_visitante=?, goles_local=?, goles_visitante=?, penaltis_local=?, penaltis_visitante=?, fecha_partido=?, estado=?, ubicacion=?, flashscore_url=?, escudo_local_url=?, escudo_visitante_url=?, fecha_partido_retrasado=?, finalizado_no_cubierto=0, fuente='redaccion' WHERE id=?`
         ).bind(
           body.competicion, grupoAGuardarEdicion, body.jornada, body.equipo_local, body.equipo_visitante,
           body.goles_local ?? null, body.goles_visitante ?? null,
@@ -16813,7 +16813,7 @@ async function handlePrimary(request, env, ctx) {
         if (payload.rol !== "admin") return json({ error: "Solo un administrador puede recalcular jornadas" }, 403);
 
         const { results: partidos } = await env.DB.prepare(
-          `SELECT id, competicion, grupo, fecha_partido, jornada FROM results WHERE fuente = 'auto_api_football'`
+          `SELECT id, competicion, grupo, fecha_partido, jornada FROM results WHERE fuente LIKE 'auto%'`
         ).all();
 
         let actualizados = 0;
