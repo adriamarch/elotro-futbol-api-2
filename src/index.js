@@ -3595,6 +3595,21 @@ function contarBloquesHtmlFusion(html) {
   return bloques;
 }
 
+// Clave para comparar fotos: la misma foto de Cloudinary puede llegar con otra
+// transformación (w_900, f_auto...), otra versión (v123) o con query string, y
+// con la URL exacta no se detectaría como repetida. Para Cloudinary se compara
+// cuenta + public_id (sin extensión); para el resto, la URL sin query ni hash.
+function claveImagenFusion(url) {
+  const u = String(url ?? "").trim();
+  if (!u) return "";
+  const limpia = u.split(/[?#]/)[0];
+  const m = limpia.match(/^https?:\/\/res\.cloudinary\.com\/([^/]+)\/(?:image|video)\/upload\/(.+)$/i);
+  if (!m) return limpia.replace(/^http:/i, "https:");
+  const partes = m[2].split("/");
+  while (partes.length > 1 && (/^v\d+$/.test(partes[0]) || /^[a-z]{1,3}_[^/]+$/i.test(partes[0]) || partes[0].includes(","))) partes.shift();
+  return `${m[1]}/${partes.join("/").replace(/\.[a-z0-9]{2,4}$/i, "")}`;
+}
+
 function parseImagenesFusion(raw) {
   try { return normalizarImagenes(raw ? JSON.parse(raw) : []); } catch { return []; }
 }
@@ -3879,7 +3894,7 @@ function fusionarGrupoDePartido(base, otros, nombres) {
   // Las "al inicio" de las secciones que no abren la página pasan a ir justo
   // tras su <h2>. Los collages de cada sección cambian de grupo para no
   // mezclarse con los de otra.
-  const vistas = new Set([base.imagen_url].filter(Boolean));
+  const vistas = new Set([claveImagenFusion(base.imagen_url)].filter(Boolean));
   const todas = [];
   let portada = base.imagen_url || null;
   const ultima = secciones.length - 1;
@@ -3911,9 +3926,14 @@ function fusionarGrupoDePartido(base, otros, nombres) {
       if (g.posicion === "collage" && g.grupo && k > 0) g.grupo = `fusion${k}-${g.grupo}`;
       return g;
     });
-    for (const f of imgs) { if (!vistas.has(f.url)) { vistas.add(f.url); todas.push(f); } }
-    if (s.art !== base && s.art.imagen_url && !vistas.has(s.art.imagen_url)) {
-      vistas.add(s.art.imagen_url);
+    for (const f of imgs) {
+      const clave = claveImagenFusion(f.url);
+      if (clave && vistas.has(clave)) continue;
+      if (clave) vistas.add(clave);
+      todas.push(f);
+    }
+    if (s.art !== base && s.art.imagen_url && !vistas.has(claveImagenFusion(s.art.imagen_url))) {
+      vistas.add(claveImagenFusion(s.art.imagen_url));
       if (!portada) portada = s.art.imagen_url;
       else todas.push({ url: s.art.imagen_url, posicion: "personalizada", trasParrafo: off + 1, foco: "50% 50%" });
     }
@@ -12512,8 +12532,24 @@ async function handlePrimary(request, env, ctx) {
              WHERE am.article_id IN (${idsMedia.map(() => "?").join(",")})
              ORDER BY am.orden ASC`
           ).bind(...idsMedia).all();
+          // En una página fusionada, además, no se repite en la galería ninguna
+          // foto que ya salga en la portada o dentro del cuerpo (las fotos de
+          // cada sección ya llegan deduplicadas por fusionarGrupoDePartido).
+          const yaMostradas = new Set();
+          if (idsFusion) {
+            if (article.imagen_url) yaMostradas.add(claveImagenFusion(article.imagen_url));
+            const cuerpoImgs = Array.isArray(article.imagenes) ? article.imagenes : parseImagenesFusion(article.imagenes);
+            for (const f of cuerpoImgs) if (f && f.tipo !== "tweet") yaMostradas.add(claveImagenFusion(f.url));
+          }
           article.galeria_fotografo = (mediaArticulo || [])
-            .filter((m, i, arr) => m.tipo !== "video" && arr.findIndex((x) => x.cloudinary_url === m.cloudinary_url) === i)
+            .filter((m) => {
+              if (m.tipo === "video") return false;
+              const clave = claveImagenFusion(m.cloudinary_url);
+              if (!clave) return true;
+              if (yaMostradas.has(clave)) return false;
+              yaMostradas.add(clave);
+              return true;
+            })
             .map((m) => ({
               url: m.cloudinary_url,
               foco: "50% 50%",
