@@ -11675,7 +11675,27 @@ async function handlePrimary(request, env, ctx) {
         const form = await request.formData();
         const file = form.get("imagen");
         try {
-          const subida = await procesarSubidaArchivo(env, file, { permitirVideo: false });
+          // Si esta misma foto (mismo contenido, bit a bit) ya se subió antes
+          // desde una noticia, se reutiliza su URL en vez de subirla otra vez:
+          // con URLs distintas la fusión de previas/crónicas no podía saber
+          // que eran la misma foto y la mostraba repetida. Es un extra: si KV
+          // falla, se sube como siempre.
+          let hashImagen = null;
+          let bytesImagen = null;
+          if (env.ELOTROFUTBOL_KV && file && typeof file.arrayBuffer === "function" && !validarArchivoSubida(file, { permitirVideo: false })) {
+            try {
+              bytesImagen = await file.arrayBuffer();
+              hashImagen = await sha256Hex(bytesImagen);
+              const previa = await env.ELOTROFUTBOL_KV.get(`imghash:${hashImagen}`);
+              if (previa) return json({ url: previa, reutilizada: true });
+            } catch (err) {
+              console.error("[subir-imagen/dedupe] fallo al comprobar duplicado (se sube igualmente):", err);
+            }
+          }
+          const subida = await procesarSubidaArchivo(env, file, { permitirVideo: false }, bytesImagen || undefined);
+          if (env.ELOTROFUTBOL_KV && (hashImagen || subida.hash)) {
+            try { await env.ELOTROFUTBOL_KV.put(`imghash:${hashImagen || subida.hash}`, subida.url); } catch {}
+          }
           return json({ url: subida.url });
         } catch (err) {
           if (err.esValidacion) return json({ error: err.message }, 400);
@@ -13044,12 +13064,12 @@ async function handlePrimary(request, env, ctx) {
           // En una página fusionada, además, no se repite en la galería ninguna
           // foto que ya salga en la portada o dentro del cuerpo (las fotos de
           // cada sección ya llegan deduplicadas por fusionarGrupoDePartido).
+          // (Antes solo se hacía en las fusionadas; una misma foto en el cuerpo
+          // y en la galería del fotógrafo también salía repetida sin fusión.)
           const yaMostradas = new Set();
-          if (idsFusion) {
-            if (article.imagen_url) yaMostradas.add(claveImagenFusion(article.imagen_url));
-            const cuerpoImgs = Array.isArray(article.imagenes) ? article.imagenes : parseImagenesFusion(article.imagenes);
-            for (const f of cuerpoImgs) if (f && f.tipo !== "tweet") yaMostradas.add(claveImagenFusion(f.url));
-          }
+          if (article.imagen_url) yaMostradas.add(claveImagenFusion(article.imagen_url));
+          const cuerpoImgs = Array.isArray(article.imagenes) ? article.imagenes : parseImagenesFusion(article.imagenes);
+          for (const f of cuerpoImgs) if (f && f.tipo !== "tweet") yaMostradas.add(claveImagenFusion(f.url));
           article.galeria_fotografo = (mediaArticulo || [])
             .filter((m) => {
               if (m.tipo === "video") return false;
