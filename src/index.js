@@ -7486,6 +7486,20 @@ async function notificarIndexNow(env, urls) {
 async function notificarPushArticulo(env, articulo) {
   try {
     if (!articulo || !articulo.titulo || !articulo.slug) return;
+    // Una previa/crónica que se muestra fusionada con otra del mismo partido
+    // no es una noticia aparte: su enlace redirige a la fusionada, que ya
+    // avisó (o avisará) por su cuenta. No se manda un segundo aviso.
+    try {
+      const fila = await env.DB.prepare(
+        `SELECT id, tipo, resultado_id FROM articles WHERE slug = ?`
+      ).bind(articulo.slug).first();
+      if (fila && fila.resultado_id && FUSION_TIPOS.includes(fila.tipo)) {
+        const previa = await env.DB.prepare(
+          `SELECT 1 AS x FROM articles WHERE resultado_id = ? AND tipo = ? AND publicado = 1 AND id < ? LIMIT 1`
+        ).bind(fila.resultado_id, fila.tipo, fila.id).first();
+        if (previa) return;
+      }
+    } catch (e) { /* si falla la comprobación, se avisa como siempre */ }
     const imagen = typeof articulo.imagen_url === "string" && articulo.imagen_url.startsWith("https://") ? articulo.imagen_url : undefined;
     await pushEnviarATopico(env, "noticias", {
       titulo: pushRecortar(articulo.titulo, 100),
@@ -12503,7 +12517,17 @@ async function handlePrimary(request, env, ctx) {
           if (!slugExacto) query += SQL_OCULTAR_SEGUNDO_DE_FUSION;
         }
         if (slugExacto) { query += " AND slug = ?"; binds.push(slugExacto); }
-        if (categoria) { query += " AND categoria = ?"; binds.push(categoria); }
+        if (categoria) {
+          // Una previa/crónica fusionada sale en la categoría de TODAS sus
+          // partes (las demás están ocultas, así que si solo se mirase la
+          // categoría de la primera, desaparecería de las otras).
+          if (admin || slugExacto) {
+            query += " AND categoria = ?"; binds.push(categoria);
+          } else {
+            query += ` AND (categoria = ? OR (tipo IN ('previa', 'cronica') AND resultado_id IS NOT NULL AND EXISTS (SELECT 1 FROM articles c WHERE c.resultado_id = articles.resultado_id AND c.tipo = articles.tipo AND c.publicado = 1 AND c.id <> articles.id AND c.categoria = ?)))`;
+            binds.push(categoria, categoria);
+          }
+        }
         // "club" puede ser un único nombre en texto plano (caso normal) o
         // un array JSON de 2 clubes en texto (previa/crónica vinculada a
         // un resultado, ver resolverClubArticulo): se busca coincidencia
