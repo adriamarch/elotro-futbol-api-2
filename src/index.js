@@ -1751,7 +1751,7 @@ async function enviarBoletinSemanalSiToca(env) {
   }
 }
 
-async function enviarEmailNotificacion(env, { asunto, texto, html }, { destinatario } = {}) {
+async function enviarEmailNotificacion(env, { asunto, texto, html }, { destinatario, replyTo } = {}) {
   if (!cuentasResend(env).length) {
     console.log("RESEND_API_KEY no configurado: aviso por email omitido ->", asunto);
     return false;
@@ -1762,6 +1762,7 @@ async function enviarEmailNotificacion(env, { asunto, texto, html }, { destinata
       subject: asunto,
       text: texto,
       html: html || undefined,
+      ...(replyTo ? { reply_to: replyTo } : {}),
     });
     if (!resp || !resp.ok) {
       console.log("Error al enviar email de notificación:", resp && resp.status, resp ? await resp.text() : "");
@@ -2402,6 +2403,47 @@ const ACREDITACION_TIPOS_ACREDITACION = [
   "Cabina de prensa (si el club dispone de ella)",
 ];
 
+// Correo al solicitante cuando un admin aprueba o rechaza su acreditación:
+// resultado, datos de la solicitud y, si se aprueba, dónde y cuándo recogerla.
+// Es un extra: si falla, la resolución ya está guardada.
+async function enviarCorreoResolucionAcreditacion(env, a, estado, { recogida, mensaje } = {}) {
+  if (!a || !a.email) return false;
+  const aprobada = estado === "aprobada";
+  const nl2br = (t) => escapeHtmlEmail(t).replace(/\n/g, "<br>");
+  const filas = [
+    ["Nombre", a.nombre], ["Equipo", a.equipo], ["Evento", a.tipo_evento],
+    ["Acreditación", a.tipo_acreditacion], ["Jornada y partido", a.jornada_partido],
+  ].filter(([, v]) => v);
+  const asunto = aprobada
+    ? `Acreditación aprobada: ${a.equipo || "ElOtroFútbol"}${a.jornada_partido ? " · " + a.jornada_partido : ""}`
+    : `Sobre tu solicitud de acreditación: ${a.equipo || "ElOtroFútbol"}`;
+  const intro = aprobada
+    ? `Hola ${a.nombre || ""}, tu solicitud de acreditación ha sido APROBADA.`
+    : `Hola ${a.nombre || ""}, lamentamos comunicarte que tu solicitud de acreditación no ha podido ser aprobada en esta ocasión.`;
+  const cierre = aprobada
+    ? "Recuerda que la concesión final de la acreditación corresponde siempre al club organizador."
+    : "Puedes volver a solicitarla en el futuro desde el formulario. Gracias por tu interés en cubrir con ElOtroFútbol.";
+  const texto = [
+    intro, "",
+    ...filas.map(([k, v]) => `${k}: ${v}`),
+    ...(aprobada && recogida ? ["", "Dónde y cuándo recogerla:", recogida] : []),
+    ...(mensaje ? ["", aprobada ? "Instrucciones:" : "Motivo / mensaje:", mensaje] : []),
+    "", cierre, "", "Equipo de ElOtroFútbol",
+  ].join("\n");
+  const color = aprobada ? "#1b7f3b" : "#c62828";
+  const html = `<div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;color:#1f2937;line-height:1.5;">
+<div style="background:${color};color:#fff;padding:14px 18px;border-radius:10px 10px 0 0;font-weight:700;font-size:16px;">${aprobada ? "✔ Acreditación aprobada" : "✖ Solicitud no aprobada"}</div>
+<div style="border:1px solid #e5e7eb;border-top:0;border-radius:0 0 10px 10px;padding:18px;">
+<p style="margin-top:0;">${escapeHtmlEmail(intro)}</p>
+<table style="border-collapse:collapse;width:100%;font-size:14px;">${filas.map(([k, v]) => `<tr><td style="padding:6px 10px 6px 0;color:#6b7280;white-space:nowrap;vertical-align:top;">${escapeHtmlEmail(k)}</td><td style="padding:6px 0;font-weight:600;">${escapeHtmlEmail(v)}</td></tr>`).join("")}</table>
+${aprobada && recogida ? `<div style="margin-top:14px;padding:12px 14px;background:#f0fdf4;border-left:4px solid ${color};border-radius:6px;"><strong>Dónde y cuándo recogerla</strong><br>${nl2br(recogida)}</div>` : ""}
+${mensaje ? `<div style="margin-top:14px;padding:12px 14px;background:#f3f4f6;border-radius:6px;"><strong>${aprobada ? "Instrucciones" : "Motivo / mensaje"}</strong><br>${nl2br(mensaje)}</div>` : ""}
+<p style="margin-top:16px;font-size:13px;color:#4b5563;">${escapeHtmlEmail(cierre)}</p>
+<p style="margin-bottom:0;font-size:13px;color:#4b5563;">Equipo de ElOtroFútbol · Puedes responder a este correo.</p>
+</div></div>`;
+  return enviarEmailNotificacion(env, { asunto, texto, html }, { destinatario: a.email, replyTo: EMAIL_NOTIFICACIONES });
+}
+
 // ---------- Configuración editable del formulario de acreditaciones ----------
 // Un admin puede cambiar textos y listas desde Solicitudes > Acreditaciones.
 // Se guarda como JSON en settings (clave "acreditacion_config"); sin nada
@@ -2415,6 +2457,10 @@ const ACREDITACION_CONFIG_DEFECTO = {
   gracias: "Hemos recibido tu solicitud de acreditación. El equipo de administración la revisará y se pondrá en contacto contigo por correo.",
   eventos: ["Rueda de prensa", "Partido de fútbol", "Presentación oficial", "Acto"],
   evento_otro: true,
+  // Textos por defecto del correo que se envía al solicitante al aprobar su
+  // solicitud (se pueden cambiar en cada solicitud antes de enviarlo).
+  recogida: "",
+  instrucciones_aprobada: "Lleva contigo tu DNI / NIE y presenta este correo si te lo piden.",
   acreditaciones: [...ACREDITACION_TIPOS_ACREDITACION],
   secciones: {
     solicitante: "Datos del solicitante",
@@ -2484,6 +2530,8 @@ function normalizarConfigAcreditacion(raw) {
     aviso: texto(r.aviso, d.aviso, 800),
     confirmacion: texto(r.confirmacion, d.confirmacion, 600),
     gracias: texto(r.gracias, d.gracias, 600),
+    recogida: typeof r.recogida === "string" ? r.recogida.replace(/\r/g, "").trim().slice(0, 600) : d.recogida,
+    instrucciones_aprobada: typeof r.instrucciones_aprobada === "string" ? r.instrucciones_aprobada.replace(/\r/g, "").trim().slice(0, 800) : d.instrucciones_aprobada,
     eventos,
     evento_otro: eventoOtro,
     acreditaciones,
@@ -8106,6 +8154,10 @@ export default {
       const cfgPublica = await obtenerConfigAcreditacion(env);
       let pinLongitud = null;
       try { const p = await obtenerPinAcreditacion(env); if (p) pinLongitud = p.length; } catch {}
+      // Los datos de recogida del correo de aprobación son internos: solo los ve un admin.
+      let esAdminCfg = false;
+      try { const pl = await requireAuth(request, env); esAdminCfg = !!(pl && pl.rol === "admin"); } catch {}
+      if (!esAdminCfg) { delete cfgPublica.recogida; delete cfgPublica.instrucciones_aprobada; }
       // Solo se expone cuántos dígitos tiene el PIN (para pintar las casillas), nunca el PIN.
       return json({ ...cfgPublica, pin_longitud: pinLongitud });
     }
@@ -10849,7 +10901,7 @@ async function handlePrimary(request, env, ctx) {
           return json({ error: "Estado no válido" }, 400);
         }
         const nota = (body.nota_admin ? String(body.nota_admin) : "").trim().slice(0, 1000);
-        const existente = await env.DB.prepare("SELECT id, nombre FROM acreditaciones WHERE id = ?").bind(id).first();
+        const existente = await env.DB.prepare("SELECT id, nombre, email, equipo, tipo_evento, tipo_acreditacion, jornada_partido, estado FROM acreditaciones WHERE id = ?").bind(id).first();
         if (!existente) return json({ error: "Solicitud no encontrada" }, 404);
         if (editaDatos) {
           const v = limpiarDatosAcreditacionAdmin(body.datos);
@@ -10879,7 +10931,24 @@ async function handlePrimary(request, env, ctx) {
           entidad_id: id,
           descripcion: `Acreditación de ${existente.nombre} marcada como ${estado}`,
         });
-        return json({ ok: true });
+        // Correo al solicitante: solo si de verdad cambia a aprobada/rechazada
+        // (guardar solo la nota no reenvía nada) y el admin no lo desactiva.
+        let correo = "omitido";
+        if ((estado === "aprobada" || estado === "rechazada") && existente.estado !== estado && body.enviar_correo !== false) {
+          try {
+            const cfgC = await obtenerConfigAcreditacion(env);
+            const limpiar = (v, d) => (typeof v === "string" ? v.replace(/\r/g, "").trim().slice(0, 800) : d);
+            const ok = await enviarCorreoResolucionAcreditacion(env, existente, estado, {
+              recogida: limpiar(body.recogida, cfgC.recogida),
+              mensaje: limpiar(body.mensaje, estado === "aprobada" ? cfgC.instrucciones_aprobada : ""),
+            });
+            correo = ok ? "enviado" : "no_enviado";
+          } catch (err) {
+            console.error("[acreditaciones/correo-resolucion]", err);
+            correo = "no_enviado";
+          }
+        }
+        return json({ ok: true, correo });
       }
 
       if (path.match(/^\/api\/acreditaciones\/\d+$/) && method === "DELETE") {
