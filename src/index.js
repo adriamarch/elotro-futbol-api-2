@@ -2365,6 +2365,14 @@ async function limiteExcedido(request, env, accion, max, ventanaSeg, extra = "")
   }
 }
 
+// Tipos de acreditación que acepta el formulario público (acreditacion.html).
+// Deben coincidir con las opciones de esa página.
+const ACREDITACION_TIPOS_ACREDITACION = [
+  "Prensa / Pupitre",
+  "Fotógrafo / Césped",
+  "Cabina de prensa (si el club dispone de ella)",
+];
+
 const RESPUESTA_DEMASIADOS_INTENTOS = "Demasiados intentos. Espera unos minutos y vuelve a probar.";
 // Sal ficticia para gastar el mismo tiempo de PBKDF2 cuando el usuario no
 // existe (evita enumerar usuarios midiendo el tiempo de respuesta).
@@ -7935,6 +7943,82 @@ export default {
       }
     }
 
+    // ---------- Acreditaciones: formulario público (acreditacion.html) ----------
+    // Cualquier persona con el enlace puede solicitar acreditación para
+    // cubrir un partido, rueda de prensa o acto. No requiere sesión. Se
+    // guarda en la tabla "acreditaciones" y solo los administradores
+    // pueden verla (pestaña Funcionalidades > Acreditaciones del panel).
+    if (path === "/api/acreditaciones" && method === "POST") {
+      if (await limiteExcedido(request, env, "acreditacion", 10, 3600)) {
+        return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+      }
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ error: "JSON inválido" }, 400);
+      }
+      body = body || {};
+      // Campo trampa para bots: un humano nunca lo ve ni lo rellena.
+      if (body.web) return json({ ok: true });
+
+      const limpiar = (v, max) => (v ? String(v) : "").replace(/\s+/g, " ").trim().slice(0, max);
+      const nombre = limpiar(body.nombre, 200);
+      const email = limpiar(body.email, 200).toLowerCase();
+      const dni = limpiar(body.dni, 30).replace(/[\s.-]/g, "").toUpperCase();
+      const equipo = limpiar(body.equipo, 200);
+      const tipoEvento = limpiar(body.tipo_evento, 200);
+      const tipoAcreditacion = limpiar(body.tipo_acreditacion, 200);
+      const funciones = (body.funciones ? String(body.funciones) : "").trim().slice(0, 2000);
+      const jornadaPartido = limpiar(body.jornada_partido, 500);
+      const TIPOS_ACREDITACION = ACREDITACION_TIPOS_ACREDITACION;
+
+      if (!nombre) return json({ error: "Indica tu nombre y apellidos" }, 400);
+      if (!emailValido(email)) return json({ error: "Introduce un correo electrónico válido" }, 400);
+      if (!dni || dni.length < 5 || !/^[A-Z0-9]+$/.test(dni)) return json({ error: "Introduce un DNI / NIE válido" }, 400);
+      if (!equipo) return json({ error: "Indica el equipo que deseas cubrir" }, 400);
+      if (!tipoEvento) return json({ error: "Indica el tipo de evento" }, 400);
+      if (!TIPOS_ACREDITACION.includes(tipoAcreditacion)) return json({ error: "Elige un tipo de acreditación" }, 400);
+      if (!funciones) return json({ error: "Describe las funciones que realizarás durante la cobertura" }, 400);
+      if (!jornadaPartido) return json({ error: "Indica la jornada y el partido que quieres cubrir" }, 400);
+      if (body.confirmo !== true) return json({ error: "Debes confirmar que los datos son correctos" }, 400);
+
+      try {
+        await env.DB.prepare(
+          `INSERT INTO acreditaciones
+             (nombre, email, dni, equipo, tipo_evento, tipo_acreditacion, funciones, jornada_partido, confirmado)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`
+        ).bind(nombre, email, dni, equipo, tipoEvento, tipoAcreditacion, funciones, jornadaPartido).run();
+      } catch (err) {
+        console.error("[acreditaciones/crear]", err);
+        return json({ error: "No se pudo enviar la solicitud. Inténtalo de nuevo en unos minutos." }, 500);
+      }
+
+      // Aviso por correo al equipo: es un extra, si falla la solicitud ya está guardada.
+      try {
+        await enviarEmailNotificacion(env, {
+          asunto: `Nueva solicitud de acreditación: ${nombre} (${equipo})`,
+          texto: [
+            `Nombre: ${nombre}`, `Correo: ${email}`, `Equipo: ${equipo}`,
+            `Evento: ${tipoEvento}`, `Acreditación: ${tipoAcreditacion}`,
+            `Jornada y partido: ${jornadaPartido}`, "",
+            "Puedes verla y gestionarla en el panel de administración (Funcionalidades > Acreditaciones).",
+          ].join("\n"),
+          html: `<p>Nueva solicitud de acreditación recibida.</p>
+<p><strong>Nombre:</strong> ${escapeHtmlEmail(nombre)}<br>
+<strong>Correo:</strong> ${escapeHtmlEmail(email)}<br>
+<strong>Equipo:</strong> ${escapeHtmlEmail(equipo)}<br>
+<strong>Evento:</strong> ${escapeHtmlEmail(tipoEvento)}<br>
+<strong>Acreditación:</strong> ${escapeHtmlEmail(tipoAcreditacion)}<br>
+<strong>Jornada y partido:</strong> ${escapeHtmlEmail(jornadaPartido)}</p>
+<p>Puedes verla y gestionarla en el panel de administración (Funcionalidades &gt; Acreditaciones).</p>`,
+        });
+      } catch (err) {
+        console.error("[acreditaciones/aviso-email]", err);
+      }
+      return json({ ok: true });
+    }
+
     // ---------- Contacto de prensa ----------
     // Formulario público (página contacto.html): no requiere autenticación,
     // pero sí validación básica para no ser un vector fácil de spam/abuso.
@@ -10449,6 +10533,55 @@ async function handlePrimary(request, env, ctx) {
           ultimo_envio_at: ultimoEnvioAt,
           proximo_envio_at: proximoEnvioAt || (ultimoEnvioAt ? null : new Date().toISOString()),
         });
+      }
+
+      // ---------- ACREDITACIONES: bandeja del panel (solo admins) ----------
+      if (path === "/api/acreditaciones" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver las acreditaciones" }, 403);
+        const { results } = await env.DB.prepare(
+          `SELECT id, nombre, email, dni, equipo, tipo_evento, tipo_acreditacion, funciones,
+                  jornada_partido, estado, nota_admin, revisado_por, revisado_at, created_at
+           FROM acreditaciones ORDER BY created_at DESC, id DESC LIMIT 2000`
+        ).all();
+        return json({ acreditaciones: results || [] });
+      }
+
+      if (path.match(/^\/api\/acreditaciones\/\d+$/) && method === "PATCH") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede gestionar las acreditaciones" }, 403);
+        const id = Number(path.split("/").pop());
+        const body = await request.json().catch(() => ({}));
+        const estado = String(body.estado || "");
+        if (!["pendiente", "aprobada", "rechazada"].includes(estado)) {
+          return json({ error: "Estado no válido" }, 400);
+        }
+        const nota = (body.nota_admin ? String(body.nota_admin) : "").trim().slice(0, 1000);
+        const existente = await env.DB.prepare("SELECT id, nombre FROM acreditaciones WHERE id = ?").bind(id).first();
+        if (!existente) return json({ error: "Solicitud no encontrada" }, 404);
+        await env.DB.prepare(
+          `UPDATE acreditaciones
+             SET estado = ?, nota_admin = ?, revisado_por = ?, revisado_at = datetime('now'), updated_at = datetime('now')
+           WHERE id = ?`
+        ).bind(estado, nota || null, payload.nombre || null, id).run();
+        await registrarActividad(env, request, payload, {
+          accion: "acreditacion_" + estado,
+          entidad: "acreditacion",
+          entidad_id: id,
+          descripcion: `Acreditación de ${existente.nombre} marcada como ${estado}`,
+        });
+        return json({ ok: true });
+      }
+
+      if (path.match(/^\/api\/acreditaciones\/\d+$/) && method === "DELETE") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede eliminar acreditaciones" }, 403);
+        const id = Number(path.split("/").pop());
+        await env.DB.prepare("DELETE FROM acreditaciones WHERE id = ?").bind(id).run();
+        return json({ ok: true });
       }
 
       if (path.match(/^\/api\/newsletter\/suscriptores\/\d+$/) && method === "DELETE") {

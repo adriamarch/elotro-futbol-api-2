@@ -338,6 +338,15 @@ export const TABLES = [
     syncMode: "authoritative", // D1 es la autoridad; tabla pequeña
   },
   {
+    name: "acreditaciones",
+    pk: ["id"],
+    order: 30,
+    changeStrategy: "updated_at",
+    cursorColumn: "updated_at",
+    deleteDetection: true, // el panel permite eliminar solicitudes
+    syncMode: "authoritative", // D1 es la autoridad; tabla pequeña
+  },
+  {
     // ---------------------------------------------------------------
     // FASE 2 (paridad de datos del failover): push_subscriptions y las 5
     // tablas de votaciones internas. Esquema en db/migrations/036 y 039.

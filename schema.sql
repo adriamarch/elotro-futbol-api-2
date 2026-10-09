@@ -790,3 +790,26 @@ CREATE TABLE noticias_rapidas (
 );
 CREATE INDEX idx_noticias_rapidas_created ON noticias_rapidas(created_at DESC);
 CREATE INDEX idx_noticias_rapidas_autor ON noticias_rapidas(autor_id);
+
+-- Solicitudes de acreditación (formulario público acreditacion.html).
+-- Ver worker/migracion_acreditaciones.sql.
+CREATE TABLE IF NOT EXISTS acreditaciones (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  nombre TEXT NOT NULL,
+  email TEXT NOT NULL,
+  dni TEXT NOT NULL,
+  equipo TEXT NOT NULL,
+  tipo_evento TEXT NOT NULL,
+  tipo_acreditacion TEXT NOT NULL,
+  funciones TEXT NOT NULL,
+  jornada_partido TEXT NOT NULL,
+  confirmado INTEGER NOT NULL DEFAULT 1,
+  estado TEXT NOT NULL DEFAULT 'pendiente',
+  nota_admin TEXT,
+  revisado_por TEXT,
+  revisado_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_acreditaciones_created ON acreditaciones(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_acreditaciones_estado ON acreditaciones(estado);
