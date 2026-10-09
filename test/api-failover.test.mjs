@@ -54,10 +54,10 @@ function createHarness(fetchImpl, { secondaryUrl = "https://secondary.example.te
 }
 
 // PRIMARY_API es una const fijada por config.js al valor real de producción
-// (elotrofutbol-api...workers.dev). No se puede reasignar desde el test, así
+// (api.elotrofutbol.media). No se puede reasignar desde el test, así
 // que en vez de sustituirla, cada test usa esa URL real como "primaria" y
 // hace que el fetchImpl responda según el host recibido.
-const PRIMARY = "https://elotrofutbol-api.adriamarch2010.workers.dev";
+const PRIMARY = "https://api.elotrofutbol.media";
 const SECONDARY = "https://secondary.example.test";
 
 test("GET: error de red en primaria hace failover a secundaria", async () => {
@@ -98,15 +98,30 @@ test("GET: 401 no hace failover", async () => {
   assert.equal(calls[0], `${PRIMARY}/api/me`);
 });
 
-test("GET: 404 no hace failover", async () => {
+test("GET: 404 JSON de la app (no existe) no hace failover", async () => {
   const calls = [];
   const ctx = createHarness(async (url) => {
     calls.push(String(url));
-    return new Response("not found", { status: 404 });
+    return new Response(JSON.stringify({ error: "No encontrado" }), {
+      status: 404,
+      headers: { "Content-Type": "application/json" },
+    });
   });
   const response = await vm.runInContext(`apiFetch("/api/missing")`, ctx);
   assert.equal(response.status, 404);
   assert.deepEqual(calls, [`${PRIMARY}/api/missing`]);
+});
+
+test("GET: 404 sin JSON (Cloudflare, worker caído) SÍ hace failover", async () => {
+  const calls = [];
+  const ctx = createHarness(async (url) => {
+    calls.push(String(url));
+    if (String(url).startsWith(PRIMARY)) return new Response("not found", { status: 404 });
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+  });
+  const response = await vm.runInContext(`apiFetch("/api/articles")`, ctx);
+  assert.equal(response.status, 200);
+  assert.deepEqual(calls, [`${PRIMARY}/api/articles`, `${SECONDARY}/api/articles`]);
 });
 
 test("GET: 502/503/504 de primaria hacen failover a secundaria", async () => {

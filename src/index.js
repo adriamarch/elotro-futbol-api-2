@@ -8068,7 +8068,7 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
       // guardado en requestParaFailover conserva su stream intacto pase
       // lo que pase dentro de handlePrimary.
       requestParaFailover = request.clone();
-      const primaryResponse = await handlePrimary(
+      const primaryResponse = await handlePrimaryConCache(
         request,
         env,
         ctx
@@ -8565,6 +8565,82 @@ async function fetchRailway(
  * Todo tu código actual debe ejecutarse desde esta función.
  * ================================================================
  */
+
+// ---------- Cache corta de GET publicos (por isolate) ----------
+// Los listados y fichas publicas (portada, categorias, noticia...) se piden
+// muchisimo mas de lo que cambian y cada peticion leia D1 entera. Aqui se
+// guarda unos segundos el JSON ya serializado de las rutas GET publicas
+// cuya respuesta NO depende de quien pregunta (verificado ruta por ruta:
+// ninguna usa requireAuth en su version publica ni escribe en la base de
+// datos). Reglas de seguridad:
+//   - Solo peticiones SIN cabecera Authorization: el panel (editores,
+//     borradores, vista admin) nunca pasa por esta cache.
+//   - Solo respuestas 200 JSON "no-store" generadas por json().
+//   - Cualquier escritura (POST/PUT/PATCH/DELETE a /api/) vacia la cache de
+//     ese isolate; en los demas isolates la frescura maxima es el TTL.
+const CACHE_PUBLICA_TTL_MS = {
+  "/api/articles": 15000,
+  "/api/articles/banner-urgente": 10000,
+  "/api/noticias-rapidas": 15000,
+  "/api/polls/portada": 15000,
+  "/api/settings": 60000,
+  "/api/club-info": 60000,
+  "/api/media/publica": 30000,
+};
+const CACHE_PUBLICA = new Map(); // clave -> { exp, texto }
+const CACHE_PUBLICA_MAX = 200;
+const CACHE_PUBLICA_MAX_BYTES = 512 * 1024;
+
+function ttlCachePublica(request, url) {
+  if (request.method !== "GET") return 0;
+  if (request.headers.get("Authorization")) return 0;
+  if (request.headers.get("X-Write-Id")) return 0;
+  const p = url.pathname;
+  if (p === "/api/articles" && url.searchParams.get("admin") === "1") return 0;
+  if (Object.prototype.hasOwnProperty.call(CACHE_PUBLICA_TTL_MS, p)) return CACHE_PUBLICA_TTL_MS[p];
+  // Ficha de noticia: /api/articles/:slug (la version sin sesion solo
+  // devuelve noticias publicadas; el borrador del autor exige Authorization).
+  if (/^\/api\/articles\/[^/]+$/.test(p)) return 15000;
+  return 0;
+}
+
+async function handlePrimaryConCache(request, env, ctx) {
+  const url = new URL(request.url);
+  const ttl = ttlCachePublica(request, url);
+  if (!ttl) {
+    if (request.method !== "GET" && request.method !== "HEAD" && url.pathname.startsWith("/api/")) {
+      CACHE_PUBLICA.clear();
+    }
+    return handlePrimary(request, env, ctx);
+  }
+  const clave = url.pathname + url.search;
+  const ahora = Date.now();
+  const e = CACHE_PUBLICA.get(clave);
+  if (e && e.exp > ahora) {
+    return cors(new Response(e.texto, {
+      status: 200,
+      headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+    }), ORIGEN_PETICION_ACTUAL);
+  }
+  const resp = await handlePrimary(request, env, ctx);
+  try {
+    if (
+      resp.status === 200 &&
+      (resp.headers.get("Content-Type") || "").startsWith("application/json") &&
+      resp.headers.get("Cache-Control") === "no-store"
+    ) {
+      const texto = await resp.clone().text();
+      if (texto.length <= CACHE_PUBLICA_MAX_BYTES) {
+        if (CACHE_PUBLICA.size >= CACHE_PUBLICA_MAX) {
+          for (const [k, v] of CACHE_PUBLICA) { if (v.exp <= ahora) CACHE_PUBLICA.delete(k); }
+          if (CACHE_PUBLICA.size >= CACHE_PUBLICA_MAX) CACHE_PUBLICA.clear();
+        }
+        CACHE_PUBLICA.set(clave, { exp: ahora + ttl, texto });
+      }
+    }
+  } catch { /* si no se puede guardar, se sirve igual la respuesta normal */ }
+  return resp;
+}
 
 async function handlePrimary(request, env, ctx) {
 
