@@ -39,6 +39,9 @@ const METODOS_ESCRITURA = new Set(["POST", "PUT", "DELETE", "PATCH"]);
 // contraseña en texto plano hacia una cola de reintentos).
 const RUTAS_EXCLUIDAS = new Set([
   "/api/login",
+  // Solo comprueba el PIN del formulario de acreditaciones: nada que reproducir
+  // y evitaría guardar el PIN en la cola de reintentos.
+  "/api/acreditaciones/pin",
   "/api/forgot-password",
   "/api/forgot-password/confirmar",
   // Login/logout de lectores: mismo motivo que "/api/login" de arriba

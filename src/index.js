@@ -2365,6 +2365,35 @@ async function limiteExcedido(request, env, accion, max, ventanaSeg, extra = "")
   }
 }
 
+// PIN de acceso al formulario público de acreditaciones. Se guarda en
+// settings (clave "acreditacion_pin") y lo gestiona un admin desde
+// Funcionalidades > Acreditaciones. Sin PIN configurado el formulario
+// queda cerrado; la primera vez que un admin abre esa pestaña se genera uno.
+const ACREDITACION_PIN_KEY = "acreditacion_pin";
+function validarPinAcreditacion(pin) {
+  return typeof pin === "string" && /^\d{4,8}$/.test(pin);
+}
+function generarPinAcreditacion() {
+  const arr = new Uint32Array(1);
+  crypto.getRandomValues(arr);
+  return String(arr[0] % 1000000).padStart(6, "0");
+}
+async function obtenerPinAcreditacion(env) {
+  const row = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind(ACREDITACION_PIN_KEY).first();
+  return row && row.value ? String(row.value) : null;
+}
+async function guardarPinAcreditacion(env, pin) {
+  await env.DB.prepare(
+    "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+  ).bind(ACREDITACION_PIN_KEY, pin).run();
+}
+function pinAcreditacionCorrecto(esperado, recibido) {
+  if (!esperado || typeof recibido !== "string" || recibido.length !== esperado.length) return false;
+  let diff = 0;
+  for (let i = 0; i < esperado.length; i++) diff |= esperado.charCodeAt(i) ^ recibido.charCodeAt(i);
+  return diff === 0;
+}
+
 // Tipos de acreditación que acepta el formulario público (acreditacion.html).
 // Deben coincidir con las opciones de esa página.
 const ACREDITACION_TIPOS_ACREDITACION = [
@@ -7948,6 +7977,20 @@ export default {
     // cubrir un partido, rueda de prensa o acto. No requiere sesión. Se
     // guarda en la tabla "acreditaciones" y solo los administradores
     // pueden verla (pestaña Funcionalidades > Acreditaciones del panel).
+    // Comprobación del PIN al entrar al formulario (acreditacion.html).
+    if (path === "/api/acreditaciones/pin" && method === "POST") {
+      if (await limiteExcedido(request, env, "acreditacion-pin", 10, 900)) {
+        return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+      }
+      const body = await request.json().catch(() => ({}));
+      const esperado = await obtenerPinAcreditacion(env);
+      if (!esperado) return json({ error: "El formulario de acreditación no está disponible todavía." }, 503);
+      if (!pinAcreditacionCorrecto(esperado, String((body && body.pin) || "").trim())) {
+        return json({ error: "PIN incorrecto" }, 401);
+      }
+      return json({ ok: true });
+    }
+
     if (path === "/api/acreditaciones" && method === "POST") {
       if (await limiteExcedido(request, env, "acreditacion", 10, 3600)) {
         return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
@@ -7961,6 +8004,13 @@ export default {
       body = body || {};
       // Campo trampa para bots: un humano nunca lo ve ni lo rellena.
       if (body.web) return json({ ok: true });
+
+      // Sin el PIN correcto no se acepta ninguna solicitud (aunque se salten la pantalla del PIN).
+      const pinEsperado = await obtenerPinAcreditacion(env);
+      if (!pinEsperado) return json({ error: "El formulario de acreditación no está disponible todavía." }, 503);
+      if (!pinAcreditacionCorrecto(pinEsperado, String(body.pin || "").trim())) {
+        return json({ error: "PIN incorrecto" }, 401);
+      }
 
       const limpiar = (v, max) => (v ? String(v) : "").replace(/\s+/g, " ").trim().slice(0, max);
       const nombre = limpiar(body.nombre, 200);
@@ -10533,6 +10583,32 @@ async function handlePrimary(request, env, ctx) {
           ultimo_envio_at: ultimoEnvioAt,
           proximo_envio_at: proximoEnvioAt || (ultimoEnvioAt ? null : new Date().toISOString()),
         });
+      }
+
+      // ---------- ACREDITACIONES: PIN de acceso al formulario (solo admins) ----------
+      if (path === "/api/acreditaciones/pin" && (method === "GET" || method === "PUT")) {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede gestionar el PIN" }, 403);
+        let pin = await obtenerPinAcreditacion(env);
+        if (method === "PUT") {
+          const body = await request.json().catch(() => ({}));
+          const pedido = body && body.pin !== undefined && body.pin !== null && body.pin !== "" ? String(body.pin).trim() : null;
+          if (pedido !== null && !validarPinAcreditacion(pedido)) {
+            return json({ error: "El PIN debe tener entre 4 y 8 dígitos" }, 400);
+          }
+          pin = pedido !== null ? pedido : generarPinAcreditacion();
+          await guardarPinAcreditacion(env, pin);
+          await registrarActividad(env, request, payload, {
+            accion: "acreditacion_pin",
+            entidad: "acreditacion",
+            descripcion: "Cambiado el PIN de acceso al formulario de acreditaciones",
+          });
+        } else if (!pin) {
+          pin = generarPinAcreditacion();
+          await guardarPinAcreditacion(env, pin);
+        }
+        return json({ pin });
       }
 
       // ---------- ACREDITACIONES: bandeja del panel (solo admins) ----------
