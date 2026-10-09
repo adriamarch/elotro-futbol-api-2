@@ -2367,7 +2367,7 @@ async function limiteExcedido(request, env, accion, max, ventanaSeg, extra = "")
 
 // PIN de acceso al formulario público de acreditaciones. Se guarda en
 // settings (clave "acreditacion_pin") y lo gestiona un admin desde
-// Funcionalidades > Acreditaciones. Sin PIN configurado el formulario
+// Solicitudes > Acreditaciones. Sin PIN configurado el formulario
 // queda cerrado; la primera vez que un admin abre esa pestaña se genera uno.
 const ACREDITACION_PIN_KEY = "acreditacion_pin";
 function validarPinAcreditacion(pin) {
@@ -2403,7 +2403,7 @@ const ACREDITACION_TIPOS_ACREDITACION = [
 ];
 
 // ---------- Configuración editable del formulario de acreditaciones ----------
-// Un admin puede cambiar textos y listas desde Funcionalidades > Acreditaciones.
+// Un admin puede cambiar textos y listas desde Solicitudes > Acreditaciones.
 // Se guarda como JSON en settings (clave "acreditacion_config"); sin nada
 // guardado se usan los valores por defecto (los de siempre).
 const ACREDITACION_CONFIG_KEY = "acreditacion_config";
@@ -8100,7 +8100,7 @@ export default {
     // Cualquier persona con el enlace puede solicitar acreditación para
     // cubrir un partido, rueda de prensa o acto. No requiere sesión. Se
     // guarda en la tabla "acreditaciones" y solo los administradores
-    // pueden verla (pestaña Funcionalidades > Acreditaciones del panel).
+    // pueden verla (pestaña Solicitudes > Acreditaciones del panel).
     // Configuración pública del formulario (textos y listas editables desde el panel).
     if (path === "/api/acreditaciones/config" && method === "GET") {
       const cfgPublica = await obtenerConfigAcreditacion(env);
@@ -8190,7 +8190,7 @@ export default {
             `Nombre: ${nombre}`, `Correo: ${email}`, `Equipo: ${equipo}`,
             `Evento: ${tipoEvento}`, `Acreditación: ${tipoAcreditacion}`,
             `Jornada y partido: ${jornadaPartido}`, "",
-            "Puedes verla y gestionarla en el panel de administración (Funcionalidades > Acreditaciones).",
+            "Puedes verla y gestionarla en el panel de administración (Solicitudes > Acreditaciones).",
           ].join("\n"),
           html: `<p>Nueva solicitud de acreditación recibida.</p>
 <p><strong>Nombre:</strong> ${escapeHtmlEmail(nombre)}<br>
@@ -8199,7 +8199,7 @@ export default {
 <strong>Evento:</strong> ${escapeHtmlEmail(tipoEvento)}<br>
 <strong>Acreditación:</strong> ${escapeHtmlEmail(tipoAcreditacion)}<br>
 <strong>Jornada y partido:</strong> ${escapeHtmlEmail(jornadaPartido)}</p>
-<p>Puedes verla y gestionarla en el panel de administración (Funcionalidades &gt; Acreditaciones).</p>`,
+<p>Puedes verla y gestionarla en el panel de administración (Solicitudes &gt; Acreditaciones).</p>`,
         });
       } catch (err) {
         console.error("[acreditaciones/aviso-email]", err);
