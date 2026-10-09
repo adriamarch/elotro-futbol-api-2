@@ -2402,6 +2402,90 @@ const ACREDITACION_TIPOS_ACREDITACION = [
   "Cabina de prensa (si el club dispone de ella)",
 ];
 
+// ---------- Configuración editable del formulario de acreditaciones ----------
+// Un admin puede cambiar textos y listas desde Funcionalidades > Acreditaciones.
+// Se guarda como JSON en settings (clave "acreditacion_config"); sin nada
+// guardado se usan los valores por defecto (los de siempre).
+const ACREDITACION_CONFIG_KEY = "acreditacion_config";
+const ACREDITACION_CONFIG_DEFECTO = {
+  titulo: "Formulario de acreditación | ElOtroFútbol",
+  intro: "Solicita tu acreditación para cubrir partidos, ruedas de prensa y actos oficiales de Primera Federación y Segunda Federación.",
+  aviso: "Las solicitudes serán revisadas por el equipo de administración. El envío del formulario no garantiza la concesión de la acreditación, ya que la decisión final corresponde al club organizador.",
+  confirmacion: "Confirmo que los datos facilitados son correctos y entiendo que el envío de esta solicitud no garantiza la concesión de la acreditación.",
+  gracias: "Hemos recibido tu solicitud de acreditación. El equipo de administración la revisará y se pondrá en contacto contigo por correo.",
+  eventos: ["Rueda de prensa", "Partido de fútbol", "Presentación oficial", "Acto"],
+  evento_otro: true,
+  acreditaciones: [...ACREDITACION_TIPOS_ACREDITACION],
+};
+function normalizarConfigAcreditacion(raw) {
+  const d = ACREDITACION_CONFIG_DEFECTO;
+  const r = raw && typeof raw === "object" ? raw : {};
+  const texto = (v, def, max) => {
+    const t = typeof v === "string" ? v.replace(/\r/g, "").trim().slice(0, max) : "";
+    return t || def;
+  };
+  const lista = (v, def) => {
+    if (!Array.isArray(v)) return [...def];
+    const vistos = new Set();
+    const out = [];
+    for (const x of v) {
+      const t = String(x == null ? "" : x).replace(/\s+/g, " ").trim().slice(0, 150);
+      if (t && !vistos.has(t.toLowerCase())) { vistos.add(t.toLowerCase()); out.push(t); }
+      if (out.length >= 20) break;
+    }
+    return out;
+  };
+  let eventos = lista(r.eventos, d.eventos);
+  const eventoOtro = r.evento_otro === undefined ? d.evento_otro : r.evento_otro === true;
+  if (!eventos.length && !eventoOtro) eventos = [...d.eventos];
+  let acreditaciones = lista(r.acreditaciones, d.acreditaciones);
+  if (!acreditaciones.length) acreditaciones = [...d.acreditaciones];
+  return {
+    titulo: texto(r.titulo, d.titulo, 120),
+    intro: texto(r.intro, d.intro, 600),
+    aviso: texto(r.aviso, d.aviso, 800),
+    confirmacion: texto(r.confirmacion, d.confirmacion, 600),
+    gracias: texto(r.gracias, d.gracias, 600),
+    eventos,
+    evento_otro: eventoOtro,
+    acreditaciones,
+  };
+}
+async function obtenerConfigAcreditacion(env) {
+  try {
+    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind(ACREDITACION_CONFIG_KEY).first();
+    if (row && row.value) return normalizarConfigAcreditacion(JSON.parse(String(row.value)));
+  } catch {}
+  return normalizarConfigAcreditacion(null);
+}
+// Limpieza y validación compartida por la edición y la importación del panel
+// (el formulario público tiene su propia validación, más estricta).
+function limpiarDatosAcreditacionAdmin(d, { estricto } = {}) {
+  const limpiar = (v, max) => (v ? String(v) : "").replace(/\s+/g, " ").trim().slice(0, max);
+  const out = {
+    nombre: limpiar(d.nombre, 200),
+    email: limpiar(d.email, 200).toLowerCase(),
+    dni: limpiar(d.dni, 30).replace(/[\s.-]/g, "").toUpperCase(),
+    equipo: limpiar(d.equipo, 200),
+    tipo_evento: limpiar(d.tipo_evento, 200),
+    tipo_acreditacion: limpiar(d.tipo_acreditacion, 200),
+    funciones: (d.funciones ? String(d.funciones) : "").trim().slice(0, 2000),
+    jornada_partido: limpiar(d.jornada_partido, 500),
+  };
+  if (!out.nombre) return { error: "Falta el nombre" };
+  if (!emailValido(out.email)) return { error: "Correo no válido" };
+  if (!out.equipo) return { error: "Falta el equipo" };
+  if (out.dni && (out.dni.length < 5 || !/^[A-Z0-9]+$/.test(out.dni))) return { error: "DNI / NIE no válido" };
+  if (estricto) {
+    if (!out.dni) return { error: "Falta el DNI / NIE" };
+    if (!out.tipo_evento) return { error: "Falta el tipo de evento" };
+    if (!out.tipo_acreditacion) return { error: "Falta el tipo de acreditación" };
+    if (!out.funciones) return { error: "Faltan las funciones" };
+    if (!out.jornada_partido) return { error: "Falta la jornada y partido" };
+  }
+  return { datos: out };
+}
+
 const RESPUESTA_DEMASIADOS_INTENTOS = "Demasiados intentos. Espera unos minutos y vuelve a probar.";
 // Sal ficticia para gastar el mismo tiempo de PBKDF2 cuando el usuario no
 // existe (evita enumerar usuarios midiendo el tiempo de respuesta).
@@ -7977,6 +8061,11 @@ export default {
     // cubrir un partido, rueda de prensa o acto. No requiere sesión. Se
     // guarda en la tabla "acreditaciones" y solo los administradores
     // pueden verla (pestaña Funcionalidades > Acreditaciones del panel).
+    // Configuración pública del formulario (textos y listas editables desde el panel).
+    if (path === "/api/acreditaciones/config" && method === "GET") {
+      return json(await obtenerConfigAcreditacion(env));
+    }
+
     // Comprobación del PIN al entrar al formulario (acreditacion.html).
     if (path === "/api/acreditaciones/pin" && method === "POST") {
       if (await limiteExcedido(request, env, "acreditacion-pin", 10, 900)) {
@@ -8021,7 +8110,7 @@ export default {
       const tipoAcreditacion = limpiar(body.tipo_acreditacion, 200);
       const funciones = (body.funciones ? String(body.funciones) : "").trim().slice(0, 2000);
       const jornadaPartido = limpiar(body.jornada_partido, 500);
-      const TIPOS_ACREDITACION = ACREDITACION_TIPOS_ACREDITACION;
+      const TIPOS_ACREDITACION = (await obtenerConfigAcreditacion(env)).acreditaciones;
 
       if (!nombre) return json({ error: "Indica tu nombre y apellidos" }, 400);
       if (!emailValido(email)) return json({ error: "Introduce un correo electrónico válido" }, 400);
@@ -10611,6 +10700,81 @@ async function handlePrimary(request, env, ctx) {
         return json({ pin });
       }
 
+      // ---------- ACREDITACIONES: configuración editable del formulario (solo admins) ----------
+      if (path === "/api/acreditaciones/config" && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede editar el formulario" }, 403);
+        const body = await request.json().catch(() => ({}));
+        const cfg = normalizarConfigAcreditacion(body && body.restaurar ? null : body);
+        await env.DB.prepare(
+          "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+        ).bind(ACREDITACION_CONFIG_KEY, JSON.stringify(cfg)).run();
+        await registrarActividad(env, request, payload, {
+          accion: "acreditacion_config",
+          entidad: "acreditacion",
+          descripcion: body && body.restaurar ? "Restaurado el formulario de acreditaciones a sus valores por defecto" : "Editado el formulario de acreditaciones",
+        });
+        return json(cfg);
+      }
+
+      // ---------- ACREDITACIONES: importar solicitudes (CSV/Excel pegado) (solo admins) ----------
+      if (path === "/api/acreditaciones/importar" && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede importar acreditaciones" }, 403);
+        const body = await request.json().catch(() => ({}));
+        const filas = Array.isArray(body && body.filas) ? body.filas : [];
+        if (!filas.length) return json({ error: "No hay filas que importar" }, 400);
+        if (filas.length > 500) return json({ error: "Máximo 500 filas por importación" }, 400);
+        const omitirDuplicadas = !(body && body.omitir_duplicadas === false);
+        let importadas = 0, duplicadas = 0;
+        const errores = [];
+        for (let i = 0; i < filas.length; i++) {
+          const f = filas[i] || {};
+          const v = limpiarDatosAcreditacionAdmin(f);
+          if (v.error) { errores.push({ fila: i + 1, motivo: v.error }); continue; }
+          const d = v.datos;
+          const estado = ["pendiente", "aprobada", "rechazada"].includes(String(f.estado || "").toLowerCase()) ? String(f.estado).toLowerCase() : "pendiente";
+          const nota = (f.nota_admin ? String(f.nota_admin) : "").trim().slice(0, 1000) || null;
+          const fechaOk = typeof f.created_at === "string" && /^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?/.test(f.created_at.trim());
+          const creada = fechaOk ? f.created_at.trim().replace("T", " ").slice(0, 19) : null;
+          try {
+            if (omitirDuplicadas) {
+              const ya = await env.DB.prepare(
+                "SELECT id FROM acreditaciones WHERE email = ? AND equipo = ? AND jornada_partido = ? AND tipo_evento = ?"
+              ).bind(d.email, d.equipo, d.jornada_partido, d.tipo_evento).first();
+              if (ya) { duplicadas++; continue; }
+            }
+            const revisor = estado !== "pendiente" ? (payload.nombre || null) : null;
+            const revisadoAt = estado !== "pendiente" ? new Date().toISOString().slice(0, 19).replace("T", " ") : null;
+            if (creada) {
+              await env.DB.prepare(
+                `INSERT INTO acreditaciones
+                   (nombre, email, dni, equipo, tipo_evento, tipo_acreditacion, funciones, jornada_partido, confirmado, estado, nota_admin, revisado_por, revisado_at, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`
+              ).bind(d.nombre, d.email, d.dni, d.equipo, d.tipo_evento, d.tipo_acreditacion, d.funciones, d.jornada_partido, estado, nota, revisor, revisadoAt, creada).run();
+            } else {
+              await env.DB.prepare(
+                `INSERT INTO acreditaciones
+                   (nombre, email, dni, equipo, tipo_evento, tipo_acreditacion, funciones, jornada_partido, confirmado, estado, nota_admin, revisado_por, revisado_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`
+              ).bind(d.nombre, d.email, d.dni, d.equipo, d.tipo_evento, d.tipo_acreditacion, d.funciones, d.jornada_partido, estado, nota, revisor, revisadoAt).run();
+            }
+            importadas++;
+          } catch (err) {
+            console.error("[acreditaciones/importar]", err);
+            errores.push({ fila: i + 1, motivo: "Error al guardar" });
+          }
+        }
+        await registrarActividad(env, request, payload, {
+          accion: "acreditacion_importar",
+          entidad: "acreditacion",
+          descripcion: `Importadas ${importadas} acreditaciones (${duplicadas} duplicadas, ${errores.length} con error)`,
+        });
+        return json({ ok: true, importadas, duplicadas, errores });
+      }
+
       // ---------- ACREDITACIONES: bandeja del panel (solo admins) ----------
       if (path === "/api/acreditaciones" && method === "GET") {
         const payload = await requireAuth(request, env);
@@ -10630,13 +10794,31 @@ async function handlePrimary(request, env, ctx) {
         if (payload.rol !== "admin") return json({ error: "Solo un administrador puede gestionar las acreditaciones" }, 403);
         const id = Number(path.split("/").pop());
         const body = await request.json().catch(() => ({}));
+        const editaDatos = !!(body.datos && typeof body.datos === "object");
         const estado = String(body.estado || "");
-        if (!["pendiente", "aprobada", "rechazada"].includes(estado)) {
+        if (!(editaDatos && !estado) && !["pendiente", "aprobada", "rechazada"].includes(estado)) {
           return json({ error: "Estado no válido" }, 400);
         }
         const nota = (body.nota_admin ? String(body.nota_admin) : "").trim().slice(0, 1000);
         const existente = await env.DB.prepare("SELECT id, nombre FROM acreditaciones WHERE id = ?").bind(id).first();
         if (!existente) return json({ error: "Solicitud no encontrada" }, 404);
+        if (editaDatos) {
+          const v = limpiarDatosAcreditacionAdmin(body.datos);
+          if (v.error) return json({ error: v.error }, 400);
+          const d = v.datos;
+          await env.DB.prepare(
+            `UPDATE acreditaciones
+               SET nombre = ?, email = ?, dni = ?, equipo = ?, tipo_evento = ?, tipo_acreditacion = ?, funciones = ?, jornada_partido = ?, updated_at = datetime('now')
+             WHERE id = ?`
+          ).bind(d.nombre, d.email, d.dni, d.equipo, d.tipo_evento, d.tipo_acreditacion, d.funciones, d.jornada_partido, id).run();
+          await registrarActividad(env, request, payload, {
+            accion: "acreditacion_editada",
+            entidad: "acreditacion",
+            entidad_id: id,
+            descripcion: `Editados los datos de la acreditación de ${d.nombre}`,
+          });
+          if (!estado) return json({ ok: true });
+        }
         await env.DB.prepare(
           `UPDATE acreditaciones
              SET estado = ?, nota_admin = ?, revisado_por = ?, revisado_at = datetime('now'), updated_at = datetime('now')
