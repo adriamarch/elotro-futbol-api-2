@@ -1013,80 +1013,132 @@ function paginaMantenimiento(horaHasta, desdeISO) {
 </html>`;
 }
 
-// Plantilla HTML compartida por todos los avisos: cabecera con el logo
-// sobre fondo marino, franja roja de acento, una etiqueta de tipo, título,
-// una lista de datos clave (autor, club, etc.) y un botón de acción.
-// Todo con estilos en línea (tablas) porque así es como hay que maquetar
-// para que se vea bien en Gmail, Outlook, etc.
-// bloqueHtml (opcional): HTML ya construido y ya escapado por quien llama
-// (p. ej. el resumen de partidos sin cubrir, agrupado por tipo). Se pinta
-// entre las filas y el botón, con el mismo ancho que el resto.
-function plantillaEmail({ etiqueta, titulo, filas = [], parrafo, boton, bloqueHtml }) {
-  const filasHtml = filas
-    .filter((f) => f && f.valor)
+// Plantilla HTML compartida por todos los avisos por correo.
+// Estructura: cabecera marino con el logo, franja de acento, etiqueta de tipo,
+// título editorial (serif, como en la web y el boletín), párrafo, ficha de
+// datos clave, bloque libre, botón de acción y pie de marca.
+// Todo con tablas y estilos en línea (así se ve bien en Gmail, Outlook, Apple
+// Mail…) + un <style> solo para el modo oscuro, con la misma paleta que el
+// boletín semanal, para que todos los correos se sientan de la misma casa.
+//
+// Parámetros:
+//   etiqueta, titulo, parrafo, filas [{etiqueta, valor}], boton {texto, url}
+//   bloqueHtml  HTML ya construido y ya escapado por quien llama.
+//   tono        "marca" (rojo, por defecto) | "exito" | "error" | "aviso":
+//               cambia el color de acento (franja, etiqueta, botón, ficha).
+//   preheader   frase que muestran las bandejas de entrada junto al asunto.
+//   pieHtml     HTML ya escapado para sustituir el pie por defecto
+//               (p. ej. el enlace de baja del boletín).
+const TONOS_EMAIL = {
+  marca: { color: "#d1132e", suave: "#fdecef", icono: "" },
+  exito: { color: "#1b7f3b", suave: "#e8f6ed", icono: "✔ " },
+  error: { color: "#c62828", suave: "#fdecec", icono: "✖ " },
+  aviso: { color: "#b45309", suave: "#fff4e0", icono: "⚠ " },
+};
+
+function plantillaEmail({ etiqueta, titulo, filas = [], parrafo, boton, bloqueHtml, tono = "marca", preheader, pieHtml }) {
+  const t = TONOS_EMAIL[tono] || TONOS_EMAIL.marca;
+  const SERIF = "Georgia,'Times New Roman',serif";
+  const SANS = "'Helvetica Neue',Helvetica,Arial,sans-serif";
+
+  const filasValidas = filas.filter((f) => f && f.valor);
+  const filasHtml = filasValidas
     .map(
-      (f) => `
-        <tr>
-          <td style="padding:6px 0;font-size:13px;color:#9aa0ab;width:110px;vertical-align:top;">${escapeHtmlEmail(f.etiqueta)}</td>
-          <td style="padding:6px 0;font-size:14px;color:#0c1b2e;font-weight:600;">${escapeHtmlEmail(f.valor)}</td>
-        </tr>`
+      (f, i) => `
+              <tr>
+                <td class="eof-linea" style="padding:10px 0;${i ? "border-top:1px solid #dfe4ec;" : ""}font-family:${SANS};font-size:12px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:#8a93a3;width:128px;vertical-align:top;">${escapeHtmlEmail(f.etiqueta)}</td>
+                <td class="eof-linea eof-texto" style="padding:10px 0;${i ? "border-top:1px solid #dfe4ec;" : ""}font-family:${SANS};font-size:15px;line-height:1.45;color:#0c1b2e;font-weight:600;vertical-align:top;">${escapeHtmlEmail(f.valor)}</td>
+              </tr>`
     )
     .join("");
 
   const botonHtml = boton
     ? `
-      <table role="presentation" cellpadding="0" cellspacing="0" style="margin-top:26px;">
-        <tr>
-          <td style="border-radius:24px;background:#d1132e;">
-            <a href="${boton.url}" style="display:inline-block;padding:12px 26px;font-family:Arial,sans-serif;font-size:13px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;color:#ffffff;text-decoration:none;">${escapeHtmlEmail(boton.texto)}</a>
-          </td>
-        </tr>
-      </table>`
+          <tr>
+            <td style="padding:6px 36px 6px;">
+              <table role="presentation" cellpadding="0" cellspacing="0" style="margin-top:22px;">
+                <tr>
+                  <td style="border-radius:8px;background:${t.color};">
+                    <a href="${boton.url}" style="display:inline-block;padding:14px 30px;font-family:${SANS};font-size:14px;font-weight:700;letter-spacing:.3px;color:#ffffff;text-decoration:none;border-radius:8px;">${escapeHtmlEmail(boton.texto)}&nbsp;&rarr;</a>
+                  </td>
+                </tr>
+              </table>
+              <p class="eof-texto-suave" style="margin:14px 0 0;font-family:${SANS};font-size:12px;line-height:1.5;color:#8a93a3;word-break:break-all;">¿No funciona el botón? Copia este enlace en tu navegador:<br><a href="${boton.url}" style="color:${t.color};text-decoration:underline;">${boton.url}</a></p>
+            </td>
+          </tr>`
     : "";
+
+  const pie = pieHtml || "Aviso automático de ELOTROFÚTBOLTV. No hace falta responder a este correo.";
 
   return `<!DOCTYPE html>
 <html lang="es">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#eef1f5;font-family:Arial,Helvetica,sans-serif;">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef1f5;padding:32px 16px;">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="supported-color-schemes" content="light dark">
+<title>${escapeHtmlEmail(titulo)}</title>
+<style>
+  @media (max-width:600px) {
+    .eof-cuerpo { padding-left:22px !important; padding-right:22px !important; }
+    .eof-titulo { font-size:23px !important; }
+  }
+  @media (prefers-color-scheme: dark) {
+    body, .eof-fondo { background:#11161f !important; }
+    .eof-tarjeta { background:#1a2130 !important; box-shadow:0 8px 28px rgba(0,0,0,.45) !important; }
+    .eof-texto, .eof-texto h1, .eof-texto p { color:#e7eaf0 !important; }
+    .eof-texto-suave { color:#9aa4b8 !important; }
+    .eof-ficha { background:#171d29 !important; }
+    .eof-linea { border-top-color:#2a3242 !important; }
+    .eof-pie { background:#171d29 !important; border-top-color:#2a3242 !important; }
+    .eof-pie p, .eof-pie a { color:#7e879b !important; }
+  }
+</style>
+</head>
+<body class="eof-fondo" style="margin:0;padding:0;background:#eef1f5;">
+  ${preheader ? `<div style="display:none;max-height:0;overflow:hidden;opacity:0;font-size:1px;line-height:1px;color:#eef1f5;">${escapeHtmlEmail(preheader)}${"&nbsp;&zwnj;".repeat(40)}</div>` : ""}
+  <table role="presentation" class="eof-fondo" width="100%" cellpadding="0" cellspacing="0" style="background:#eef1f5;padding:32px 14px;">
     <tr>
       <td align="center">
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#ffffff;border-radius:10px;overflow:hidden;box-shadow:0 4px 18px rgba(12,27,46,.12);">
+        <table role="presentation" class="eof-tarjeta" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 8px 28px rgba(12,27,46,.14);">
           <tr>
-            <td style="background:#0c1b2e;padding:22px 28px;">
-              <img src="${SITIO_URL}/img/logo.png" alt="ELOTROFÚTBOLTV" height="34" style="display:block;">
+            <td style="background:#0c1b2e;padding:26px 36px;">
+              <img src="${SITIO_URL}/img/logo.png" alt="ELOTROFÚTBOLTV" height="36" style="display:block;border:0;height:36px;width:auto;">
             </td>
           </tr>
-          <tr><td style="height:4px;background:#d1132e;line-height:0;font-size:0;">&nbsp;</td></tr>
+          <tr><td style="height:5px;background:${t.color};line-height:5px;font-size:0;">&nbsp;</td></tr>
           <tr>
-            <td style="padding:32px 28px 8px;">
-              <span style="display:inline-block;background:#eef1f5;color:#d1132e;font-size:11px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;padding:4px 11px;border-radius:12px;">${escapeHtmlEmail(etiqueta)}</span>
-              <h1 style="margin:14px 0 6px;font-size:21px;line-height:1.3;color:#0c1b2e;">${escapeHtmlEmail(titulo)}</h1>
-              ${parrafo ? `<p style="margin:0 0 4px;font-size:14px;line-height:1.5;color:#5a6270;">${escapeHtmlEmail(parrafo)}</p>` : ""}
+            <td class="eof-cuerpo" style="padding:36px 36px 10px;">
+              <span style="display:inline-block;background:${t.suave};color:${t.color};font-family:${SANS};font-size:11px;font-weight:700;letter-spacing:.9px;text-transform:uppercase;padding:5px 12px;border-radius:20px;">${t.icono}${escapeHtmlEmail(etiqueta)}</span>
+              <h1 class="eof-titulo eof-texto" style="margin:16px 0 0;font-family:${SERIF};font-size:26px;line-height:1.25;font-weight:700;color:#0c1b2e;">${escapeHtmlEmail(titulo)}</h1>
+              ${parrafo ? `<p class="eof-texto-suave" style="margin:14px 0 0;font-family:${SANS};font-size:15px;line-height:1.6;color:#5a6270;">${escapeHtmlEmail(parrafo)}</p>` : ""}
             </td>
           </tr>
           ${filasHtml ? `
           <tr>
-            <td style="padding:6px 28px 8px;">
-              <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;background:#eef1f5;border-radius:8px;padding:14px 16px;">
-                ${filasHtml}
+            <td class="eof-cuerpo" style="padding:20px 36px 4px;">
+              <table role="presentation" class="eof-ficha" width="100%" cellpadding="0" cellspacing="0" style="background:#f5f7fa;border-left:4px solid ${t.color};border-radius:8px;">
+                <tr>
+                  <td style="padding:8px 20px;">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">${filasHtml}
+                    </table>
+                  </td>
+                </tr>
               </table>
             </td>
           </tr>` : ""}
           ${bloqueHtml ? `
           <tr>
-            <td style="padding:14px 28px 0;">
+            <td class="eof-cuerpo eof-texto" style="padding:18px 36px 0;font-family:${SANS};font-size:15px;line-height:1.65;color:#2b3445;">
               ${bloqueHtml}
             </td>
-          </tr>` : ""}
+          </tr>` : ""}${botonHtml}
+          <tr><td style="height:30px;line-height:30px;font-size:0;">&nbsp;</td></tr>
           <tr>
-            <td style="padding:8px 28px 34px;">
-              ${botonHtml}
-            </td>
-          </tr>
-          <tr>
-            <td style="padding:18px 28px;background:#f7f8fa;border-top:1px solid #eee;">
-              <p style="margin:0;font-size:11.5px;color:#9aa0ab;">Aviso automático de ELOTROFÚTBOLTV · No hace falta responder a este correo.</p>
+            <td class="eof-pie eof-cuerpo" style="padding:22px 36px 26px;background:#f5f7fa;border-top:1px solid #e6e9ef;">
+              <p style="margin:0 0 6px;font-family:${SANS};font-size:12px;font-weight:700;letter-spacing:1.4px;text-transform:uppercase;color:#0c1b2e;" class="eof-texto">EL<span style="color:${TONOS_EMAIL.marca.color};">OTRO</span>FÚTBOLTV</p>
+              <p style="margin:0;font-family:${SANS};font-size:12px;line-height:1.6;color:#8a93a3;">${pie}</p>
+              <p style="margin:8px 0 0;font-family:${SANS};font-size:12px;line-height:1.6;color:#8a93a3;"><a href="${SITIO_URL}" style="color:#8a93a3;text-decoration:underline;">${SITIO_URL.replace(/^https?:\/\//, "")}</a></p>
             </td>
           </tr>
         </table>
@@ -1883,17 +1935,18 @@ function mensajeAnuncioAHtml(mensaje) {
 
 function construirEmailAnuncio({ asunto, mensaje, boton_texto, boton_url }, destinatario) {
   const botonValido = boton_texto && boton_url && /^https:\/\//i.test(boton_url);
-  let html = plantillaEmail({
-    etiqueta: "Anuncio",
-    titulo: asunto,
-    bloqueHtml: mensajeAnuncioAHtml(mensaje),
-    boton: botonValido ? { texto: boton_texto, url: escapeHtmlEmail(boton_url) } : null,
-  });
   // El pie genérico dice "aviso automático... no responder": en un anuncio
   // se sustituye por el motivo del envío y, si hay, el enlace de baja.
   const bajaUrl = destinatario.baja_token ? `${API_URL}/api/newsletter/baja?token=${encodeURIComponent(destinatario.baja_token)}` : null;
-  const pie = `Recibes este correo de ELOTROFÚTBOLTV por ser parte de la comunidad del medio.${bajaUrl ? ` <a href="${bajaUrl}" style="color:#9aa0ab;">Darme de baja del boletín</a>.` : ""}`;
-  html = html.replace(/Aviso automático de ELOTROFÚTBOLTV · No hace falta responder a este correo\./, pie);
+  const pie = `Recibes este correo de ELOTROFÚTBOLTV por ser parte de la comunidad del medio.${bajaUrl ? ` <a href="${escapeHtmlEmail(bajaUrl)}" style="color:#8a93a3;text-decoration:underline;">Darme de baja del boletín</a>.` : ""}`;
+  const html = plantillaEmail({
+    etiqueta: "Anuncio",
+    titulo: asunto,
+    preheader: String(mensaje).trim().replace(/\s+/g, " ").slice(0, 110),
+    bloqueHtml: mensajeAnuncioAHtml(mensaje),
+    boton: botonValido ? { texto: boton_texto, url: escapeHtmlEmail(boton_url) } : null,
+    pieHtml: pie,
+  });
   const texto = `${asunto}\n\n${String(mensaje).trim()}${botonValido ? `\n\n${boton_texto}: ${boton_url}` : ""}\n\n— ELOTROFÚTBOLTV${bajaUrl ? `\nBaja del boletín: ${bajaUrl}` : ""}`;
   return { html, texto };
 }
@@ -2572,17 +2625,24 @@ async function enviarCorreoResolucionAcreditacion(env, a, estado, { recogida, me
     ...(mensaje ? ["", aprobada ? "Instrucciones:" : "Motivo / mensaje:", mensaje] : []),
     "", cierre, "", "Equipo de ElOtroFútbol",
   ].join("\n");
-  const color = aprobada ? "#1b7f3b" : "#c62828";
-  const html = `<div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;color:#1f2937;line-height:1.5;">
-<div style="background:${color};color:#fff;padding:14px 18px;border-radius:10px 10px 0 0;font-weight:700;font-size:16px;">${aprobada ? "✔ Acreditación aprobada" : "✖ Solicitud no aprobada"}</div>
-<div style="border:1px solid #e5e7eb;border-top:0;border-radius:0 0 10px 10px;padding:18px;">
-<p style="margin-top:0;">${escapeHtmlEmail(intro)}</p>
-<table style="border-collapse:collapse;width:100%;font-size:14px;">${filas.map(([k, v]) => `<tr><td style="padding:6px 10px 6px 0;color:#6b7280;white-space:nowrap;vertical-align:top;">${escapeHtmlEmail(k)}</td><td style="padding:6px 0;font-weight:600;">${escapeHtmlEmail(v)}</td></tr>`).join("")}</table>
-${aprobada && recogida ? `<div style="margin-top:14px;padding:12px 14px;background:#f0fdf4;border-left:4px solid ${color};border-radius:6px;"><strong>Dónde y cuándo recogerla</strong><br>${nl2br(recogida)}</div>` : ""}
-${mensaje ? `<div style="margin-top:14px;padding:12px 14px;background:#f3f4f6;border-radius:6px;"><strong>${aprobada ? "Instrucciones" : "Motivo / mensaje"}</strong><br>${nl2br(mensaje)}</div>` : ""}
-<p style="margin-top:16px;font-size:13px;color:#4b5563;">${escapeHtmlEmail(cierre)}</p>
-<p style="margin-bottom:0;font-size:13px;color:#4b5563;">Equipo de ElOtroFútbol · Puedes responder a este correo.</p>
-</div></div>`;
+  const bloques = [];
+  if (aprobada && recogida) {
+    bloques.push(`<div style="margin:0 0 14px;padding:14px 16px;background:#e8f6ed;border-left:4px solid #1b7f3b;border-radius:8px;color:#14532d;"><strong style="display:block;margin-bottom:4px;">Dónde y cuándo recogerla</strong>${nl2br(recogida)}</div>`);
+  }
+  if (mensaje) {
+    bloques.push(`<div style="margin:0 0 14px;padding:14px 16px;background:#f5f7fa;border-left:4px solid #8a93a3;border-radius:8px;color:#2b3445;"><strong style="display:block;margin-bottom:4px;">${aprobada ? "Instrucciones" : "Motivo / mensaje"}</strong>${nl2br(mensaje)}</div>`);
+  }
+  bloques.push(`<p style="margin:4px 0 0;font-size:14px;line-height:1.6;color:#5a6270;">${escapeHtmlEmail(cierre)}</p>`);
+  const html = plantillaEmail({
+    etiqueta: "Acreditaciones",
+    titulo: aprobada ? "Acreditación aprobada" : "Solicitud no aprobada",
+    tono: aprobada ? "exito" : "error",
+    preheader: intro,
+    parrafo: intro,
+    filas: filas.map(([k, v]) => ({ etiqueta: k, valor: v })),
+    bloqueHtml: bloques.join(""),
+    pieHtml: "Equipo de ElOtroFútbol. Puedes responder a este correo si tienes cualquier duda.",
+  });
   return enviarEmailNotificacion(env, { asunto, texto, html }, { destinatario: a.email, replyTo: EMAIL_NOTIFICACIONES });
 }
 
@@ -6726,6 +6786,7 @@ function construirEmailRecordatorioInactividad({ nombre, diasSinSubir, numeroAvi
   const saludo = nombre ? `Hola ${nombre},` : "Hola,";
   const despedida = ["Un abrazo,", "El equipo de El Otro Fútbol"];
   let asunto;
+  let tituloCorreo;
   let parrafos;
 
   if (numeroAviso >= INACTIVIDAD_AVISOS_HASTA_INCUMPLIMIENTO) {
@@ -6733,6 +6794,7 @@ function construirEmailRecordatorioInactividad({ nombre, diasSinSubir, numeroAvi
     // 3.6 (Compromiso) de la guía del medio y lo que pasará si no hay
     // respuesta (a los 5 días se avisa a los admins, ver más abajo).
     asunto = "Sobre tu colaboración en El Otro Fútbol";
+    tituloCorreo = "Hablemos de tu colaboración";
     parrafos = [
       `Llevamos ${diasSinSubir} días sin ver ninguna noticia tuya y ya te hemos escrito varias veces. Sabemos que colaboras de forma totalmente voluntaria y que no es ninguna obligación, así que no queremos agobiarte.`,
       "Aun así, tenemos que comentarte que una inactividad tan prolongada no encaja con el compromiso que aceptaste al unirte al medio, recogido en el apartado 3.6 (Compromiso) de la guía del medio.",
@@ -6741,6 +6803,7 @@ function construirEmailRecordatorioInactividad({ nombre, diasSinSubir, numeroAvi
     ];
   } else if (numeroAviso === 1) {
     asunto = "¡Te echamos de menos en El Otro Fútbol!";
+    tituloCorreo = "¡Te echamos de menos!";
     parrafos = [
       `Hace ya ${diasSinSubir} días que no subes ninguna noticia a El Otro Fútbol y queríamos escribirte para saber cómo estás.`,
       "Sabemos que colaboras por voluntad propia y que no es ninguna obligación, así que no te lo tomes como un reproche: es solo un recordatorio amistoso. Como en su día te comprometiste a colaborar con el medio, nos gustaría contar contigo cuando puedas y tengas ganas.",
@@ -6749,6 +6812,7 @@ function construirEmailRecordatorioInactividad({ nombre, diasSinSubir, numeroAvi
     ];
   } else {
     asunto = "Un recordatorio amistoso de El Otro Fútbol";
+    tituloCorreo = "Un recordatorio amistoso";
     parrafos = [
       `Solo queríamos recordarte que seguimos contando contigo: ya han pasado ${diasSinSubir} días desde tu última noticia.`,
       "Sabemos que colaboras por voluntad propia y que no es una obligación, así que sin ninguna presión. Simplemente, como te comprometiste con el medio, nos haría ilusión volver a ver tu nombre por aquí cuando te venga bien.",
@@ -6761,9 +6825,21 @@ function construirEmailRecordatorioInactividad({ nombre, diasSinSubir, numeroAvi
   // y contestar a la dirección de envío, que nadie lee.
   const notaAutomatico = "Este es un mensaje automático, por favor no respondas a este correo. Si quieres comentarnos algo, escríbenos por el canal habitual del medio.";
   const texto = [saludo, "", ...parrafos.flatMap((p) => [p, ""]), ...despedida, "", "--", notaAutomatico].join("\n");
-  const html = [saludo, ...parrafos, despedida.join("<br>")]
-    .map((p, i, todos) => (i === todos.length - 1 ? `<p>${p.split("<br>").map(escapeHtmlEmail).join("<br>")}</p>` : `<p>${escapeHtmlEmail(p)}</p>`))
-    .join("") + `<p style="color:#777;font-size:12px;margin-top:24px">${escapeHtmlEmail(notaAutomatico)}</p>`;
+  // En el HTML el enlace al panel pasa a ser un botón (el último párrafo del
+  // texto plano es justo esa línea con el enlace).
+  const parrafosHtml = parrafos.slice(0, -1);
+  const cuerpoHtml = [saludo, ...parrafosHtml]
+    .map((p) => `<p style="margin:0 0 14px;">${escapeHtmlEmail(p)}</p>`)
+    .join("") + `<p style="margin:18px 0 0;">${despedida.map(escapeHtmlEmail).join("<br>")}</p>`;
+  const html = plantillaEmail({
+    etiqueta: "Colaboradores",
+    titulo: tituloCorreo,
+    tono: numeroAviso >= INACTIVIDAD_AVISOS_HASTA_INCUMPLIMIENTO ? "aviso" : "marca",
+    preheader: parrafosHtml[0],
+    bloqueHtml: cuerpoHtml,
+    boton: { texto: "Entrar al panel", url: enlacePanel },
+    pieHtml: escapeHtmlEmail(notaAutomatico),
+  });
   return { asunto, texto, html };
 }
 
