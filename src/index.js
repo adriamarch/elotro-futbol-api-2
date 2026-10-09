@@ -1775,6 +1775,148 @@ async function enviarEmailNotificacion(env, { asunto, texto, html }, { destinata
   }
 }
 
+// ---------- Anuncios por correo (panel de admin) ----------
+// Un admin escribe un anuncio y lo manda a colaboradores (admins, redactores,
+// fotógrafos) y/o a lectores (cuentas verificadas y/o suscriptores del
+// boletín). Cada persona recibe SU correo (nadie ve las direcciones de los
+// demás). El panel manda el envío por tandas (ANUNCIO_TAMANO_TANDA) para no
+// pasar el límite de subpeticiones de un Worker ni el ritmo de Resend.
+const ANUNCIO_AUDIENCIAS = ["admins", "redactores", "fotografos", "lectores", "suscriptores"];
+const ANUNCIO_TAMANO_TANDA = 20;
+const ANUNCIO_MAX_ASUNTO = 150;
+const ANUNCIO_MAX_MENSAJE = 5000;
+const ANUNCIO_ROL_POR_AUDIENCIA = { admins: "admin", redactores: "redactor", fotografos: "fotografo" };
+
+function emailAnuncioValido(email) {
+  const e = String(email || "").trim();
+  return e.length <= 254 && /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(e);
+}
+
+// Selección de destinatarios. Formato guardado en anuncios_email.audiencias:
+//   - antiguo: ["admins","lectores"]  (cada grupo completo)
+//   - nuevo:   {"admins":"todos","redactores":["ana@x.com","luis@x.com"]}
+//              (un grupo entero, o solo las personas elegidas dentro del grupo)
+// Siempre se normaliza a { audiencia: "todos" | [correos en minúsculas] }.
+// Una lista concreta solo FILTRA filas que ya existen en la base de datos:
+// nunca se puede enviar a un correo que no pertenezca a ese grupo.
+const ANUNCIO_MAX_PERSONAS_SELECCION = 5000;
+function normalizarSeleccionAnuncio(raw) {
+  const sel = {};
+  if (Array.isArray(raw)) {
+    for (const a of raw) if (ANUNCIO_AUDIENCIAS.includes(a)) sel[a] = "todos";
+    return sel;
+  }
+  if (raw && typeof raw === "object") {
+    for (const a of ANUNCIO_AUDIENCIAS) {
+      const v = raw[a];
+      if (v === "todos") sel[a] = "todos";
+      else if (Array.isArray(v)) {
+        const correos = [...new Set(v.map((e) => String(e || "").trim().toLowerCase()).filter(emailAnuncioValido))].slice(0, ANUNCIO_MAX_PERSONAS_SELECCION);
+        if (correos.length) sel[a] = correos;
+      }
+    }
+  }
+  return sel;
+}
+
+// Destinatarios únicos (por correo, sin distinguir mayúsculas) de la
+// selección, ordenados por correo para que las tandas sean estables entre
+// llamadas. Si una persona está en varias listas, recibe un solo correo; si
+// es suscriptora, conserva su enlace de baja.
+async function resolverDestinatariosAnuncio(env, seleccionRaw) {
+  const sel = normalizarSeleccionAnuncio(seleccionRaw);
+  const porEmail = new Map();
+  const anadirDe = (audiencia, email, nombre, baja_token) => {
+    if (!emailAnuncioValido(email)) return;
+    const clave = String(email).trim().toLowerCase();
+    const filtro = sel[audiencia];
+    if (Array.isArray(filtro) && !filtro.includes(clave)) return;
+    const previo = porEmail.get(clave);
+    if (previo) {
+      if (!previo.baja_token && baja_token) previo.baja_token = baja_token;
+      return;
+    }
+    porEmail.set(clave, { email: String(email).trim(), nombre: nombre || "", baja_token: baja_token || null });
+  };
+
+  const audienciasRol = Object.keys(sel).filter((a) => ANUNCIO_ROL_POR_AUDIENCIA[a]);
+  if (audienciasRol.length) {
+    const roles = audienciasRol.map((a) => ANUNCIO_ROL_POR_AUDIENCIA[a]);
+    const { results } = await env.DB.prepare(
+      `SELECT nombre, email, rol FROM users WHERE activo = 1 AND email IS NOT NULL AND TRIM(email) <> '' AND rol IN (${roles.map(() => "?").join(",")})`
+    ).bind(...roles).all();
+    for (const u of results || []) {
+      const aud = audienciasRol.find((a) => ANUNCIO_ROL_POR_AUDIENCIA[a] === u.rol);
+      if (aud) anadirDe(aud, u.email, u.nombre, null);
+    }
+  }
+  if (sel.lectores) {
+    const { results } = await env.DB.prepare(
+      "SELECT nombre, email FROM readers WHERE activo = 1 AND email_verificado = 1"
+    ).all();
+    for (const r of results || []) anadirDe("lectores", r.email, r.nombre, null);
+  }
+  if (sel.suscriptores) {
+    const { results } = await env.DB.prepare(
+      "SELECT email, baja_token FROM newsletter_suscriptores WHERE activo = 1"
+    ).all();
+    for (const x of results || []) anadirDe("suscriptores", x.email, "", x.baja_token);
+  }
+  return [...porEmail.values()].sort((a, b) => a.email.toLowerCase().localeCompare(b.email.toLowerCase()));
+}
+
+// Resumen legible de la selección para el historial de actividad.
+function describirSeleccionAnuncio(sel) {
+  return Object.entries(sel).map(([a, v]) => v === "todos" ? a : `${a}: ${v.length} elegidos`).join(", ");
+}
+
+// Texto del admin -> párrafos HTML (todo escapado; saltos de línea respetados).
+function mensajeAnuncioAHtml(mensaje) {
+  return String(mensaje || "")
+    .replace(/\r\n/g, "\n")
+    .split(/\n{2,}/)
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .map((p) => `<p style="margin:0 0 14px;font-size:15px;line-height:1.6;color:#2a3140;">${escapeHtmlEmail(p).replace(/\n/g, "<br>")}</p>`)
+    .join("");
+}
+
+function construirEmailAnuncio({ asunto, mensaje, boton_texto, boton_url }, destinatario) {
+  const botonValido = boton_texto && boton_url && /^https:\/\//i.test(boton_url);
+  let html = plantillaEmail({
+    etiqueta: "Anuncio",
+    titulo: asunto,
+    bloqueHtml: mensajeAnuncioAHtml(mensaje),
+    boton: botonValido ? { texto: boton_texto, url: escapeHtmlEmail(boton_url) } : null,
+  });
+  // El pie genérico dice "aviso automático... no responder": en un anuncio
+  // se sustituye por el motivo del envío y, si hay, el enlace de baja.
+  const bajaUrl = destinatario.baja_token ? `${API_URL}/api/newsletter/baja?token=${encodeURIComponent(destinatario.baja_token)}` : null;
+  const pie = `Recibes este correo de ELOTROFÚTBOLTV por ser parte de la comunidad del medio.${bajaUrl ? ` <a href="${bajaUrl}" style="color:#9aa0ab;">Darme de baja del boletín</a>.` : ""}`;
+  html = html.replace(/Aviso automático de ELOTROFÚTBOLTV · No hace falta responder a este correo\./, pie);
+  const texto = `${asunto}\n\n${String(mensaje).trim()}${botonValido ? `\n\n${boton_texto}: ${boton_url}` : ""}\n\n— ELOTROFÚTBOLTV${bajaUrl ? `\nBaja del boletín: ${bajaUrl}` : ""}`;
+  return { html, texto };
+}
+
+function dormirMs(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// Valida el cuerpo recibido del panel. Devuelve { error } o { datos }.
+function validarAnuncio(body) {
+  const asunto = String(body.asunto || "").trim();
+  const mensaje = String(body.mensaje || "").trim();
+  if (!asunto) return { error: "Escribe un asunto" };
+  if (asunto.length > ANUNCIO_MAX_ASUNTO) return { error: `El asunto no puede pasar de ${ANUNCIO_MAX_ASUNTO} caracteres` };
+  if (/[\r\n]/.test(asunto)) return { error: "El asunto no puede tener saltos de línea" };
+  if (!mensaje) return { error: "Escribe el mensaje" };
+  if (mensaje.length > ANUNCIO_MAX_MENSAJE) return { error: `El mensaje no puede pasar de ${ANUNCIO_MAX_MENSAJE} caracteres` };
+  const boton_texto = String(body.boton_texto || "").trim().slice(0, 40) || null;
+  const boton_url = String(body.boton_url || "").trim() || null;
+  if ((boton_texto && !boton_url) || (!boton_texto && boton_url)) return { error: "El botón necesita texto y enlace (o ninguno de los dos)" };
+  if (boton_url && (!/^https:\/\//i.test(boton_url) || boton_url.length > 500)) return { error: "El enlace del botón debe empezar por https://" };
+  const audiencias = normalizarSeleccionAnuncio(body.seleccion && typeof body.seleccion === "object" ? body.seleccion : body.audiencias);
+  return { datos: { asunto, mensaje, boton_texto, boton_url, audiencias } };
+}
+
 // ---------- Equipos de un usuario (hasta 3 clubes) ----------
 // Se guardan en la columna "equipo" como un array JSON en texto, p. ej.
 // '["Real Madrid","FC Barcelona"]'. Antes era un unico club en texto
@@ -11056,6 +11198,122 @@ async function handlePrimary(request, env, ctx) {
         }));
 
         return json({ ok: true, enviados: destinatarios.length });
+      }
+
+      // ---------- ANUNCIOS POR CORREO (solo admins) ----------
+      //  GET  /api/anuncios/audiencias   -> nº de personas por audiencia
+      //  GET  /api/anuncios              -> historial
+      //  POST /api/anuncios/prueba       -> manda el anuncio solo al correo del admin
+      //  POST /api/anuncios/enviar       -> { anuncio_id?, tanda, ...anuncio }: primera
+      //       llamada (sin anuncio_id) crea el registro y manda la tanda 0; las
+      //       siguientes (con anuncio_id) mandan las demás hasta terminar.
+      if (path.startsWith("/api/anuncios")) {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede enviar anuncios" }, 403);
+
+        if (path === "/api/anuncios/audiencias" && method === "GET") {
+          const conteos = {};
+          for (const a of ANUNCIO_AUDIENCIAS) conteos[a] = (await resolverDestinatariosAnuncio(env, [a])).length;
+          const total = (await resolverDestinatariosAnuncio(env, ANUNCIO_AUDIENCIAS)).length;
+          // Total sin repetidos de la selección pedida (?aud=admins,lectores).
+          const pedidas = (url.searchParams.get("aud") || "").split(",").filter((a) => ANUNCIO_AUDIENCIAS.includes(a));
+          const totalSeleccion = pedidas.length ? (await resolverDestinatariosAnuncio(env, pedidas)).length : 0;
+          return json({ conteos, total_unico: total, total_seleccion: totalSeleccion, tanda: ANUNCIO_TAMANO_TANDA, correo_configurado: cuentasResend(env).length > 0 });
+        }
+
+        // Personas de cada grupo para poder elegirlas una a una en el panel.
+        // Solo nombre, correo, avatar y rol: nunca hashes ni tokens de baja.
+        if (path === "/api/anuncios/personas" && method === "GET") {
+          const personas = { admins: [], redactores: [], fotografos: [], lectores: [], suscriptores: [] };
+          const { results: us } = await env.DB.prepare(
+            "SELECT id, nombre, username, email, rol, avatar_url FROM users WHERE activo = 1 AND email IS NOT NULL AND TRIM(email) <> '' ORDER BY nombre COLLATE NOCASE"
+          ).all();
+          for (const u of us || []) {
+            const aud = Object.keys(ANUNCIO_ROL_POR_AUDIENCIA).find((a) => ANUNCIO_ROL_POR_AUDIENCIA[a] === u.rol);
+            if (aud && emailAnuncioValido(u.email)) personas[aud].push({ nombre: u.nombre || u.username || "", email: String(u.email).trim(), avatar: u.avatar_url || null });
+          }
+          const { results: rs } = await env.DB.prepare(
+            "SELECT nombre, email FROM readers WHERE activo = 1 AND email_verificado = 1 ORDER BY nombre COLLATE NOCASE LIMIT 3000"
+          ).all();
+          for (const r of rs || []) if (emailAnuncioValido(r.email)) personas.lectores.push({ nombre: r.nombre || "", email: String(r.email).trim(), avatar: null });
+          const { results: ss } = await env.DB.prepare(
+            "SELECT email FROM newsletter_suscriptores WHERE activo = 1 ORDER BY email COLLATE NOCASE LIMIT 3000"
+          ).all();
+          for (const x of ss || []) if (emailAnuncioValido(x.email)) personas.suscriptores.push({ nombre: "", email: String(x.email).trim(), avatar: null });
+          return json({ personas });
+        }
+
+        if (path === "/api/anuncios" && method === "GET") {
+          const { results } = await env.DB.prepare(
+            "SELECT id, asunto, audiencias, total_destinatarios, enviados, fallidos, estado, creado_por_nombre, created_at, completado_at FROM anuncios_email ORDER BY id DESC LIMIT 50"
+          ).all();
+          return json({ anuncios: (results || []).map((r) => { let aud = {}; try { aud = normalizarSeleccionAnuncio(JSON.parse(r.audiencias)); } catch {} return { ...r, audiencias: aud }; }) });
+        }
+
+        if (path === "/api/anuncios/prueba" && method === "POST") {
+          const body = await request.json().catch(() => ({}));
+          const v = validarAnuncio(body);
+          if (v.error) return json({ error: v.error }, 400);
+          if (!cuentasResend(env).length) return json({ error: "El envío de correo no está configurado (falta RESEND_API_KEY)" }, 503);
+          const yo = await env.DB.prepare("SELECT email, nombre FROM users WHERE id = ?").bind(payload.uid).first();
+          if (!yo || !emailAnuncioValido(yo.email)) return json({ error: "Tu usuario no tiene un correo válido guardado, así que no se puede enviar la prueba" }, 400);
+          const { html, texto } = construirEmailAnuncio(v.datos, { baja_token: null });
+          const ok = await enviarEmailNotificacion(env, { asunto: `[PRUEBA] ${v.datos.asunto}`, texto, html }, { destinatario: yo.email });
+          if (!ok) return json({ error: "No se pudo enviar la prueba. Revisa la configuración de Resend." }, 502);
+          return json({ ok: true, enviado_a: yo.email });
+        }
+
+        if (path === "/api/anuncios/enviar" && method === "POST") {
+          const body = await request.json().catch(() => ({}));
+          if (!cuentasResend(env).length) return json({ error: "El envío de correo no está configurado (falta RESEND_API_KEY)" }, 503);
+          let anuncio;
+          const anuncioId = body.anuncio_id ? parseInt(body.anuncio_id, 10) : null;
+          if (anuncioId) {
+            // Tandas siguientes: el contenido sale de lo guardado, no de lo que mande el navegador.
+            anuncio = await env.DB.prepare("SELECT * FROM anuncios_email WHERE id = ?").bind(anuncioId).first();
+            if (!anuncio) return json({ error: "Anuncio no encontrado" }, 404);
+            if (anuncio.estado === "completado") return json({ error: "Este anuncio ya se envió por completo" }, 409);
+            try { anuncio.audiencias = normalizarSeleccionAnuncio(JSON.parse(anuncio.audiencias)); } catch { anuncio.audiencias = {}; }
+          } else {
+            const v = validarAnuncio(body);
+            if (v.error) return json({ error: v.error }, 400);
+            if (!Object.keys(v.datos.audiencias).length) return json({ error: "Elige al menos una audiencia o una persona" }, 400);
+            const total = (await resolverDestinatariosAnuncio(env, v.datos.audiencias)).length;
+            if (!total) return json({ error: "No hay ningún destinatario con correo válido en esas audiencias" }, 400);
+            const ins = await env.DB.prepare(
+              `INSERT INTO anuncios_email (asunto, mensaje, audiencias, boton_texto, boton_url, creado_por_id, creado_por_nombre, total_destinatarios)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+            ).bind(v.datos.asunto, v.datos.mensaje, JSON.stringify(v.datos.audiencias), v.datos.boton_texto, v.datos.boton_url, payload.uid, payload.nombre || null, total).run();
+            const id = ins.meta && ins.meta.last_row_id;
+            anuncio = { id, ...v.datos, total_destinatarios: total, enviados: 0, fallidos: 0 };
+            ctx.waitUntil(registrarActividad(env, request, payload, {
+              accion: "anuncio_email_envio", entidad: "anuncio", entidad_id: id,
+              descripcion: `Ha enviado el anuncio por correo "${v.datos.asunto}" a ${total} persona(s) (${describirSeleccionAnuncio(v.datos.audiencias)})`,
+            }));
+          }
+
+          const tanda = Math.max(0, parseInt(body.tanda, 10) || 0);
+          const destinatarios = await resolverDestinatariosAnuncio(env, anuncio.audiencias);
+          const lote = destinatarios.slice(tanda * ANUNCIO_TAMANO_TANDA, (tanda + 1) * ANUNCIO_TAMANO_TANDA);
+          let ok = 0, ko = 0;
+          for (let i = 0; i < lote.length; i++) {
+            const d = lote[i];
+            const { html, texto } = construirEmailAnuncio(anuncio, d);
+            const enviado = await enviarEmailNotificacion(env, { asunto: anuncio.asunto, texto, html }, { destinatario: d.email });
+            if (enviado) ok++; else ko++;
+            if (i < lote.length - 1) await dormirMs(550); // Resend: ~2 correos/segundo
+          }
+          const hayMas = (tanda + 1) * ANUNCIO_TAMANO_TANDA < destinatarios.length;
+          await env.DB.prepare(
+            `UPDATE anuncios_email SET enviados = enviados + ?, fallidos = fallidos + ?,
+               total_destinatarios = ?, estado = ?, completado_at = ${hayMas ? "NULL" : "datetime('now')"} WHERE id = ?`
+          ).bind(ok, ko, destinatarios.length, hayMas ? "enviando" : "completado", anuncio.id).run();
+          const fila = await env.DB.prepare("SELECT enviados, fallidos, total_destinatarios FROM anuncios_email WHERE id = ?").bind(anuncio.id).first();
+          return json({ ok: true, anuncio_id: anuncio.id, tanda, siguiente_tanda: hayMas ? tanda + 1 : null, enviados: fila.enviados, fallidos: fila.fallidos, total: fila.total_destinatarios });
+        }
+
+        return json({ error: "No encontrado" }, 404);
       }
 
       // ---------- LECTORES (cuentas públicas, solo lectura para admins) ----------
