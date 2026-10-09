@@ -2416,7 +2416,24 @@ const ACREDITACION_CONFIG_DEFECTO = {
   eventos: ["Rueda de prensa", "Partido de fútbol", "Presentación oficial", "Acto"],
   evento_otro: true,
   acreditaciones: [...ACREDITACION_TIPOS_ACREDITACION],
+  secciones: {
+    solicitante: "Datos del solicitante",
+    cobertura: "Información de la cobertura",
+    confirmacion: "Confirmación",
+  },
+  preguntas: {
+    nombre: { etiqueta: "Nombre y apellidos", ayuda: "Tu respuesta", error: "Indica tu nombre y apellidos.", activa: true, obligatoria: true },
+    email: { etiqueta: "Correo electrónico", ayuda: "Tu respuesta", error: "Introduce un correo electrónico válido.", activa: true, obligatoria: true },
+    dni: { etiqueta: "DNI / NIE", ayuda: "Tu respuesta", error: "Introduce un DNI / NIE válido.", activa: true, obligatoria: true },
+    equipo: { etiqueta: "Equipo que deseas cubrir", ayuda: "Elige un equipo…", error: "Elige o escribe el equipo que deseas cubrir.", activa: true, obligatoria: true },
+    tipo_evento: { etiqueta: "Tipo de evento", ayuda: "", error: "Elige el tipo de evento.", activa: true, obligatoria: true },
+    tipo_acreditacion: { etiqueta: "Tipo de acreditación", ayuda: "", error: "Elige el tipo de acreditación.", activa: true, obligatoria: true },
+    funciones: { etiqueta: "Describe brevemente las funciones que realizarás durante la cobertura", ayuda: "Tu respuesta", error: "Describe brevemente tus funciones.", activa: true, obligatoria: true },
+    jornada_partido: { etiqueta: "Indica la jornada y partido que quieres cubrir", ayuda: "Tu respuesta", error: "Indica la jornada y el partido.", activa: true, obligatoria: true },
+  },
 };
+// Preguntas que no se pueden ocultar ni hacer opcionales (sin ellas no hay solicitud útil).
+const ACREDITACION_PREGUNTAS_FIJAS = ["nombre", "email", "equipo", "tipo_acreditacion"];
 function normalizarConfigAcreditacion(raw) {
   const d = ACREDITACION_CONFIG_DEFECTO;
   const r = raw && typeof raw === "object" ? raw : {};
@@ -2440,6 +2457,27 @@ function normalizarConfigAcreditacion(raw) {
   if (!eventos.length && !eventoOtro) eventos = [...d.eventos];
   let acreditaciones = lista(r.acreditaciones, d.acreditaciones);
   if (!acreditaciones.length) acreditaciones = [...d.acreditaciones];
+  const rs = r.secciones && typeof r.secciones === "object" ? r.secciones : {};
+  const secciones = {
+    solicitante: texto(rs.solicitante, d.secciones.solicitante, 100),
+    cobertura: texto(rs.cobertura, d.secciones.cobertura, 100),
+    confirmacion: texto(rs.confirmacion, d.secciones.confirmacion, 100),
+  };
+  const rp = r.preguntas && typeof r.preguntas === "object" ? r.preguntas : {};
+  const preguntas = {};
+  for (const k of Object.keys(d.preguntas)) {
+    const dp = d.preguntas[k];
+    const p = rp[k] && typeof rp[k] === "object" ? rp[k] : {};
+    const fija = ACREDITACION_PREGUNTAS_FIJAS.includes(k);
+    preguntas[k] = {
+      etiqueta: texto(p.etiqueta, dp.etiqueta, 300),
+      // La ayuda (texto gris dentro de la casilla) puede dejarse vacía a propósito.
+      ayuda: typeof p.ayuda === "string" ? p.ayuda.replace(/\r/g, "").trim().slice(0, 200) : dp.ayuda,
+      error: texto(p.error, dp.error, 200),
+      activa: fija ? true : (p.activa === undefined ? dp.activa : p.activa === true),
+      obligatoria: fija ? true : (p.obligatoria === undefined ? dp.obligatoria : p.obligatoria === true),
+    };
+  }
   return {
     titulo: texto(r.titulo, d.titulo, 120),
     intro: texto(r.intro, d.intro, 600),
@@ -2449,6 +2487,8 @@ function normalizarConfigAcreditacion(raw) {
     eventos,
     evento_otro: eventoOtro,
     acreditaciones,
+    secciones,
+    preguntas,
   };
 }
 async function obtenerConfigAcreditacion(env) {
@@ -8063,7 +8103,11 @@ export default {
     // pueden verla (pestaña Funcionalidades > Acreditaciones del panel).
     // Configuración pública del formulario (textos y listas editables desde el panel).
     if (path === "/api/acreditaciones/config" && method === "GET") {
-      return json(await obtenerConfigAcreditacion(env));
+      const cfgPublica = await obtenerConfigAcreditacion(env);
+      let pinLongitud = null;
+      try { const p = await obtenerPinAcreditacion(env); if (p) pinLongitud = p.length; } catch {}
+      // Solo se expone cuántos dígitos tiene el PIN (para pintar las casillas), nunca el PIN.
+      return json({ ...cfgPublica, pin_longitud: pinLongitud });
     }
 
     // Comprobación del PIN al entrar al formulario (acreditacion.html).
@@ -8102,24 +8146,29 @@ export default {
       }
 
       const limpiar = (v, max) => (v ? String(v) : "").replace(/\s+/g, " ").trim().slice(0, max);
+      const cfgAcred = await obtenerConfigAcreditacion(env);
+      const P = cfgAcred.preguntas;
+      const TIPOS_ACREDITACION = cfgAcred.acreditaciones;
       const nombre = limpiar(body.nombre, 200);
       const email = limpiar(body.email, 200).toLowerCase();
-      const dni = limpiar(body.dni, 30).replace(/[\s.-]/g, "").toUpperCase();
+      // Una pregunta oculta desde el panel no se pide ni se guarda aunque llegue en la petición.
+      const dni = P.dni.activa ? limpiar(body.dni, 30).replace(/[\s.-]/g, "").toUpperCase() : "";
       const equipo = limpiar(body.equipo, 200);
-      const tipoEvento = limpiar(body.tipo_evento, 200);
+      const tipoEvento = P.tipo_evento.activa ? limpiar(body.tipo_evento, 200) : "";
       const tipoAcreditacion = limpiar(body.tipo_acreditacion, 200);
-      const funciones = (body.funciones ? String(body.funciones) : "").trim().slice(0, 2000);
-      const jornadaPartido = limpiar(body.jornada_partido, 500);
-      const TIPOS_ACREDITACION = (await obtenerConfigAcreditacion(env)).acreditaciones;
+      const funciones = P.funciones.activa ? (body.funciones ? String(body.funciones) : "").trim().slice(0, 2000) : "";
+      const jornadaPartido = P.jornada_partido.activa ? limpiar(body.jornada_partido, 500) : "";
 
-      if (!nombre) return json({ error: "Indica tu nombre y apellidos" }, 400);
-      if (!emailValido(email)) return json({ error: "Introduce un correo electrónico válido" }, 400);
-      if (!dni || dni.length < 5 || !/^[A-Z0-9]+$/.test(dni)) return json({ error: "Introduce un DNI / NIE válido" }, 400);
-      if (!equipo) return json({ error: "Indica el equipo que deseas cubrir" }, 400);
-      if (!tipoEvento) return json({ error: "Indica el tipo de evento" }, 400);
-      if (!TIPOS_ACREDITACION.includes(tipoAcreditacion)) return json({ error: "Elige un tipo de acreditación" }, 400);
-      if (!funciones) return json({ error: "Describe las funciones que realizarás durante la cobertura" }, 400);
-      if (!jornadaPartido) return json({ error: "Indica la jornada y el partido que quieres cubrir" }, 400);
+      if (!nombre) return json({ error: P.nombre.error }, 400);
+      if (!emailValido(email)) return json({ error: P.email.error }, 400);
+      if (P.dni.activa) {
+        if (dni ? (dni.length < 5 || !/^[A-Z0-9]+$/.test(dni)) : P.dni.obligatoria) return json({ error: P.dni.error }, 400);
+      }
+      if (!equipo) return json({ error: P.equipo.error }, 400);
+      if (P.tipo_evento.activa && P.tipo_evento.obligatoria && !tipoEvento) return json({ error: P.tipo_evento.error }, 400);
+      if (!TIPOS_ACREDITACION.includes(tipoAcreditacion)) return json({ error: P.tipo_acreditacion.error }, 400);
+      if (P.funciones.activa && P.funciones.obligatoria && !funciones) return json({ error: P.funciones.error }, 400);
+      if (P.jornada_partido.activa && P.jornada_partido.obligatoria && !jornadaPartido) return json({ error: P.jornada_partido.error }, 400);
       if (body.confirmo !== true) return json({ error: "Debes confirmar que los datos son correctos" }, 400);
 
       try {
