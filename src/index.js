@@ -5749,10 +5749,23 @@ async function reanudarSegundaParteAutomatica(env, partidosEnJuego) {
 
     const minutoReanudar = Number.isInteger(partido.cronometro_pausado_en) && partido.cronometro_pausado_en > 0
       ? partido.cronometro_pausado_en : MINUTO_DESCANSO_AUTOMATICO;
-    await iniciarCronometroPartido(env, partido.id, minutoReanudar);
+    // El evento "fin_descanso" se registra ANTES de arrancar el cronometro:
+    // el panel de Minuto a Minuto decide si va la 2a parte (y por tanto si
+    // muestra 46' y no 45+1') mirando ese evento, y si recargaba justo entre
+    // las dos escrituras se quedaba sin verlo y pintaba 45+x hasta la
+    // siguiente recarga. Si el arranque falla se retira el evento para que
+    // el siguiente minuto del cron lo reintente.
     await env.DB.prepare(
       `INSERT INTO match_events (resultado_id, tipo, equipo, minuto, orden, var_motivo) VALUES (?, 'fin_descanso', 'ninguno', ?, 1, 'automatico')`
     ).bind(partido.id, 45).run();
+    try {
+      await iniciarCronometroPartido(env, partido.id, minutoReanudar);
+    } catch (err) {
+      console.error("[descanso-automatico] no se pudo reanudar el cronometro:", err.message);
+      await env.DB.prepare(
+        `DELETE FROM match_events WHERE id = (SELECT MAX(id) FROM match_events WHERE resultado_id = ? AND tipo = 'fin_descanso' AND var_motivo = 'automatico')`
+      ).bind(partido.id).run();
+    }
   }
 }
 
@@ -9444,6 +9457,22 @@ const SYNC_RESERVA_SUBREQUESTS = 8; // consultas D1 que cuesta aplicar los event
 let SYNC_PROXIMA_COMPROBACION_MS = 0;
 let SYNC_ULTIMO_VIVO_MS = 0;
 
+// ---- Ahorro de peticiones a TheSportsDB -------------------------
+// Ciclo diario INCREMENTAL: no se vuelven a pedir las jornadas ya
+// cerradas (todos sus partidos finalizados hace mas de 2 dias) ni las
+// futuras ya conocidas que quedan a mas de SYNC_RONDAS_ADELANTE rondas
+// de la ultima jugada. Una vez por semana (y siempre que se pulse el
+// boton manual) se repasa TODO por si la API corrige algo.
+const SYNC_RONDAS_ADELANTE = 3;
+const SYNC_CICLO_COMPLETO_DIAS = 7;
+// Refresco vivo: un partido no termina antes de ~100 min desde el inicio
+// y, si la API aun no trae el resultado, se reintenta con espera creciente
+// (15, 30, 60, 120, 120 min) y se abandona tras SYNC_VIVO_MAX_INTENTOS.
+const SYNC_VIVO_MIN_TRAS_INICIO_MS = 100 * 60 * 1000;
+const SYNC_VIVO_ESPERA_BASE_MS = 15 * 60 * 1000;
+const SYNC_VIVO_ESPERA_MAX_MS = 2 * 60 * 60 * 1000;
+const SYNC_VIVO_MAX_INTENTOS = 6;
+
 function syncSinAcentos(s) {
   return String(s ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
     .replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
@@ -9554,6 +9583,7 @@ async function syncGuardarSetting(env, key, objeto) {
 
 async function syncFetchJson(env, ruta, ctr) {
   ctr.sub++;
+  ctr.api = (ctr.api || 0) + 1; // peticiones reales a TheSportsDB (se guarda en ultima_pasada)
   const clave = env.THESPORTSDB_API_KEY || "3";
   const resp = await fetch(`${SYNC_API_BASE}/${encodeURIComponent(clave)}/${ruta}`, {
     headers: { Accept: "application/json" },
@@ -9580,6 +9610,97 @@ function syncJornadaDeCalendario(calendario, fecha) {
   if (!dia) return null;
   const fila = calendario.find((r) => r.fecha_inicio <= dia && r.fecha_fin >= dia);
   return fila ? fila.jornada : null;
+}
+
+// Rondas que el ciclo incremental puede saltarse (ver SYNC_RONDAS_ADELANTE).
+// Funcion pura: recibe una fila por jornada { jornada, n, fin, ultima } con
+// los partidos que ya hay en BD y devuelve el conjunto de rondas a omitir.
+// Es conservadora: una jornada con menos partidos que lo habitual (modal)
+// o con algun partido sin finalizar NUNCA se omite.
+function syncCalcularOmitidas(filas, hoyFecha, rondasAdelante = SYNC_RONDAS_ADELANTE) {
+  const omitir = new Set();
+  const porRonda = new Map();
+  const frecuencia = new Map();
+  let ultimaJugada = 0;
+  for (const f of filas || []) {
+    const j = Number(f.jornada);
+    const n = Number(f.n) || 0;
+    const fin = Number(f.fin) || 0;
+    if (!Number.isInteger(j) || j < 1 || !n) continue;
+    porRonda.set(j, { n, fin, ultima: String(f.ultima || "").slice(0, 10) });
+    frecuencia.set(n, (frecuencia.get(n) || 0) + 1);
+    if (fin > 0 && j > ultimaJugada) ultimaJugada = j;
+  }
+  if (!porRonda.size) return omitir;
+  // Partidos por jornada "normales": el valor mas repetido (en empate, el mayor).
+  let habitual = 0;
+  let veces = 0;
+  for (const [n, c] of frecuencia) if (c > veces || (c === veces && n > habitual)) { habitual = n; veces = c; }
+  const limite = new Date(Date.parse(`${hoyFecha}T12:00:00Z`) - 2 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  for (const [j, r] of porRonda) {
+    if (r.n < habitual) continue;
+    const cerrada = r.fin === r.n && r.ultima && r.ultima < limite;
+    const lejana = r.fin === 0 && j > ultimaJugada + rondasAdelante;
+    if (cerrada || lejana) omitir.add(j);
+  }
+  return omitir;
+}
+
+// Plan de la liga para el ciclo incremental (1 consulta a D1 por liga y
+// pasada). Si la liga tiene el calendario de jornadas corregido a mano, la
+// jornada guardada puede no coincidir con la ronda de la API: no se omite nada.
+async function syncPlanRondas(env, liga, temporada, ctr, cache) {
+  cache.planes = cache.planes || {};
+  const clave = syncClaveLiga(liga);
+  if (cache.planes[clave]) return cache.planes[clave];
+  let omitir = new Set();
+  try {
+    ctr.sub++;
+    const sobre = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM jornadas_calendario WHERE competicion = ? AND (grupo IS ? OR grupo = ?)`
+    ).bind(liga.competicion, liga.grupo, liga.grupo).first();
+    if (!(Number(sobre?.n) > 0)) {
+      ctr.sub++;
+      const { results } = await env.DB.prepare(
+        `SELECT jornada, COUNT(*) AS n, SUM(CASE WHEN estado = 'finalizado' THEN 1 ELSE 0 END) AS fin, MAX(fecha_partido) AS ultima
+         FROM results
+         WHERE competicion = ? AND (grupo IS ? OR grupo = ?) AND jornada IS NOT NULL AND fecha_partido >= ?
+         GROUP BY jornada`
+      ).bind(liga.competicion, liga.grupo, liga.grupo, `${temporada.slice(0, 4)}-07-01`).all();
+      omitir = syncCalcularOmitidas(results || [], syncPartesMadrid(new Date()).fecha);
+    }
+  } catch (err) {
+    console.error("[sync-partidos] plan de rondas no disponible, se pide todo:", err.message);
+    omitir = new Set();
+  }
+  cache.planes[clave] = omitir;
+  return omitir;
+}
+
+// ¿Este partido programado ya deberia tener resultado en la API?
+// fecha_partido es hora de Madrid ("YYYY-MM-DDTHH:MM") o solo el dia.
+function syncPartidoPendienteDeResultado(fechaPartido, ahora, forzar = false) {
+  const f = String(fechaPartido || "");
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(f)) {
+    const inicio = Date.parse(`${f.slice(0, 16)}:00Z`);
+    const hoy = Date.parse(`${ahora.fecha}T${ahora.hora}:00Z`);
+    if (Number.isNaN(inicio)) return false;
+    return hoy - inicio >= (forzar ? 0 : SYNC_VIVO_MIN_TRAS_INICIO_MS);
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(f)) {
+    // Sin hora: se espera a la noche del propio dia (o a que pase el dia).
+    return f < ahora.fecha || (f === ahora.fecha && (forzar || ahora.hora >= "23:00"));
+  }
+  return false;
+}
+
+// ¿Toca reintentar esta ronda en el refresco vivo? Espera creciente mientras
+// siga igual (misma "firma" de partidos pendientes); si algo se resuelve, se reinicia.
+function syncVivoTocaReintentar(previo, firma, ahoraMs, forzar = false) {
+  if (forzar || !previo || previo.firma !== firma) return true;
+  if (previo.n >= SYNC_VIVO_MAX_INTENTOS) return false;
+  const espera = Math.min(SYNC_VIVO_ESPERA_MAX_MS, SYNC_VIVO_ESPERA_BASE_MS * 2 ** Math.max(0, previo.n - 1));
+  return ahoraMs - Date.parse(previo.ultimo) >= espera;
 }
 
 async function syncCargarAlias(env, ctr, cache) {
@@ -9787,6 +9908,12 @@ async function syncEjecutarPasada(env, { modo, reiniciar = false, forzar = false
       estado.ciclo_inicio = new Date().toISOString();
       estado.cursores = {};
       estado.informe = { ciclo_inicio: estado.ciclo_inicio, ligas: {}, sin_alias: [] };
+      // Manual (reiniciar) y el repaso semanal piden todas las rondas; el resto
+      // del tiempo el ciclo diario es incremental (ver SYNC_RONDAS_ADELANTE).
+      const ultimoCompleto = estado.ultimo_ciclo_completo ? Date.parse(estado.ultimo_ciclo_completo) : 0;
+      estado.ciclo_completo = !!reiniciar || !ultimoCompleto
+        || (Date.now() - ultimoCompleto) > (SYNC_CICLO_COMPLETO_DIAS * 24 - 3) * 60 * 60 * 1000;
+      estado.informe.completo = estado.ciclo_completo;
     }
     estado.en_ejecucion_hasta = new Date(Date.now() + 4 * 60 * 1000).toISOString();
     await syncGuardarSetting(env, SYNC_ESTADO_KEY, estado);
@@ -9811,7 +9938,9 @@ async function syncEjecutarPasada(env, { modo, reiniciar = false, forzar = false
             cursor = liga.rondas + 1;
           } else {
             let vaciasSeguidas = 0;
+            const omitir = estado.ciclo_completo ? new Set() : await syncPlanRondas(env, liga, temporada, ctr, cache);
             while (cursor <= liga.rondas && ctr.sub + SYNC_RESERVA_SUBREQUESTS < ctr.max) {
+              if (omitir.has(cursor)) { ctr.omitidas = (ctr.omitidas || 0) + 1; cursor++; continue; }
               const datos = await syncFetchJson(env, `eventsround.php?id=${liga.leagueId}&r=${cursor}&s=${encodeURIComponent(temporada)}`, ctr);
               const evs = (datos?.events || []).map((e) => ({ ...e, _ronda: cursor }));
               if (evs.length) { eventos.push(...evs); vaciasSeguidas = 0; } else vaciasSeguidas++;
@@ -9851,31 +9980,58 @@ async function syncEjecutarPasada(env, { modo, reiniciar = false, forzar = false
         estado.ciclo_en_curso = false;
         estado.ultimo_ciclo_fin = new Date().toISOString();
         estado.informe.ciclo_fin = estado.ultimo_ciclo_fin;
+        if (estado.ciclo_completo) estado.ultimo_ciclo_completo = estado.ultimo_ciclo_fin;
       }
     } else {
-      // Modo "vivo": partidos automaticos que ya han empezado y siguen sin resultado.
-      const ahora = syncPartesMadrid(new Date());
-      const ayer = syncPartesMadrid(new Date(Date.now() - 36 * 60 * 60 * 1000)).fecha;
+      // Modo "vivo": partidos automaticos que ya deberian haber terminado y siguen sin resultado.
+      const ahoraMs = Date.now();
+      const ahora = syncPartesMadrid(new Date(ahoraMs));
+      const ayer = syncPartesMadrid(new Date(ahoraMs - 30 * 60 * 60 * 1000)).fecha;
       ctr.sub++;
-      const { results: pend } = await env.DB.prepare(
-        `SELECT DISTINCT competicion, grupo, jornada FROM results
+      const { results: cand } = await env.DB.prepare(
+        `SELECT id, competicion, grupo, jornada, fecha_partido FROM results
          WHERE fuente LIKE 'auto%' AND estado = 'programado' AND autor_id IS NULL
            AND fecha_partido <= ? AND fecha_partido >= ?`
       ).bind(`${ahora.fecha}T${ahora.hora}`, ayer).all();
-      for (const p of pend || []) {
+
+      // Una peticion por (liga, ronda), no por partido.
+      const grupos = new Map();
+      for (const p of cand || []) {
+        if (!p.jornada || !syncPartidoPendienteDeResultado(p.fecha_partido, ahora, forzar)) continue;
         const liga = ligas.find((l) => l.competicion === p.competicion && (l.grupo || null) === (p.grupo || null))
           || ligas.find((l) => l.competicion === p.competicion && !p.grupo);
-        if (!liga || !p.jornada) continue;
+        if (!liga) continue;
+        const clave = `${syncClaveLiga(liga)}|${p.jornada}`;
+        const g = grupos.get(clave) || { clave, liga, jornada: p.jornada, ids: [] };
+        g.ids.push(p.id);
+        grupos.set(clave, g);
+      }
+
+      const previos = estado.vivo_intentos || {};
+      const intentos = {};
+      let peticionesVivo = 0;
+      for (const g of grupos.values()) {
+        const firma = g.ids.slice().sort((a, b) => a - b).join(",");
+        const previo = previos[g.clave];
+        intentos[g.clave] = previo || { n: 0, ultimo: null, firma };
+        if (!syncVivoTocaReintentar(previo, firma, ahoraMs, forzar)) continue;
         if (ctr.sub + SYNC_RESERVA_SUBREQUESTS > ctr.max) break;
+        peticionesVivo++;
+        intentos[g.clave] = { n: (previo && previo.firma === firma ? previo.n : 0) + 1, ultimo: new Date().toISOString(), firma };
         try {
-          const datos = await syncFetchJson(env, `eventsround.php?id=${liga.leagueId}&r=${p.jornada}&s=${encodeURIComponent(temporada)}`, ctr);
-          const resumen = await syncAplicarEventos(env, liga, datos?.events || [], p.jornada, temporada, ctr, cache);
-          syncSumarResumen(estado.informe, liga, resumen);
-          if (resumen.error) errores.push(`${syncClaveLiga(liga)}: ${resumen.error}`);
+          const datos = await syncFetchJson(env, `eventsround.php?id=${g.liga.leagueId}&r=${g.jornada}&s=${encodeURIComponent(temporada)}`, ctr);
+          const resumen = await syncAplicarEventos(env, g.liga, datos?.events || [], g.jornada, temporada, ctr, cache);
+          syncSumarResumen(estado.informe, g.liga, resumen);
+          if (resumen.error) errores.push(`${syncClaveLiga(g.liga)}: ${resumen.error}`);
         } catch (err) {
-          errores.push(`${syncClaveLiga(liga)}: ${err.message}`);
+          errores.push(`${syncClaveLiga(g.liga)}: ${err.message}`);
+          // 429: no se sigue golpeando la API en esta pasada.
+          if (/\(429\)/.test(String(err.message))) break;
         }
       }
+      // Sin nada que pedir (lo habitual casi todo el dia): no se escribe nada en BD.
+      if (!peticionesVivo && !forzar) return { ok: true, errores: [], estado, sin_peticiones: true };
+      estado.vivo_intentos = intentos;
       estado.ultimo_vivo = new Date().toISOString();
     }
   } catch (err) {
@@ -9885,6 +10041,7 @@ async function syncEjecutarPasada(env, { modo, reiniciar = false, forzar = false
   estado.en_ejecucion_hasta = null;
   estado.ultima_pasada = {
     modo, at: new Date().toISOString(), ms: Date.now() - inicioMs, subrequests: ctr.sub,
+    peticiones_api: ctr.api || 0, rondas_omitidas: ctr.omitidas || 0,
     errores: errores.slice(0, 10),
   };
   await syncGuardarSetting(env, SYNC_ESTADO_KEY, estado);
@@ -9901,6 +10058,10 @@ async function syncEjecutarPasada(env, { modo, reiniciar = false, forzar = false
 // Llamado desde el cron de cada minuto. Se autolimita a una comprobacion
 // cada 5 min por isolate y, ademas, decide si toca ciclo, vivo o nada.
 async function sincronizarPartidosAutomaticosSiToca(env) {
+  // Interruptor para que solo UN backend llame a TheSportsDB (p. ej. en el
+  // secundario de Railway: SYNC_PARTIDOS_DESACTIVADO=1). Los resultados le
+  // llegan por la replicacion D1 -> PostgreSQL. No afecta a las rutas admin.
+  if (String(env.SYNC_PARTIDOS_DESACTIVADO || "") === "1") return;
   if (Date.now() < SYNC_PROXIMA_COMPROBACION_MS) return;
   SYNC_PROXIMA_COMPROBACION_MS = Date.now() + 5 * 60 * 1000;
   try {
@@ -9916,7 +10077,13 @@ async function sincronizarPartidosAutomaticosSiToca(env) {
       const horaMadrid = parseInt(syncPartesMadrid(new Date()).hora.slice(0, 2), 10);
       // Un ciclo completo al dia, de madrugada (o ya, si nunca se ha hecho).
       if (!ultimoFin || (Date.now() - ultimoFin > 22 * 60 * 60 * 1000 && horaMadrid >= 4)) modo = "ciclo";
-      else if (Date.now() - SYNC_ULTIMO_VIVO_MS > 15 * 60 * 1000) { modo = "vivo"; SYNC_ULTIMO_VIVO_MS = Date.now(); }
+      else {
+        // El "ultimo vivo" se lee tambien del estado guardado: la variable del
+        // modulo se pierde cuando el isolate se recicla y entonces el vivo
+        // se lanzaba en cada comprobacion en vez de cada 15 min.
+        const ultimoVivo = Math.max(SYNC_ULTIMO_VIVO_MS, estado.ultimo_vivo ? Date.parse(estado.ultimo_vivo) || 0 : 0);
+        if (Date.now() - ultimoVivo > 15 * 60 * 1000) { modo = "vivo"; SYNC_ULTIMO_VIVO_MS = Date.now(); }
+      }
     }
     if (modo) await syncEjecutarPasada(env, { modo });
   } catch (err) {
@@ -9948,8 +10115,36 @@ async function syncRutasAdmin(request, env, path, method, url) {
     const { config, estado } = await syncLeerConfigYEstado(env);
     const fila = await env.DB.prepare("SELECT ultimo_sync_at, ultimo_sync_ok, ultimo_error FROM sync_partidos_auto WHERE id = 1").first();
     const conteo = await env.DB.prepare("SELECT COUNT(*) AS n FROM results WHERE fuente LIKE 'auto%'").first();
+    // Foto REAL de cada liga en BD (no depende de lo que tocara la ultima
+    // pasada, que con el ciclo incremental solo ve unas pocas rondas).
+    let resumenLigas = {};
+    try {
+      const temporadaResumen = config.temporada || syncTemporada();
+      const { results: grupos } = await env.DB.prepare(
+        `SELECT competicion, grupo, COUNT(*) AS total,
+                SUM(CASE WHEN estado = 'finalizado' THEN 1 ELSE 0 END) AS finalizados,
+                SUM(CASE WHEN estado = 'programado' THEN 1 ELSE 0 END) AS programados,
+                SUM(CASE WHEN fuente LIKE 'auto%' THEN 1 ELSE 0 END) AS automaticos,
+                SUM(CASE WHEN fuente LIKE 'auto%' THEN 0 ELSE 1 END) AS redaccion,
+                MAX(CASE WHEN estado = 'finalizado' THEN jornada END) AS ultima_jornada
+         FROM results
+         WHERE competicion IN ('hypermotion', 'primera_federacion', 'segunda_federacion')
+           AND (fecha_partido IS NULL OR fecha_partido >= ?)
+         GROUP BY competicion, grupo`
+      ).bind(`${temporadaResumen.slice(0, 4)}-07-01`).all();
+      for (const g of grupos || []) {
+        resumenLigas[`${g.competicion}|${g.grupo || ""}`] = {
+          total: Number(g.total) || 0, finalizados: Number(g.finalizados) || 0,
+          programados: Number(g.programados) || 0, automaticos: Number(g.automaticos) || 0,
+          redaccion: Number(g.redaccion) || 0, ultima_jornada: g.ultima_jornada === null || g.ultima_jornada === undefined ? null : Number(g.ultima_jornada),
+        };
+      }
+    } catch (err) {
+      console.error("[sync-partidos] resumen de ligas no disponible:", err.message);
+    }
     return json({
       config, estado, sync: fila || null,
+      resumen_ligas: resumenLigas,
       partidos_automaticos: conteo?.n ?? 0,
       clave_premium: !!env.THESPORTSDB_API_KEY && env.THESPORTSDB_API_KEY !== "3",
       temporada_actual: config.temporada || syncTemporada(),
@@ -9977,8 +10172,27 @@ async function syncRutasAdmin(request, env, path, method, url) {
   }
 
   if (path === "/api/admin/sync-partidos/ligas" && method === "GET") {
+    // La lista de ligas de Espana casi no cambia: se cachea 24 h (si el
+    // entorno tiene Cache API) para no gastar una peticion por cada apertura.
     const ctr = { sub: 0 };
-    const datos = await syncFetchJson(env, "search_all_leagues.php?c=Spain&s=Soccer", ctr);
+    const claveCache = new Request("https://cache.elotrofutbol.local/tsdb/search_all_leagues/spain");
+    let datos = null;
+    try {
+      if (typeof caches !== "undefined" && caches.default) {
+        const acierto = await caches.default.match(claveCache);
+        if (acierto) datos = await acierto.json();
+      }
+    } catch { datos = null; }
+    if (!datos) {
+      datos = await syncFetchJson(env, "search_all_leagues.php?c=Spain&s=Soccer", ctr);
+      try {
+        if (typeof caches !== "undefined" && caches.default && datos) {
+          await caches.default.put(claveCache, new Response(JSON.stringify(datos), {
+            headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=86400" },
+          }));
+        }
+      } catch { /* sin cache: no pasa nada */ }
+    }
     const ligas = (datos?.countries || datos?.leagues || []).map((l) => ({ id: l.idLeague, nombre: l.strLeague, alternativo: l.strLeagueAlternate || null }));
     return json({ ligas });
   }
