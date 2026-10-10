@@ -2578,7 +2578,7 @@ const FORMULARIO_TIPOS_SIN_RESPUESTA = ["seccion", "enlaces"];
 const FORMULARIO_MAX_ENLACES = 12;
 const FORMULARIO_TIPOS_CON_OPCIONES = ["desplegable", "opcion", "casillas"];
 const FORMULARIO_MAX_CAMPOS = 60;
-const FORMULARIO_MAX_OPCIONES = 100;
+const FORMULARIO_MAX_OPCIONES = 200;
 
 function formularioLimpiarTexto(v, max) {
   return (v === null || v === undefined ? "" : String(v)).replace(/\s+/g, " ").trim().slice(0, max);
