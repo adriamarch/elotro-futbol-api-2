@@ -15660,6 +15660,29 @@ async function handlePrimary(request, env, ctx) {
         }
         const referenciaPago = normalizarTexto(body.referencia_pago);
 
+        // Método de pago y forma de entrega (se guardan en columnas propias,
+        // ya no hace falta mirar el prefijo de la referencia).
+        const metodoPago = body.metodo_pago === undefined || body.metodo_pago === null || body.metodo_pago === ""
+          ? "bizum" : String(body.metodo_pago).toLowerCase();
+        if (!["bizum", "paypal"].includes(metodoPago)) {
+          return json({ error: "Método de pago no válido" }, 400);
+        }
+        const entrega = body.entrega === undefined || body.entrega === null || body.entrega === ""
+          ? "mano" : String(body.entrega).toLowerCase();
+        if (!["mano", "envio"].includes(entrega)) {
+          return json({ error: "Forma de entrega no válida" }, 400);
+        }
+        let direccionEnvio = null;
+        if (entrega === "envio") {
+          direccionEnvio = normalizarTexto(body.direccion_envio);
+          if (!direccionEnvio || direccionEnvio.length < 10) {
+            return json({ error: "Escribe la dirección completa de envío (nombre, calle, código postal, ciudad y teléfono)" }, 400);
+          }
+          if (direccionEnvio.length > 400) {
+            return json({ error: "La dirección de envío es demasiado larga (máximo 400 caracteres)" }, 400);
+          }
+        }
+
         // Cantidad: cada unidad es una fila de tienda_pedidos (ver
         // migracion_tienda.sql), así que pedir 3 crea 3 pedidos que se
         // gestionan por separado. Máximo 10 por pedido para evitar
@@ -15686,19 +15709,32 @@ async function handlePrimary(request, env, ctx) {
         for (let i = 0; i < cantidad; i++) {
           const { meta } = await env.DB.prepare(
             `INSERT INTO tienda_pedidos
-               (usuario_id, producto_id, producto_nombre, variante, precio_centimos, referencia_pago)
-             VALUES (?, ?, ?, ?, ?, ?)`
+               (usuario_id, producto_id, producto_nombre, variante, precio_centimos, referencia_pago,
+                metodo_pago, entrega, direccion_envio)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
           ).bind(payload.uid, producto.id, producto.nombre, variantesDisponibles.length ? variante : null,
-                 producto.precio_centimos, referenciaPago).run();
+                 producto.precio_centimos, referenciaPago, metodoPago, entrega, direccionEnvio).run();
           pedidosIds.push(meta.last_row_id);
         }
 
+        // Número de pedido: uno solo para todas las unidades de esta compra,
+        // derivado del id de la primera fila (EOF-0042). Es lo que la persona
+        // pone de concepto en el Bizum/PayPal y lo que se busca al confirmar.
+        const codigo = "EOF-" + String(pedidosIds[0]).padStart(4, "0");
+        await env.DB.prepare(
+          `UPDATE tienda_pedidos SET codigo = ? WHERE id IN (${pedidosIds.map(() => "?").join(",")})`
+        ).bind(codigo, ...pedidosIds).run();
+
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "crear_pedido_tienda", entidad: "pedido_tienda", entidad_id: pedidosIds[0],
-          descripcion: `${payload.nombre} ha pedido ${cantidad > 1 ? cantidad + " x " : ""}"${producto.nombre}"${variante ? " (" + variante + ")" : ""} en la tienda`,
+          descripcion: `${payload.nombre} ha pedido ${cantidad > 1 ? cantidad + " x " : ""}"${producto.nombre}"${variante ? " (" + variante + ")" : ""} en la tienda (${codigo}, ${metodoPago}, ${entrega === "envio" ? "envío" : "en mano"})`,
         }));
 
-        return json({ ok: true, pedido_id: pedidosIds[0], pedidos_ids: pedidosIds, cantidad });
+        return json({
+          ok: true, pedido_id: pedidosIds[0], pedidos_ids: pedidosIds, cantidad,
+          codigo, metodo_pago: metodoPago, entrega,
+          total_centimos: producto.precio_centimos * cantidad,
+        });
       }
 
       // Pedidos del propio redactor (para ver en qué estado está lo que
@@ -15707,8 +15743,11 @@ async function handlePrimary(request, env, ctx) {
         const payload = await requireAuthTienda(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         const { results: pedidos } = await env.DB.prepare(
-          `SELECT id, producto_nombre, variante, precio_centimos, estado, referencia_pago, created_at
-           FROM tienda_pedidos WHERE usuario_id = ? ORDER BY created_at DESC`
+          `SELECT tp.id, tp.producto_nombre, tp.variante, tp.precio_centimos, tp.estado, tp.referencia_pago, tp.created_at,
+                  tp.codigo, tp.metodo_pago, tp.entrega, tp.direccion_envio,
+                  (SELECT COUNT(*) FROM tienda_pedidos t2 WHERE t2.codigo = tp.codigo AND tp.codigo IS NOT NULL) AS unidades_pedido,
+                  (SELECT COALESCE(SUM(t2.precio_centimos), 0) FROM tienda_pedidos t2 WHERE t2.codigo = tp.codigo AND tp.codigo IS NOT NULL) AS total_pedido_centimos
+           FROM tienda_pedidos tp WHERE tp.usuario_id = ? ORDER BY tp.created_at DESC, tp.id DESC`
         ).bind(payload.uid).all();
         return json({ pedidos });
       }
@@ -15782,6 +15821,9 @@ async function handlePrimary(request, env, ctx) {
         const estado = url.searchParams.get("estado");
         let query = `SELECT tp.id, tp.producto_nombre, tp.variante, tp.precio_centimos, tp.estado,
                             tp.referencia_pago, tp.nota_gestion, tp.created_at, tp.gestionado_en,
+                            tp.codigo, tp.metodo_pago, tp.entrega, tp.direccion_envio,
+                            (SELECT COUNT(*) FROM tienda_pedidos t2 WHERE t2.codigo = tp.codigo AND tp.codigo IS NOT NULL) AS unidades_pedido,
+                            (SELECT COALESCE(SUM(t2.precio_centimos), 0) FROM tienda_pedidos t2 WHERE t2.codigo = tp.codigo AND tp.codigo IS NOT NULL) AS total_pedido_centimos,
                             u.nombre AS redactor_nombre, u.email AS redactor_email
                      FROM tienda_pedidos tp
                      JOIN users u ON u.id = tp.usuario_id`;
@@ -15790,7 +15832,7 @@ async function handlePrimary(request, env, ctx) {
           query += " WHERE tp.estado = ?";
           binds.push(estado);
         }
-        query += " ORDER BY tp.created_at DESC";
+        query += " ORDER BY tp.created_at DESC, tp.id DESC";
         const { results: pedidos } = await env.DB.prepare(query).bind(...binds).all();
         return json({ pedidos });
       }
