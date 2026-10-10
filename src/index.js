@@ -1827,6 +1827,7 @@ async function enviarEmailNotificacion(env, { asunto, texto, html }, { destinata
   }
 }
 
+
 // ---------- Anuncios por correo (panel de admin) ----------
 // Un admin escribe un anuncio y lo manda a colaboradores (admins, redactores,
 // fotógrafos) y/o a lectores (cuentas verificadas y/o suscriptores del
@@ -9735,8 +9736,45 @@ const CACHE_PUBLICA_TTL_MS = {
   "/api/settings": 60000,
   "/api/club-info": 60000,
   "/api/media/publica": 30000,
+  "/api/custom-clubs": 60000,
 };
 const CACHE_PUBLICA = new Map(); // clave -> { exp, texto }
+
+// Capa 2: caché de BORDE (Cache API de Cloudflare), compartida por todos los
+// isolates de un mismo centro de datos. La capa 1 (el Map de arriba) vive en
+// UN isolate; con tráfico repartido entre varios, cada uno volvía a preguntar
+// a D1 por la misma portada/noticia. Con la capa 2, una misma URL pública se
+// resuelve en D1 como mucho una vez por TTL y por centro de datos.
+// Mismas reglas de elegibilidad que la capa 1 (ttlCachePublica): solo GET sin
+// Authorization, sin admin=1, solo 200 JSON generado por json(). Se guarda el
+// texto (no la Response) y CORS se reaplica con el Origin de cada petición.
+// Si "caches" no existe (worker secundario en Node) esta capa es un no-op.
+function cacheBordeDisponible() {
+  return typeof caches !== "undefined" && !!caches.default;
+}
+function claveCacheBorde(url) {
+  return new Request(url.toString(), { method: "GET" });
+}
+async function leerTextoCacheBorde(url) {
+  if (!cacheBordeDisponible()) return null;
+  try {
+    const r = await caches.default.match(claveCacheBorde(url));
+    return r ? await r.text() : null;
+  } catch { return null; }
+}
+function guardarTextoCacheBorde(url, texto, ttlMs, ctx) {
+  if (!cacheBordeDisponible() || !ctx || typeof ctx.waitUntil !== "function") return;
+  try {
+    ctx.waitUntil(
+      caches.default.put(
+        claveCacheBorde(url),
+        new Response(texto, {
+          headers: { "Content-Type": "application/json", "Cache-Control": `public, max-age=${Math.max(1, Math.round(ttlMs / 1000))}` },
+        })
+      ).catch(() => {})
+    );
+  } catch { /* la caché nunca debe romper la petición */ }
+}
 const CACHE_PUBLICA_MAX = 200;
 const CACHE_PUBLICA_MAX_BYTES = 512 * 1024;
 
@@ -9771,6 +9809,18 @@ async function handlePrimaryConCache(request, env, ctx) {
       headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
     }), ORIGEN_PETICION_ACTUAL);
   }
+  // Capa 2 (borde): si otro isolate del centro de datos ya la resolvió hace
+  // poco, se sirve de aquí sin tocar D1 y se sube a la capa 1.
+  const textoBorde = await leerTextoCacheBorde(url);
+  if (textoBorde !== null) {
+    if (textoBorde.length <= CACHE_PUBLICA_MAX_BYTES && CACHE_PUBLICA.size < CACHE_PUBLICA_MAX) {
+      CACHE_PUBLICA.set(clave, { exp: ahora + Math.min(ttl, 5000), texto: textoBorde });
+    }
+    return cors(new Response(textoBorde, {
+      status: 200,
+      headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+    }), ORIGEN_PETICION_ACTUAL);
+  }
   const resp = await handlePrimary(request, env, ctx);
   try {
     if (
@@ -9785,6 +9835,7 @@ async function handlePrimaryConCache(request, env, ctx) {
           if (CACHE_PUBLICA.size >= CACHE_PUBLICA_MAX) CACHE_PUBLICA.clear();
         }
         CACHE_PUBLICA.set(clave, { exp: ahora + ttl, texto });
+        guardarTextoCacheBorde(url, texto, ttl, ctx);
       }
     }
   } catch { /* si no se puede guardar, se sirve igual la respuesta normal */ }
@@ -14236,9 +14287,16 @@ async function handlePrimary(request, env, ctx) {
           return new Response(null, { status: 204 });
         }
 
-        const articulo = await env.DB.prepare(
-          "SELECT id FROM articles WHERE (slug = ?1 OR id = ?2) AND publicado = 1"
-        ).bind(slugOId, isNaN(slugOId) ? -1 : parseInt(slugOId)).first();
+        // slug -> id se memoriza 60 s en el isolate: antes cada vista hacía
+        // este SELECT además del INSERT. No se memoriza el "no encontrado".
+        const claveArticuloTrack = `trkart:${slugOId}`;
+        const articulo = await memoCorta(claveArticuloTrack, 60000, async () => {
+          const fila = await env.DB.prepare(
+            "SELECT id FROM articles WHERE (slug = ?1 OR id = ?2) AND publicado = 1"
+          ).bind(slugOId, isNaN(slugOId) ? -1 : parseInt(slugOId)).first();
+          if (!fila) CACHE_CORTA.delete(claveArticuloTrack);
+          return fila;
+        });
         if (!articulo) return json({ error: "Noticia no encontrada" }, 404);
 
         const visitanteHash = await hashVisitante(request, env);
@@ -14278,7 +14336,12 @@ async function handlePrimary(request, env, ctx) {
           return new Response(null, { status: 204 });
         }
 
-        const partido = await env.DB.prepare("SELECT id FROM results WHERE id = ?").bind(resultId).first();
+        const claveResultTrack = `trkres:${resultId}`;
+        const partido = await memoCorta(claveResultTrack, 300000, async () => {
+          const fila = await env.DB.prepare("SELECT id FROM results WHERE id = ?").bind(resultId).first();
+          if (!fila) CACHE_CORTA.delete(claveResultTrack);
+          return fila;
+        });
         if (!partido) return json({ error: "Partido no encontrado" }, 404);
 
         const visitanteHash = await hashVisitante(request, env);
@@ -14315,7 +14378,14 @@ async function handlePrimary(request, env, ctx) {
         // debe desvirtuar la media de tiempo de lectura.
         segundos = Math.max(0, Math.min(segundos, 1800));
 
-        const vista = await env.DB.prepare("SELECT article_id FROM article_views WHERE id = ?").bind(viewId).first();
+        // Cada heartbeat de la misma vista repetía este SELECT: la vista ->
+        // artículo no cambia nunca, así que se memoriza 10 min en el isolate.
+        const claveVistaTrack = `trkvista:${viewId}`;
+        const vista = await memoCorta(claveVistaTrack, 600000, async () => {
+          const fila = await env.DB.prepare("SELECT article_id FROM article_views WHERE id = ?").bind(viewId).first();
+          if (!fila) CACHE_CORTA.delete(claveVistaTrack);
+          return fila;
+        });
         if (!vista) return json({ error: "Vista no encontrada" }, 404);
 
         // No se usa el helper genérico "?" -> "$n" de sql-compat aquí
