@@ -2715,12 +2715,42 @@ async function opcionesUsadasFormulario(env, f, campos) {
   const usadas = new Map(unicos.map((c) => [c.id, new Set()]));
   if (!unicos.length) return usadas;
   const { results } = await env.DB.prepare("SELECT datos FROM formularios_respuestas WHERE formulario_id = ?").bind(f.id).all();
+  const crudas = new Map(unicos.map((c) => [c.id, []]));
   for (const r of (results || [])) {
     let datos = {};
     try { datos = JSON.parse(String(r.datos || "{}")) || {}; } catch {}
-    for (const c of unicos) { const v = datos[c.id]; if (typeof v === "string" && v) usadas.get(c.id).add(normalizarOpcionUnica(v)); }
+    for (const c of unicos) {
+      const v = datos[c.id];
+      if (typeof v === "string" && v) { usadas.get(c.id).add(normalizarOpcionUnica(v)); crudas.get(c.id).push(v); }
+    }
+  }
+  // Respuestas antiguas o importadas pueden llevar el nombre del equipo escrito de otra forma
+  // («Daniel — Cacereño CF» frente a «Daniel — CP Cacereño»): si es la misma persona, la opción también cuenta como usada.
+  for (const c of unicos) {
+    const vistas = crudas.get(c.id);
+    if (!vistas.length) continue;
+    for (const o of (c.opciones || [])) {
+      const k = normalizarOpcionUnica(o);
+      if (!usadas.get(c.id).has(k) && vistas.some((v) => opcionesEquivalentesFormulario(o, v))) usadas.get(c.id).add(k);
+    }
   }
   return usadas;
+}
+// Clave de equipo sin prefijos ni artículos: «CP Cacereño» y «Cacereño CF» dan la misma clave.
+const FORMULARIO_EQUIPO_RUIDO = new Set(["cd", "cf", "cp", "ud", "sd", "rc", "rcd", "ad", "ce", "ue", "fc", "club", "de", "del", "la", "el", "los", "las", "y", "real"]);
+function claveEquipoFormulario(t) {
+  return normalizarOpcionUnica(t).replace(/[^a-z0-9 ]+/g, " ").split(" ").filter((x) => x && !FORMULARIO_EQUIPO_RUIDO.has(x)).sort().join(" ");
+}
+// Dos opciones de la lista (o una respuesta y una opción) son la misma persona si tienen el mismo nombre
+// y comparten algún equipo (por clave) o categoría fija. Con otro equipo NO se unifican (dos «Laura» distintas).
+function opcionesEquivalentesFormulario(a, b) {
+  if (normalizarOpcionUnica(a) === normalizarOpcionUnica(b)) return true;
+  const da = datosUsuarioDesdeOpcionFormulario(a), db = datosUsuarioDesdeOpcionFormulario(b);
+  const na = normalizarOpcionUnica(da.nombre), nb = normalizarOpcionUnica(db.nombre);
+  if (!na || na !== nb) return false;
+  if (da.categorias_fijas.some((c) => db.categorias_fijas.includes(c))) return true;
+  const ea = da.equipos.map(claveEquipoFormulario).filter(Boolean), eb = db.equipos.map(claveEquipoFormulario).filter(Boolean);
+  return ea.some((e) => eb.includes(e));
 }
 // Igual que formularioPublico, pero quitando de los campos "unica" las opciones que ya se han usado.
 async function formularioPublicoDisponible(env, f, conContenido) {
@@ -2892,7 +2922,7 @@ function comprobarAccesoFormulario(f, pinRecibido) {
 }
 // Valida las respuestas de un visitante contra los campos del formulario.
 // Devuelve { datos, resumen } o { error }.
-function validarRespuestasFormulario(campos, recibidas) {
+function validarRespuestasFormulario(campos, recibidas, opts = {}) {
   const r = recibidas && typeof recibidas === "object" ? recibidas : {};
   const datos = {};
   for (const c of campos) {
@@ -2906,7 +2936,7 @@ function validarRespuestasFormulario(campos, recibidas) {
     const v = r[c.id];
     const vacio = (v === undefined || v === null || v === "" || (Array.isArray(v) && !v.length) || v === false);
     if (vacio) {
-      if (c.obligatorio) return { error: c.tipo === "confirmacion" ? `Debes marcar: ${c.etiqueta}` : `Falta responder: ${c.etiqueta}` };
+      if (c.obligatorio && opts.estricto !== false) return { error: c.tipo === "confirmacion" ? `Debes marcar: ${c.etiqueta}` : `Falta responder: ${c.etiqueta}` };
       continue;
     }
     switch (c.tipo) {
@@ -11856,6 +11886,49 @@ async function handlePrimary(request, env, ctx) {
             "UPDATE formularios_respuestas SET estado = ?, nota_admin = ?, updated_at = datetime('now') WHERE id = ?"
           ).bind(estado, nota || null, id).run();
           return json({ ok: true });
+        }
+
+        // Edición de una respuesta por un admin (corregir erratas, completar datos...).
+        // Los campos que dan de alta un usuario no se tocan (el usuario ya está creado) y los
+        // datos de campos que ya no existen en el formulario se conservan. No se exigen los
+        // campos obligatorios (hay respuestas antiguas o importadas que pueden no tenerlos).
+        if (path.match(/^\/api\/formularios\/respuestas\/\d+$/) && method === "PUT") {
+          const id = idDe(path);
+          const body = await request.json().catch(() => ({}));
+          const r = await env.DB.prepare("SELECT id, formulario_id, datos FROM formularios_respuestas WHERE id = ?").bind(id).first();
+          if (!r) return json({ error: "Respuesta no encontrada" }, 404);
+          const f = await env.DB.prepare("SELECT id, slug, campos FROM formularios WHERE id = ?").bind(r.formulario_id).first();
+          if (!f) return json({ error: "Formulario no encontrado" }, 404);
+          const campos = camposConAltaPorDefecto(f.slug, parsearCamposFormulario(f.campos));
+          let antes = {};
+          try { antes = JSON.parse(String(r.datos || "{}")) || {}; } catch {}
+          const recibidas = { ...((body && typeof body.respuestas === "object" && body.respuestas) || {}) };
+          const v = validarRespuestasFormulario(campos, recibidas, { estricto: false });
+          if (v.error) return json({ error: v.error }, 400);
+          const datos = {};
+          const ids = new Set(campos.map((c) => c.id));
+          for (const [k, val] of Object.entries(antes)) { if (!ids.has(k)) datos[k] = val; }
+          Object.assign(datos, v.datos);
+          if (!Object.keys(datos).length) return json({ error: "La respuesta no puede quedar vacía. Si quieres quitarla, elimínala." }, 400);
+          // Opciones de un solo uso: no se puede cambiar a una que ya tiene otra respuesta.
+          try {
+            const { results } = await env.DB.prepare("SELECT id, datos FROM formularios_respuestas WHERE formulario_id = ? AND id <> ?").bind(f.id, id).all();
+            for (const c of campos) {
+              if (!c.unica || (c.tipo !== "desplegable" && c.tipo !== "opcion")) continue;
+              const val = datos[c.id];
+              if (typeof val !== "string" || !val || val === antes[c.id]) continue;
+              const clave = normalizarOpcionUnica(val);
+              for (const o of (results || [])) {
+                let d = {}; try { d = JSON.parse(String(o.datos || "{}")) || {}; } catch {}
+                if (typeof d[c.id] === "string" && normalizarOpcionUnica(d[c.id]) === clave) {
+                  return json({ error: `«${val}» ya la ha elegido otra respuesta en: ${c.etiqueta}` }, 409);
+                }
+              }
+            }
+          } catch (err) { console.error("[formularios/editar-unicas]", err); }
+          await env.DB.prepare("UPDATE formularios_respuestas SET datos = ?, updated_at = datetime('now') WHERE id = ?")
+            .bind(JSON.stringify(datos), id).run();
+          return json({ ok: true, datos });
         }
 
         if (path.match(/^\/api\/formularios\/respuestas\/\d+$/) && method === "DELETE") {
