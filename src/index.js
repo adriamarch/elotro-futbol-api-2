@@ -2655,7 +2655,11 @@ function normalizarCamposFormulario(raw) {
       if (!opciones.length) return { error: `El campo "${etiqueta}" necesita al menos una opción` };
       if (opciones.length > FORMULARIO_MAX_OPCIONES) return { error: `El campo "${etiqueta}" admite como máximo ${FORMULARIO_MAX_OPCIONES} opciones` };
       campo.opciones = opciones;
-      if (tipo !== "casillas") campo.permitir_otro = c.permitir_otro === true || c.permitir_otro === 1;
+      if (tipo !== "casillas") {
+        campo.permitir_otro = c.permitir_otro === true || c.permitir_otro === 1;
+        // "unica": cada opción solo se puede elegir una vez; al usarla desaparece para los demás (p. ej. nombres).
+        if (c.unica === true || c.unica === 1) campo.unica = true;
+      }
     }
     // Campo condicional: solo se muestra (y se valida) si un campo ANTERIOR tiene cierto valor.
     // Ej.: { campo: "rol", igual: "Redactor" }. Sirve para formularios con ramas por perfil.
@@ -2687,6 +2691,34 @@ function formularioPublico(f, conContenido = true) {
     acceso: f.acceso === "pin" ? "pin" : "libre",
     pin_longitud: f.acceso === "pin" && f.pin ? String(f.pin).length : null,
   };
+}
+// Opciones de un solo uso (campo.unica): se comparan sin tildes, mayúsculas ni guiones para que
+// una respuesta antigua con "Miguel - Linares" o "Ángel" siga contando como usada.
+function normalizarOpcionUnica(t) {
+  return String(t || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[-\u2013\u2014]/g, " ").replace(/\s+/g, " ").trim();
+}
+async function opcionesUsadasFormulario(env, f, campos) {
+  const unicos = campos.filter((c) => c.unica && (c.tipo === "desplegable" || c.tipo === "opcion"));
+  const usadas = new Map(unicos.map((c) => [c.id, new Set()]));
+  if (!unicos.length) return usadas;
+  const { results } = await env.DB.prepare("SELECT datos FROM formularios_respuestas WHERE formulario_id = ?").bind(f.id).all();
+  for (const r of (results || [])) {
+    let datos = {};
+    try { datos = JSON.parse(String(r.datos || "{}")) || {}; } catch {}
+    for (const c of unicos) { const v = datos[c.id]; if (typeof v === "string" && v) usadas.get(c.id).add(normalizarOpcionUnica(v)); }
+  }
+  return usadas;
+}
+// Igual que formularioPublico, pero quitando de los campos "unica" las opciones que ya se han usado.
+async function formularioPublicoDisponible(env, f, conContenido) {
+  const pub = formularioPublico(f, conContenido);
+  if (!pub.campos.length) return pub;
+  const usadas = await opcionesUsadasFormulario(env, f, pub.campos);
+  pub.campos = pub.campos.map((c) => {
+    const u = usadas.get(c.id);
+    return u && u.size ? { ...c, opciones: c.opciones.filter((o) => !u.has(normalizarOpcionUnica(o))) } : c;
+  });
+  return pub;
 }
 async function obtenerFormularioPublico(env, slug) {
   const s = String(slug || "").toLowerCase();
@@ -8749,13 +8781,13 @@ export default {
       if (!f) return json({ error: "Este formulario no está disponible" }, 404);
       const acc = comprobarAccesoFormulario(f, body && body.pin);
       if (!acc.ok) return json({ error: acc.error }, acc.status);
-      return json({ ok: true, formulario: formularioPublico(f, true) });
+      return json({ ok: true, formulario: await formularioPublicoDisponible(env, f, true) });
     }
 
     if (path.match(/^\/api\/formularios-publicos\/[a-z0-9-]{1,60}$/) && method === "GET") {
       const f = await obtenerFormularioPublico(env, path.split("/").pop());
       if (!f) return json({ error: "Este formulario no está disponible" }, 404);
-      return json(formularioPublico(f, false));
+      return json(await formularioPublicoDisponible(env, f, false));
     }
 
     if (path === "/api/formularios-publicos/responder" && method === "POST") {
@@ -8775,6 +8807,16 @@ export default {
       const v = validarRespuestasFormulario(campos, body.respuestas);
       if (v.error) return json({ error: v.error }, 400);
       if (!Object.keys(v.datos).length) return json({ error: "No hay ninguna respuesta que enviar" }, 400);
+      // Opciones de un solo uso (p. ej. el nombre): si alguien la usó mientras tanto, se rechaza.
+      try {
+        const usadas = await opcionesUsadasFormulario(env, f, campos);
+        for (const c of campos) {
+          const u = usadas.get(c.id), val = v.datos[c.id];
+          if (u && typeof val === "string" && u.has(normalizarOpcionUnica(val))) {
+            return json({ error: `«${val}» ya ha respondido este formulario. Recarga la página y elige tu nombre en la lista; si es un error, contacta con el equipo.` }, 409);
+          }
+        }
+      } catch (err) { console.error("[formularios/unicas]", err); }
       try {
         await env.DB.prepare("INSERT INTO formularios_respuestas (formulario_id, datos) VALUES (?, ?)")
           .bind(f.id, JSON.stringify(v.datos)).run();
