@@ -2572,8 +2572,8 @@ const FORMULARIO_TIPOS_CAMPO = [
   "desplegable", "opcion", "casillas", "confirmacion",
 ];
 const FORMULARIO_TIPOS_CON_OPCIONES = ["desplegable", "opcion", "casillas"];
-const FORMULARIO_MAX_CAMPOS = 40;
-const FORMULARIO_MAX_OPCIONES = 40;
+const FORMULARIO_MAX_CAMPOS = 60;
+const FORMULARIO_MAX_OPCIONES = 100;
 
 function formularioLimpiarTexto(v, max) {
   return (v === null || v === undefined ? "" : String(v)).replace(/\s+/g, " ").trim().slice(0, max);
@@ -2637,6 +2637,14 @@ function normalizarCamposFormulario(raw) {
       campo.opciones = opciones;
       if (tipo !== "casillas") campo.permitir_otro = c.permitir_otro === true || c.permitir_otro === 1;
     }
+    // Campo condicional: solo se muestra (y se valida) si un campo ANTERIOR tiene cierto valor.
+    // Ej.: { campo: "rol", igual: "Redactor" }. Sirve para formularios con ramas por perfil.
+    if (c.mostrar_si && typeof c.mostrar_si === "object") {
+      const ref = String(c.mostrar_si.campo || "");
+      const igual = formularioLimpiarTexto(c.mostrar_si.igual, 300);
+      if (ref !== id && usados.has(ref) && igual) campo.mostrar_si = { campo: ref, igual };
+      else return { error: `El campo "${etiqueta}" depende de un campo que no existe o que está más abajo` };
+    }
     campos.push(campo);
   }
   return { campos };
@@ -2681,6 +2689,12 @@ function validarRespuestasFormulario(campos, recibidas) {
   const r = recibidas && typeof recibidas === "object" ? recibidas : {};
   const datos = {};
   for (const c of campos) {
+    // Campo condicional oculto: no se exige ni se guarda (se evalúa contra lo ya validado).
+    if (c.mostrar_si) {
+      const ref = datos[c.mostrar_si.campo];
+      const visible = Array.isArray(ref) ? ref.includes(c.mostrar_si.igual) : ref === c.mostrar_si.igual;
+      if (!visible) continue;
+    }
     const v = r[c.id];
     const vacio = (v === undefined || v === null || v === "" || (Array.isArray(v) && !v.length) || v === false);
     if (vacio) {
