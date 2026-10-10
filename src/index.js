@@ -2570,7 +2570,12 @@ async function limiteExcedido(request, env, accion, max, ventanaSeg, extra = "")
 const FORMULARIO_TIPOS_CAMPO = [
   "texto", "parrafo", "email", "telefono", "numero", "fecha",
   "desplegable", "opcion", "casillas", "confirmacion",
+  // No son preguntas: "seccion" abre una nueva página del formulario (Sección X de N)
+  // y "enlaces" muestra una lista de enlaces (guía, redes...) sin recoger respuesta.
+  "seccion", "enlaces",
 ];
+const FORMULARIO_TIPOS_SIN_RESPUESTA = ["seccion", "enlaces"];
+const FORMULARIO_MAX_ENLACES = 12;
 const FORMULARIO_TIPOS_CON_OPCIONES = ["desplegable", "opcion", "casillas"];
 const FORMULARIO_MAX_CAMPOS = 60;
 const FORMULARIO_MAX_OPCIONES = 100;
@@ -2625,6 +2630,21 @@ function normalizarCamposFormulario(raw) {
       ayuda: formularioLimpiarTexto(c.ayuda, 400),
       obligatorio: c.obligatorio === true || c.obligatorio === 1,
     };
+    if (tipo === "enlaces") {
+      const enlaces = [];
+      for (const e of (Array.isArray(c.enlaces) ? c.enlaces : [])) {
+        const texto = formularioLimpiarTexto(e && e.texto, 120);
+        const url = String((e && e.url) || "").trim().slice(0, 500);
+        if (!texto && !url) continue;
+        if (!texto || !/^https:\/\/[^\s]+$/i.test(url)) return { error: `Hay un enlace no válido en: ${etiqueta} (usa texto y una URL https://)` };
+        enlaces.push({ texto, url });
+      }
+      if (!enlaces.length) return { error: `El bloque "${etiqueta}" necesita al menos un enlace` };
+      if (enlaces.length > FORMULARIO_MAX_ENLACES) return { error: `El bloque "${etiqueta}" admite como máximo ${FORMULARIO_MAX_ENLACES} enlaces` };
+      campo.enlaces = enlaces;
+      campo.obligatorio = false;
+    }
+    if (tipo === "seccion") campo.obligatorio = false;
     if (FORMULARIO_TIPOS_CON_OPCIONES.includes(tipo)) {
       const vistas = new Set();
       const opciones = [];
@@ -2689,6 +2709,7 @@ function validarRespuestasFormulario(campos, recibidas) {
   const r = recibidas && typeof recibidas === "object" ? recibidas : {};
   const datos = {};
   for (const c of campos) {
+    if (FORMULARIO_TIPOS_SIN_RESPUESTA.includes(c.tipo)) continue;
     // Campo condicional oculto: no se exige ni se guarda (se evalúa contra lo ya validado).
     if (c.mostrar_si) {
       const ref = datos[c.mostrar_si.campo];
