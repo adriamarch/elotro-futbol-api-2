@@ -2874,6 +2874,15 @@ async function enviarCuentaPorCorreoFormulario(env, cuenta, correo) {
 const FORMULARIO_INCORPORACION_SLUG = "formulario-de-incorporacion-elotrofutbol";
 const FORMULARIO_INCORPORACION_ALTA = { nombre_red: "redactor", nombre_fot: "fotografo" };
 const FORMULARIO_INCORPORACION_ALIAS = { "TodosADCeuta — AD Ceuta": "ismael_adc", "Juanma — Jurisprudencia": "juanma" };
+// Respuestas sin rol -> «Redactor». Las primeras respuestas del formulario de incorporación se recogieron antes de
+// que existiera la pregunta «Selecciona tu rol» y quedaron sin rol; todas eran de redactores. Si una respuesta no
+// trae rol (o viene vacío) se le pone «Redactor». Se aplica al listarlas, al editarlas y, de forma permanente, con
+// asignar_rol_redactor_incorporacion.sql. Si ya tiene rol (Redactor o Fotógrafo) no se toca.
+function rolPorDefectoIncorporacion(slug, datos) {
+  if (slug !== FORMULARIO_INCORPORACION_SLUG || !datos || typeof datos !== "object" || Array.isArray(datos)) return datos;
+  if (typeof datos.rol === "string" && datos.rol.trim()) return datos;
+  return { ...datos, rol: "Redactor" };
+}
 function camposConAltaPorDefecto(slug, campos) {
   if (slug !== FORMULARIO_INCORPORACION_SLUG || campos.some((c) => c && c.alta_usuario)) return campos;
   return campos.map((c) => {
@@ -11866,9 +11875,11 @@ async function handlePrimary(request, env, ctx) {
             `SELECT id, datos, estado, nota_admin, created_at FROM formularios_respuestas
              WHERE formulario_id = ? ORDER BY created_at DESC, id DESC LIMIT 2000`
           ).bind(id).all();
+          const formSlug = ((await env.DB.prepare("SELECT slug FROM formularios WHERE id = ?").bind(id).first()) || {}).slug;
           const respuestas = (results || []).map((r) => {
             let datos = {};
             try { datos = JSON.parse(String(r.datos || "{}")) || {}; } catch {}
+            datos = rolPorDefectoIncorporacion(formSlug, datos);
             return { id: r.id, datos, estado: r.estado, nota_admin: r.nota_admin, created_at: r.created_at };
           });
           return json({ respuestas });
@@ -11902,7 +11913,7 @@ async function handlePrimary(request, env, ctx) {
           const campos = camposConAltaPorDefecto(f.slug, parsearCamposFormulario(f.campos));
           let antes = {};
           try { antes = JSON.parse(String(r.datos || "{}")) || {}; } catch {}
-          const recibidas = { ...((body && typeof body.respuestas === "object" && body.respuestas) || {}) };
+          const recibidas = rolPorDefectoIncorporacion(f.slug, { ...((body && typeof body.respuestas === "object" && body.respuestas) || {}) });
           const v = validarRespuestasFormulario(campos, recibidas, { estricto: false });
           if (v.error) return json({ error: v.error }, 400);
           const datos = {};
