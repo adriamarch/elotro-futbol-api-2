@@ -2838,11 +2838,25 @@ async function enviarCuentaPorCorreoFormulario(env, cuenta, correo) {
 <p><a href="${enlace}">Entrar al panel</a></p><p>Guarda estos datos en un sitio seguro.</p>`,
   }, { destinatario: correo });
 }
+// Red de seguridad del formulario de incorporación: si por lo que sea sus campos de nombre han perdido la
+// marca "alta_usuario" (no se aplicó el SQL, o se guardó el formulario desde un panel antiguo), se aplica
+// igualmente: nombre_red crea redactores y nombre_fot fotógrafos. Solo actúa si NINGÚN campo tiene la marca.
+const FORMULARIO_INCORPORACION_SLUG = "formulario-de-incorporacion-elotrofutbol";
+const FORMULARIO_INCORPORACION_ALTA = { nombre_red: "redactor", nombre_fot: "fotografo" };
+const FORMULARIO_INCORPORACION_ALIAS = { "TodosADCeuta — AD Ceuta": "ismael_adc", "Juanma — Jurisprudencia": "juanma" };
+function camposConAltaPorDefecto(slug, campos) {
+  if (slug !== FORMULARIO_INCORPORACION_SLUG || campos.some((c) => c && c.alta_usuario)) return campos;
+  return campos.map((c) => {
+    const rol = FORMULARIO_INCORPORACION_ALTA[c && c.id];
+    if (!rol || (c.tipo !== "desplegable" && c.tipo !== "opcion")) return c;
+    return { ...c, alta_usuario: rol, ...(rol === "redactor" && !c.alias_usuarios ? { alias_usuarios: { ...FORMULARIO_INCORPORACION_ALIAS } } : {}) };
+  });
+}
 // Recorre las respuestas de los formularios que tienen algún campo con alta de usuario de ese rol.
 async function recorrerRespuestasAltaUsuarios(env, rol, fn) {
-  const { results: forms } = await env.DB.prepare("SELECT id, campos FROM formularios").all();
+  const { results: forms } = await env.DB.prepare("SELECT id, slug, campos FROM formularios").all();
   for (const f of (forms || [])) {
-    const ids = parsearCamposFormulario(f.campos).filter((c) => c.alta_usuario === rol);
+    const ids = camposConAltaPorDefecto(f.slug, parsearCamposFormulario(f.campos)).filter((c) => c.alta_usuario === rol);
     if (!ids.length) continue;
     const { results } = await env.DB.prepare("SELECT id, datos FROM formularios_respuestas WHERE formulario_id = ?").bind(f.id).all();
     for (const r of (results || [])) {
@@ -8944,7 +8958,7 @@ export default {
       if (!f) return json({ error: "Este formulario no está disponible" }, 404);
       const acc = comprobarAccesoFormulario(f, body.pin);
       if (!acc.ok) return json({ error: acc.error }, acc.status);
-      const campos = parsearCamposFormulario(f.campos);
+      const campos = camposConAltaPorDefecto(f.slug, parsearCamposFormulario(f.campos));
       const v = validarRespuestasFormulario(campos, body.respuestas);
       if (v.error) return json({ error: v.error }, 400);
       if (!Object.keys(v.datos).length) return json({ error: "No hay ninguna respuesta que enviar" }, 400);
@@ -11742,7 +11756,7 @@ async function handlePrimary(request, env, ctx) {
                     (SELECT COUNT(*) FROM formularios_respuestas r WHERE r.formulario_id = f.id AND r.estado = 'nueva') AS nuevas
              FROM formularios f ORDER BY f.created_at DESC, f.id DESC LIMIT 500`
           ).all();
-          const formularios = (results || []).map((f) => ({ ...f, campos: parsearCamposFormulario(f.campos), activo: Number(f.activo), notificar_email: Number(f.notificar_email) }));
+          const formularios = (results || []).map((f) => ({ ...f, campos: camposConAltaPorDefecto(f.slug, parsearCamposFormulario(f.campos)), activo: Number(f.activo), notificar_email: Number(f.notificar_email) }));
           return json({ formularios });
         }
 
