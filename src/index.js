@@ -2561,9 +2561,186 @@ async function limiteExcedido(request, env, accion, max, ventanaSeg, extra = "")
   }
 }
 
+// ---------- FORMULARIOS (constructor de formularios públicos) ----------
+// Sección "Formularios" del panel (Solicitudes > Formularios). El formulario de
+// acreditaciones es un formulario ya creado con su propio sistema (arriba: PIN,
+// acceso, configuración, importación...), que no se toca. Aquí viven los demás
+// formularios que cree un admin: cada uno tiene su enlace público
+// (/formulario?f=<slug>), sus campos y su bandeja de respuestas.
+const FORMULARIO_TIPOS_CAMPO = [
+  "texto", "parrafo", "email", "telefono", "numero", "fecha",
+  "desplegable", "opcion", "casillas", "confirmacion",
+];
+const FORMULARIO_TIPOS_CON_OPCIONES = ["desplegable", "opcion", "casillas"];
+const FORMULARIO_MAX_CAMPOS = 40;
+const FORMULARIO_MAX_OPCIONES = 40;
+
+function formularioLimpiarTexto(v, max) {
+  return (v === null || v === undefined ? "" : String(v)).replace(/\s+/g, " ").trim().slice(0, max);
+}
+function formularioLimpiarParrafo(v, max) {
+  return (v === null || v === undefined ? "" : String(v)).replace(/\r/g, "").trim().slice(0, max);
+}
+function formularioSlugBase(titulo) {
+  const s = String(titulo || "")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50);
+  return s || "formulario";
+}
+// "acreditacion" y "acreditaciones" están reservados: ese formulario ya existe aparte.
+const FORMULARIO_SLUGS_RESERVADOS = ["acreditacion", "acreditaciones", "nuevo", "admin", "api"];
+async function formularioSlugLibre(env, titulo, idActual = null) {
+  const base = formularioSlugBase(titulo);
+  for (let n = 1; n < 200; n++) {
+    const cand = n === 1 ? base : `${base}-${n}`;
+    if (FORMULARIO_SLUGS_RESERVADOS.includes(cand)) continue;
+    const row = await env.DB.prepare("SELECT id FROM formularios WHERE slug = ?").bind(cand).first();
+    if (!row || (idActual !== null && Number(row.id) === Number(idActual))) return cand;
+  }
+  return `${base}-${Date.now().toString(36)}`;
+}
+function generarIdCampoFormulario() {
+  const arr = new Uint32Array(1);
+  crypto.getRandomValues(arr);
+  return "c" + arr[0].toString(36);
+}
+// Normaliza la lista de campos que manda el panel. Devuelve { campos } o { error }.
+function normalizarCamposFormulario(raw) {
+  if (!Array.isArray(raw)) return { error: "Los campos del formulario no son válidos" };
+  if (!raw.length) return { error: "Añade al menos un campo al formulario" };
+  if (raw.length > FORMULARIO_MAX_CAMPOS) return { error: `Un formulario admite como máximo ${FORMULARIO_MAX_CAMPOS} campos` };
+  const usados = new Set();
+  const campos = [];
+  for (const c of raw) {
+    if (!c || typeof c !== "object") return { error: "Hay un campo no válido" };
+    const tipo = String(c.tipo || "");
+    if (!FORMULARIO_TIPOS_CAMPO.includes(tipo)) return { error: "Hay un campo con un tipo no válido" };
+    const etiqueta = formularioLimpiarTexto(c.etiqueta, 300);
+    if (!etiqueta) return { error: "Todos los campos necesitan un título" };
+    let id = /^[a-z0-9_]{2,24}$/.test(String(c.id || "")) ? String(c.id) : generarIdCampoFormulario();
+    while (usados.has(id)) id = generarIdCampoFormulario();
+    usados.add(id);
+    const campo = {
+      id, tipo, etiqueta,
+      ayuda: formularioLimpiarTexto(c.ayuda, 400),
+      obligatorio: c.obligatorio === true || c.obligatorio === 1,
+    };
+    if (FORMULARIO_TIPOS_CON_OPCIONES.includes(tipo)) {
+      const vistas = new Set();
+      const opciones = [];
+      for (const o of (Array.isArray(c.opciones) ? c.opciones : [])) {
+        const t = formularioLimpiarTexto(o, 200);
+        if (t && !vistas.has(t)) { vistas.add(t); opciones.push(t); }
+      }
+      if (!opciones.length) return { error: `El campo "${etiqueta}" necesita al menos una opción` };
+      if (opciones.length > FORMULARIO_MAX_OPCIONES) return { error: `El campo "${etiqueta}" admite como máximo ${FORMULARIO_MAX_OPCIONES} opciones` };
+      campo.opciones = opciones;
+      if (tipo !== "casillas") campo.permitir_otro = c.permitir_otro === true || c.permitir_otro === 1;
+    }
+    campos.push(campo);
+  }
+  return { campos };
+}
+function parsearCamposFormulario(txt) {
+  try { const a = JSON.parse(String(txt || "[]")); return Array.isArray(a) ? a : []; } catch { return []; }
+}
+// Lo que ve cualquier visitante: nunca el PIN ni datos internos. En un formulario
+// con PIN, los campos y textos solo se entregan al comprobar el PIN (conContenido).
+function formularioPublico(f, conContenido = true) {
+  const protegido = f.acceso === "pin" && !conContenido;
+  return {
+    slug: f.slug,
+    titulo: f.titulo,
+    descripcion: protegido ? "" : (f.descripcion || ""),
+    aviso: protegido ? "" : (f.aviso || ""),
+    texto_boton: f.texto_boton || "Enviar",
+    mensaje_final: protegido ? "" : (f.mensaje_final || ""),
+    campos: protegido ? [] : parsearCamposFormulario(f.campos),
+    acceso: f.acceso === "pin" ? "pin" : "libre",
+    pin_longitud: f.acceso === "pin" && f.pin ? String(f.pin).length : null,
+  };
+}
+async function obtenerFormularioPublico(env, slug) {
+  const s = String(slug || "").toLowerCase();
+  if (!/^[a-z0-9-]{1,60}$/.test(s)) return null;
+  const f = await env.DB.prepare(
+    "SELECT id, slug, titulo, descripcion, aviso, texto_boton, mensaje_final, campos, acceso, pin, activo, notificar_email FROM formularios WHERE slug = ?"
+  ).bind(s).first();
+  if (!f || !Number(f.activo)) return null;
+  return f;
+}
+function comprobarAccesoFormulario(f, pinRecibido) {
+  if (f.acceso !== "pin") return { ok: true };
+  if (!f.pin) return { ok: false, status: 403, error: "Este formulario todavía no está disponible" };
+  if (!pinAcreditacionCorrecto(String(f.pin), String(pinRecibido || "").trim())) return { ok: false, status: 401, error: "PIN incorrecto" };
+  return { ok: true };
+}
+// Valida las respuestas de un visitante contra los campos del formulario.
+// Devuelve { datos, resumen } o { error }.
+function validarRespuestasFormulario(campos, recibidas) {
+  const r = recibidas && typeof recibidas === "object" ? recibidas : {};
+  const datos = {};
+  for (const c of campos) {
+    const v = r[c.id];
+    const vacio = (v === undefined || v === null || v === "" || (Array.isArray(v) && !v.length) || v === false);
+    if (vacio) {
+      if (c.obligatorio) return { error: c.tipo === "confirmacion" ? `Debes marcar: ${c.etiqueta}` : `Falta responder: ${c.etiqueta}` };
+      continue;
+    }
+    switch (c.tipo) {
+      case "texto": datos[c.id] = formularioLimpiarTexto(v, 500); break;
+      case "parrafo": datos[c.id] = formularioLimpiarParrafo(v, 4000); break;
+      case "email": {
+        const e = formularioLimpiarTexto(v, 200).toLowerCase();
+        if (!emailValido(e)) return { error: `Correo no válido en: ${c.etiqueta}` };
+        datos[c.id] = e; break;
+      }
+      case "telefono": {
+        const t = formularioLimpiarTexto(v, 30);
+        if (!/^[+()\d\s.-]{6,30}$/.test(t)) return { error: `Teléfono no válido en: ${c.etiqueta}` };
+        datos[c.id] = t; break;
+      }
+      case "numero": {
+        const n = Number(String(v).replace(",", "."));
+        if (!Number.isFinite(n) || Math.abs(n) > 1e12) return { error: `Número no válido en: ${c.etiqueta}` };
+        datos[c.id] = n; break;
+      }
+      case "fecha": {
+        const t = formularioLimpiarTexto(v, 10);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(t) || Number.isNaN(Date.parse(t))) return { error: `Fecha no válida en: ${c.etiqueta}` };
+        datos[c.id] = t; break;
+      }
+      case "desplegable":
+      case "opcion": {
+        const t = formularioLimpiarTexto(v, 300);
+        if (c.opciones.includes(t)) { datos[c.id] = t; break; }
+        if (c.permitir_otro && t.startsWith("Otro: ") && t.length > 6) { datos[c.id] = t; break; }
+        return { error: `Opción no válida en: ${c.etiqueta}` };
+      }
+      case "casillas": {
+        const arr = Array.isArray(v) ? v : [v];
+        const sel = [...new Set(arr.map((x) => formularioLimpiarTexto(x, 300)))].filter(Boolean);
+        if (!sel.length) { if (c.obligatorio) return { error: `Falta responder: ${c.etiqueta}` }; break; }
+        if (sel.some((x) => !c.opciones.includes(x))) return { error: `Opción no válida en: ${c.etiqueta}` };
+        datos[c.id] = sel; break;
+      }
+      case "confirmacion": datos[c.id] = v === true; break;
+      default: break;
+    }
+  }
+  return { datos };
+}
+function datosFormularioParaTexto(campos, datos) {
+  return campos.filter((c) => datos[c.id] !== undefined).map((c) => {
+    const v = datos[c.id];
+    const t = Array.isArray(v) ? v.join(", ") : (v === true ? "Sí" : String(v));
+    return { etiqueta: c.etiqueta, valor: t };
+  });
+}
+
 // PIN de acceso al formulario público de acreditaciones. Se guarda en
 // settings (clave "acreditacion_pin") y lo gestiona un admin desde
-// Solicitudes > Acreditaciones. Sin PIN configurado el formulario
+// Solicitudes > Formularios > Acreditaciones. Sin PIN configurado el formulario
 // queda cerrado; la primera vez que un admin abre esa pestaña se genera uno.
 const ACREDITACION_PIN_KEY = "acreditacion_pin";
 function validarPinAcreditacion(pin) {
@@ -2683,7 +2860,7 @@ async function enviarCorreoResolucionAcreditacion(env, a, estado, { recogida, me
 }
 
 // ---------- Configuración editable del formulario de acreditaciones ----------
-// Un admin puede cambiar textos y listas desde Solicitudes > Acreditaciones.
+// Un admin puede cambiar textos y listas desde Solicitudes > Formularios > Acreditaciones.
 // Se guarda como JSON en settings (clave "acreditacion_config"); sin nada
 // guardado se usan los valores por defecto (los de siempre).
 const ACREDITACION_CONFIG_KEY = "acreditacion_config";
@@ -8416,7 +8593,7 @@ export default {
     // Cualquier persona con el enlace puede solicitar acreditación para
     // cubrir un partido, rueda de prensa o acto. No requiere sesión. Se
     // guarda en la tabla "acreditaciones" y solo los administradores
-    // pueden verla (pestaña Solicitudes > Acreditaciones del panel).
+    // pueden verla (pestaña Solicitudes > Formularios > Acreditaciones del panel).
     // Configuración pública del formulario (textos y listas editables desde el panel).
     if (path === "/api/acreditaciones/config" && method === "GET") {
       const cfgPublica = await obtenerConfigAcreditacion(env);
@@ -8507,7 +8684,7 @@ export default {
             `Nombre: ${nombre}`, `Correo: ${email}`, `Equipo: ${equipo}`,
             `Evento: ${tipoEvento}`, `Acreditación: ${tipoAcreditacion}`,
             `Jornada y partido: ${jornadaPartido}`, "",
-            "Puedes verla y gestionarla en el panel de administración (Solicitudes > Acreditaciones).",
+            "Puedes verla y gestionarla en el panel de administración (Solicitudes > Formularios > Acreditaciones).",
           ].join("\n"),
           html: `<p>Nueva solicitud de acreditación recibida.</p>
 <p><strong>Nombre:</strong> ${escapeHtmlEmail(nombre)}<br>
@@ -8516,10 +8693,74 @@ export default {
 <strong>Evento:</strong> ${escapeHtmlEmail(tipoEvento)}<br>
 <strong>Acreditación:</strong> ${escapeHtmlEmail(tipoAcreditacion)}<br>
 <strong>Jornada y partido:</strong> ${escapeHtmlEmail(jornadaPartido)}</p>
-<p>Puedes verla y gestionarla en el panel de administración (Solicitudes &gt; Acreditaciones).</p>`,
+<p>Puedes verla y gestionarla en el panel de administración (Solicitudes &gt; Formularios &gt; Acreditaciones).</p>`,
         });
       } catch (err) {
         console.error("[acreditaciones/aviso-email]", err);
+      }
+      return json({ ok: true });
+    }
+
+    // ---------- Formularios públicos (formulario.html?f=<slug>) ----------
+    // Formularios creados por un admin en Solicitudes > Formularios. Cualquiera
+    // con el enlace puede rellenarlos (con PIN si el admin lo pide). El de
+    // acreditaciones sigue siendo el de arriba, con su propia ruta.
+    if (path === "/api/formularios-publicos/pin" && method === "POST") {
+      if (await limiteExcedido(request, env, "formulario-pin", 10, 900)) {
+        return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+      }
+      const body = await request.json().catch(() => ({}));
+      const f = await obtenerFormularioPublico(env, body && body.slug);
+      if (!f) return json({ error: "Este formulario no está disponible" }, 404);
+      const acc = comprobarAccesoFormulario(f, body && body.pin);
+      if (!acc.ok) return json({ error: acc.error }, acc.status);
+      return json({ ok: true, formulario: formularioPublico(f, true) });
+    }
+
+    if (path.match(/^\/api\/formularios-publicos\/[a-z0-9-]{1,60}$/) && method === "GET") {
+      const f = await obtenerFormularioPublico(env, path.split("/").pop());
+      if (!f) return json({ error: "Este formulario no está disponible" }, 404);
+      return json(formularioPublico(f, false));
+    }
+
+    if (path === "/api/formularios-publicos/responder" && method === "POST") {
+      if (await limiteExcedido(request, env, "formulario-respuesta", 15, 3600)) {
+        return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+      }
+      let body;
+      try { body = await request.json(); } catch { return json({ error: "JSON inválido" }, 400); }
+      body = body || {};
+      // Campo trampa para bots: un humano nunca lo ve ni lo rellena.
+      if (body.web) return json({ ok: true });
+      const f = await obtenerFormularioPublico(env, body.slug);
+      if (!f) return json({ error: "Este formulario no está disponible" }, 404);
+      const acc = comprobarAccesoFormulario(f, body.pin);
+      if (!acc.ok) return json({ error: acc.error }, acc.status);
+      const campos = parsearCamposFormulario(f.campos);
+      const v = validarRespuestasFormulario(campos, body.respuestas);
+      if (v.error) return json({ error: v.error }, 400);
+      if (!Object.keys(v.datos).length) return json({ error: "No hay ninguna respuesta que enviar" }, 400);
+      try {
+        await env.DB.prepare("INSERT INTO formularios_respuestas (formulario_id, datos) VALUES (?, ?)")
+          .bind(f.id, JSON.stringify(v.datos)).run();
+      } catch (err) {
+        console.error("[formularios/responder]", err);
+        return json({ error: "No se pudo enviar el formulario. Inténtalo de nuevo en unos minutos." }, 500);
+      }
+      // Aviso por correo al equipo: es un extra, si falla la respuesta ya está guardada.
+      if (Number(f.notificar_email)) {
+        try {
+          const filas = datosFormularioParaTexto(campos, v.datos);
+          await enviarEmailNotificacion(env, {
+            asunto: `Nueva respuesta en el formulario "${f.titulo}"`,
+            texto: [...filas.map((x) => `${x.etiqueta}: ${x.valor}`), "", "Puedes verla en el panel de administración (Solicitudes > Formularios)."].join("\n"),
+            html: `<p>Nueva respuesta en el formulario <strong>${escapeHtmlEmail(f.titulo)}</strong>.</p>
+<p>${filas.map((x) => `<strong>${escapeHtmlEmail(x.etiqueta)}:</strong> ${escapeHtmlEmail(x.valor)}`).join("<br>")}</p>
+<p>Puedes verla en el panel de administración (Solicitudes &gt; Formularios).</p>`,
+          });
+        } catch (err) {
+          console.error("[formularios/aviso-email]", err);
+        }
       }
       return json({ ok: true });
     }
@@ -11245,6 +11486,130 @@ async function handlePrimary(request, env, ctx) {
         const id = Number(path.split("/").pop());
         await env.DB.prepare("DELETE FROM acreditaciones WHERE id = ?").bind(id).run();
         return json({ ok: true });
+      }
+
+      // ---------- FORMULARIOS: constructor y bandeja de respuestas (solo admins) ----------
+      if (path.startsWith("/api/formularios") && !path.startsWith("/api/formularios-publicos")) {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede gestionar los formularios" }, 403);
+        const idDe = (p) => Number(p.split("/").pop());
+
+        if (path === "/api/formularios" && method === "GET") {
+          const { results } = await env.DB.prepare(
+            `SELECT f.id, f.slug, f.titulo, f.descripcion, f.aviso, f.texto_boton, f.mensaje_final, f.campos,
+                    f.acceso, f.pin, f.activo, f.notificar_email, f.created_at, f.updated_at,
+                    (SELECT COUNT(*) FROM formularios_respuestas r WHERE r.formulario_id = f.id) AS total_respuestas,
+                    (SELECT COUNT(*) FROM formularios_respuestas r WHERE r.formulario_id = f.id AND r.estado = 'nueva') AS nuevas
+             FROM formularios f ORDER BY f.created_at DESC, f.id DESC LIMIT 500`
+          ).all();
+          const formularios = (results || []).map((f) => ({ ...f, campos: parsearCamposFormulario(f.campos), activo: Number(f.activo), notificar_email: Number(f.notificar_email) }));
+          return json({ formularios });
+        }
+
+        if ((path === "/api/formularios" && method === "POST") || (path.match(/^\/api\/formularios\/\d+$/) && method === "PUT")) {
+          const editando = method === "PUT";
+          const id = editando ? idDe(path) : null;
+          const body = await request.json().catch(() => ({}));
+          let actual = null;
+          if (editando) {
+            actual = await env.DB.prepare("SELECT id, slug, titulo, acceso, pin FROM formularios WHERE id = ?").bind(id).first();
+            if (!actual) return json({ error: "Formulario no encontrado" }, 404);
+          }
+          const titulo = formularioLimpiarTexto(body.titulo, 200);
+          if (!titulo) return json({ error: "El formulario necesita un título" }, 400);
+          const nc = normalizarCamposFormulario(body.campos);
+          if (nc.error) return json({ error: nc.error }, 400);
+          const acceso = body.acceso === "pin" ? "pin" : "libre";
+          let pin = actual ? actual.pin : null;
+          if (acceso === "pin") {
+            const pedido = body.pin !== undefined && body.pin !== null && body.pin !== "" ? String(body.pin).trim() : null;
+            if (pedido !== null && !validarPinAcreditacion(pedido)) return json({ error: "El PIN debe tener entre 4 y 8 dígitos" }, 400);
+            pin = pedido !== null ? pedido : (pin || generarPinAcreditacion());
+          }
+          const descripcion = formularioLimpiarParrafo(body.descripcion, 2000);
+          const aviso = formularioLimpiarParrafo(body.aviso, 1000);
+          const textoBoton = formularioLimpiarTexto(body.texto_boton, 40) || "Enviar";
+          const mensajeFinal = formularioLimpiarParrafo(body.mensaje_final, 1000);
+          const activo = body.activo === false || body.activo === 0 ? 0 : 1;
+          const notificar = body.notificar_email === false || body.notificar_email === 0 ? 0 : 1;
+          try {
+            if (!editando) {
+              const slug = await formularioSlugLibre(env, titulo);
+              const ins = await env.DB.prepare(
+                `INSERT INTO formularios (slug, titulo, descripcion, aviso, texto_boton, mensaje_final, campos, acceso, pin, activo, notificar_email, creado_por)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              ).bind(slug, titulo, descripcion, aviso, textoBoton, mensajeFinal, JSON.stringify(nc.campos), acceso, pin, activo, notificar, payload.nombre || null).run();
+              const nuevoId = ins.meta && ins.meta.last_row_id;
+              await registrarActividad(env, request, payload, {
+                accion: "formulario_creado", entidad: "formulario", entidad_id: nuevoId || null,
+                descripcion: `Creado el formulario "${titulo}"`,
+              });
+              return json({ ok: true, id: nuevoId, slug });
+            }
+            // El enlace (slug) no cambia al editar: así los enlaces ya compartidos siguen funcionando.
+            await env.DB.prepare(
+              `UPDATE formularios SET titulo = ?, descripcion = ?, aviso = ?, texto_boton = ?, mensaje_final = ?, campos = ?,
+                      acceso = ?, pin = ?, activo = ?, notificar_email = ?, updated_at = datetime('now')
+               WHERE id = ?`
+            ).bind(titulo, descripcion, aviso, textoBoton, mensajeFinal, JSON.stringify(nc.campos), acceso, pin, activo, notificar, id).run();
+            await registrarActividad(env, request, payload, {
+              accion: "formulario_editado", entidad: "formulario", entidad_id: id,
+              descripcion: `Editado el formulario "${titulo}"`,
+            });
+            return json({ ok: true, id, slug: actual.slug });
+          } catch (err) {
+            console.error("[formularios/guardar]", err);
+            return json({ error: "No se pudo guardar el formulario" }, 500);
+          }
+        }
+
+        if (path.match(/^\/api\/formularios\/\d+$/) && method === "DELETE") {
+          const id = idDe(path);
+          const f = await env.DB.prepare("SELECT id, titulo FROM formularios WHERE id = ?").bind(id).first();
+          if (!f) return json({ error: "Formulario no encontrado" }, 404);
+          await env.DB.prepare("DELETE FROM formularios_respuestas WHERE formulario_id = ?").bind(id).run();
+          await env.DB.prepare("DELETE FROM formularios WHERE id = ?").bind(id).run();
+          await registrarActividad(env, request, payload, {
+            accion: "formulario_eliminado", entidad: "formulario", entidad_id: id,
+            descripcion: `Eliminado el formulario "${f.titulo}" y sus respuestas`,
+          });
+          return json({ ok: true });
+        }
+
+        if (path.match(/^\/api\/formularios\/\d+\/respuestas$/) && method === "GET") {
+          const id = Number(path.split("/")[3]);
+          const { results } = await env.DB.prepare(
+            `SELECT id, datos, estado, nota_admin, created_at FROM formularios_respuestas
+             WHERE formulario_id = ? ORDER BY created_at DESC, id DESC LIMIT 2000`
+          ).bind(id).all();
+          const respuestas = (results || []).map((r) => {
+            let datos = {};
+            try { datos = JSON.parse(String(r.datos || "{}")) || {}; } catch {}
+            return { id: r.id, datos, estado: r.estado, nota_admin: r.nota_admin, created_at: r.created_at };
+          });
+          return json({ respuestas });
+        }
+
+        if (path.match(/^\/api\/formularios\/respuestas\/\d+$/) && method === "PATCH") {
+          const id = idDe(path);
+          const body = await request.json().catch(() => ({}));
+          const estado = String(body.estado || "");
+          if (!["nueva", "revisada"].includes(estado)) return json({ error: "Estado no válido" }, 400);
+          const nota = formularioLimpiarParrafo(body.nota_admin, 1000);
+          const r = await env.DB.prepare("SELECT id FROM formularios_respuestas WHERE id = ?").bind(id).first();
+          if (!r) return json({ error: "Respuesta no encontrada" }, 404);
+          await env.DB.prepare(
+            "UPDATE formularios_respuestas SET estado = ?, nota_admin = ?, updated_at = datetime('now') WHERE id = ?"
+          ).bind(estado, nota || null, id).run();
+          return json({ ok: true });
+        }
+
+        if (path.match(/^\/api\/formularios\/respuestas\/\d+$/) && method === "DELETE") {
+          const id = idDe(path);
+          await env.DB.prepare("DELETE FROM formularios_respuestas WHERE id = ?").bind(id).run();
+          return json({ ok: true });
+        }
       }
 
       if (path.match(/^\/api\/newsletter\/suscriptores\/\d+$/) && method === "DELETE") {

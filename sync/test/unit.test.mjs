@@ -51,6 +51,8 @@ test("todas las tablas sincronizadas están configuradas (17 de Fase 4 + las añ
     "equipo_alias_externo",
     "jornadas_calendario",
     "acreditaciones",
+    "formularios",
+    "formularios_respuestas",
     "newsletter_envios",
     "recordatorios_inactividad",
     "sync_partidos_auto",

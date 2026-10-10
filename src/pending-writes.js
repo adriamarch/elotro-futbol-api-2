@@ -42,6 +42,8 @@ const RUTAS_EXCLUIDAS = new Set([
   // Solo comprueba el PIN del formulario de acreditaciones: nada que reproducir
   // y evitaría guardar el PIN en la cola de reintentos.
   "/api/acreditaciones/pin",
+  // Igual para los formularios personalizados: solo comprueba el PIN, no guarda nada.
+  "/api/formularios-publicos/pin",
   "/api/forgot-password",
   "/api/forgot-password/confirmar",
   // Login/logout de lectores: mismo motivo que "/api/login" de arriba
