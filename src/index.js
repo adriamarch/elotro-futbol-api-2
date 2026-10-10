@@ -6806,7 +6806,11 @@ async function conCacheKV(env, cacheKey, ttlSegundos, generar) {
     }
   }
   const datos = await generar();
-  if (env.ELOTROFUTBOL_KV) {
+  // Un resultado con error (p. ej. Search Console con la clave mal
+  // configurada) NO se cachea: si no, tras corregir el fallo el panel
+  // seguiría mostrando el mismo error hasta que caducase la caché (10 min).
+  const esError = !!(datos && typeof datos === "object" && datos.error);
+  if (env.ELOTROFUTBOL_KV && !esError) {
     try {
       await env.ELOTROFUTBOL_KV.put(cacheKey, JSON.stringify(datos), { expirationTtl: ttlSegundos });
     } catch (err) {
