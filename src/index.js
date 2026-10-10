@@ -2659,6 +2659,19 @@ function normalizarCamposFormulario(raw) {
         campo.permitir_otro = c.permitir_otro === true || c.permitir_otro === 1;
         // "unica": cada opción solo se puede elegir una vez; al usarla desaparece para los demás (p. ej. nombres).
         if (c.unica === true || c.unica === 1) campo.unica = true;
+        // "alta_usuario": al enviar esta opción se crea el usuario (ver crearUsuarioDesdeFormulario).
+        if ((tipo === "desplegable" || tipo === "opcion") && FORMULARIO_ALTA_ROLES.includes(String(c.alta_usuario || ""))) {
+          campo.alta_usuario = String(c.alta_usuario);
+          // "alias_usuarios": { "opción de la lista": "usuario" } para quien YA tiene usuario con otro nombre (no se le crea otro).
+          if (c.alias_usuarios && typeof c.alias_usuarios === "object") {
+            const alias = {};
+            for (const [k, v] of Object.entries(c.alias_usuarios).slice(0, 200)) {
+              const kk = formularioLimpiarTexto(k, 300), vv = String(v || "").trim().toLowerCase().slice(0, 60);
+              if (kk && /^[a-z0-9_.]+$/.test(vv)) alias[kk] = vv;
+            }
+            if (Object.keys(alias).length) campo.alias_usuarios = alias;
+          }
+        }
       }
     }
     // Campo condicional: solo se muestra (y se valida) si un campo ANTERIOR tiene cierto valor.
@@ -2719,6 +2732,134 @@ async function formularioPublicoDisponible(env, f, conContenido) {
     return u && u.size ? { ...c, opciones: c.opciones.filter((o) => !u.has(normalizarOpcionUnica(o))) } : c;
   });
   return pub;
+}
+// ---------- Alta automática de usuarios desde un formulario ----------
+// Un campo desplegable/opción con "alta_usuario" (redactor | fotografo) es una plantilla de
+// nombres y equipos ("Nombre — Equipo1 & Equipo2"). Al enviar el formulario con una de esas
+// opciones se crea el usuario (usuario y contraseña) con ese nombre, equipo(s) y rol, y se le
+// entrega la contraseña en pantalla y por correo (el que escribe en el formulario).
+// Si luego se elimina el usuario, se borra también su respuesta (y la opción vuelve a la lista).
+const FORMULARIO_ALTA_ROLES = ["redactor", "fotografo"];
+const FORMULARIO_CATEGORIA_FIJA_ETIQUETA = { arbitraje: "Arbitraje", jurisdiccion: "Jurisdicción deportiva" };
+function formularioClaveNombreUsuario(t) {
+  // Sin el paréntesis final (p. ej. un teléfono), sin tildes ni mayúsculas.
+  return normalizarOpcionUnica(String(t || "").replace(/\s*\([^)]*\)\s*$/, ""));
+}
+function etiquetaUsuarioFormulario(u) {
+  const nombre = String((u && u.nombre) || "").trim();
+  const equipos = parsearEquipos(u && u.equipo);
+  const cats = parsearCategoriasFijas(u && u.categorias_fijas).map((c) => FORMULARIO_CATEGORIA_FIJA_ETIQUETA[c] || c);
+  const detalle = (equipos.length ? equipos : cats).join(" & ");
+  return detalle ? `${nombre} — ${detalle}` : nombre;
+}
+// "Jose Morales — Arbitraje" -> { nombre, equipos: [], categorias_fijas: ["arbitraje"] }
+function datosUsuarioDesdeOpcionFormulario(valor) {
+  const t = String(valor || "").replace(/\s*\([^)]*\)\s*$/, "").trim();
+  const i = t.indexOf(" — ");
+  const nombre = (i >= 0 ? t.slice(0, i) : t).trim();
+  const partes = i >= 0 ? t.slice(i + 3).split(/\s*&\s*/).map((x) => x.trim()).filter(Boolean) : [];
+  const categorias = [];
+  const equipos = [];
+  for (const p of partes) {
+    const k = normalizarOpcionUnica(p);
+    if (k === "arbitraje") categorias.push("arbitraje");
+    else if (k === "jurisprudencia" || k.startsWith("jurisdiccion")) categorias.push("jurisdiccion");
+    else equipos.push(p);
+  }
+  return { nombre, equipos: categorias.length ? [] : equipos.slice(0, 3), categorias_fijas: [...new Set(categorias)] };
+}
+function usernameBaseFormulario(nombre) {
+  const s = normalizarOpcionUnica(nombre).replace(/[^a-z0-9]+/g, ".").replace(/^\.+|\.+$/g, "").slice(0, 24);
+  return s || "usuario";
+}
+async function usernameLibreFormulario(env, nombre, equipos) {
+  const base = usernameBaseFormulario(nombre);
+  const club = equipos.length ? normalizarOpcionUnica(equipos[0]).replace(/[^a-z0-9]+/g, "").slice(0, 12) : "";
+  const candidatos = [base, ...(club ? [`${base}_${club}`] : [])];
+  for (let n = 2; n < 60; n++) candidatos.push(`${base}${n}`);
+  for (const c of candidatos) {
+    const row = await env.DB.prepare("SELECT id FROM users WHERE username = ?").bind(c).first();
+    if (!row) return c;
+  }
+  return `${base}${Date.now().toString(36)}`;
+}
+// ¿Esta opción de la lista corresponde a este usuario? Tres niveles, de más a menos estricto:
+//  1) alias explícito (campo.alias_usuarios): decide solo, es la forma segura para quien tiene otro nombre;
+//  2) mismo nombre y equipo/categoría exactos (tildes, mayúsculas y teléfono entre paréntesis ignorados);
+//  3) mismo nombre y al menos un equipo o categoría en común (p. ej. alguien con un equipo más o menos).
+function opcionCoincideConUsuarioFormulario(opcion, u, alias) {
+  const clave = formularioClaveNombreUsuario(opcion);
+  for (const [k, v] of Object.entries(alias || {})) {
+    if (formularioClaveNombreUsuario(k) === clave) return String(v).toLowerCase() === String(u.username || "").toLowerCase();
+  }
+  if (clave === formularioClaveNombreUsuario(etiquetaUsuarioFormulario(u))) return true;
+  const d = datosUsuarioDesdeOpcionFormulario(opcion);
+  if (!d.nombre || normalizarOpcionUnica(d.nombre) !== normalizarOpcionUnica(u.nombre)) return false;
+  const equipos = parsearEquipos(u.equipo).map(normalizarOpcionUnica);
+  const cats = parsearCategoriasFijas(u.categorias_fijas);
+  return d.equipos.some((e) => equipos.includes(normalizarOpcionUnica(e))) || d.categorias_fijas.some((c) => cats.includes(c));
+}
+// Crea el usuario de la opción elegida. Devuelve { cuenta } (cuenta=null si esa persona ya tenía usuario).
+async function crearUsuarioDesdeFormulario(env, { opcion, rol, email, alias }) {
+  const d = datosUsuarioDesdeOpcionFormulario(opcion);
+  if (!d.nombre || !FORMULARIO_ALTA_ROLES.includes(rol)) return { cuenta: null };
+  const { results } = await env.DB.prepare("SELECT id, username, nombre, rol, equipo, categorias_fijas FROM users").all();
+  const todos = results || [];
+  // Con alias explícito, la persona ya tiene su usuario (de cualquier rol): no se crea otro.
+  const clave = formularioClaveNombreUsuario(opcion);
+  const enAlias = Object.entries(alias || {}).find(([k]) => formularioClaveNombreUsuario(k) === clave);
+  if (enAlias && todos.some((u) => String(u.username).toLowerCase() === String(enAlias[1]).toLowerCase())) return { cuenta: null, yaExistia: true };
+  if (!enAlias && todos.some((u) => u.rol === rol && opcionCoincideConUsuarioFormulario(opcion, u, alias))) return { cuenta: null, yaExistia: true };
+  const { error, equipos } = validarEquipos(d.equipos);
+  if (error) throw new Error(error);
+  const username = await usernameLibreFormulario(env, d.nombre, equipos);
+  const password = generatePassword();
+  const salt = randomSalt();
+  const hash = await hashPassword(password, salt);
+  await env.DB.prepare(
+    "INSERT INTO users (username, password_hash, salt, nombre, rol, activo, email, equipo, categorias_fijas) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)"
+  ).bind(username, hash, salt, d.nombre, rol, email || null, equipos.length ? JSON.stringify(equipos) : null,
+    d.categorias_fijas.length ? JSON.stringify(d.categorias_fijas) : null).run();
+  return { cuenta: { username, password, nombre: d.nombre, rol, equipos, categorias_fijas: d.categorias_fijas } };
+}
+async function enviarCuentaPorCorreoFormulario(env, cuenta, correo) {
+  if (!correo) return false;
+  const enlace = `${SITIO_URL}/admin/login.html`;
+  const equipo = cuenta.equipos.length ? cuenta.equipos.join(" & ") : (cuenta.categorias_fijas.map((c) => FORMULARIO_CATEGORIA_FIJA_ETIQUETA[c] || c).join(" & "));
+  const rolTxt = cuenta.rol === "fotografo" ? "fotógrafo" : "redactor";
+  return enviarEmailNotificacion(env, {
+    asunto: "Tu cuenta de ElOtroFútbol",
+    texto: [`Hola, ${cuenta.nombre}:`, "", `Ya tienes cuenta de ${rolTxt}${equipo ? " (" + equipo + ")" : ""} en ElOtroFútbol.`,
+      "", `Usuario: ${cuenta.username}`, `Contraseña: ${cuenta.password}`, "", `Entra aquí: ${enlace}`,
+      "", "Guarda estos datos en un sitio seguro."].join("\n"),
+    html: `<p>Hola, <strong>${escapeHtmlEmail(cuenta.nombre)}</strong>:</p>
+<p>Ya tienes cuenta de ${rolTxt}${equipo ? " (" + escapeHtmlEmail(equipo) + ")" : ""} en ElOtroFútbol.</p>
+<p><strong>Usuario:</strong> ${escapeHtmlEmail(cuenta.username)}<br><strong>Contraseña:</strong> ${escapeHtmlEmail(cuenta.password)}</p>
+<p><a href="${enlace}">Entrar al panel</a></p><p>Guarda estos datos en un sitio seguro.</p>`,
+  }, { destinatario: correo });
+}
+// Recorre las respuestas de los formularios que tienen algún campo con alta de usuario de ese rol.
+async function recorrerRespuestasAltaUsuarios(env, rol, fn) {
+  const { results: forms } = await env.DB.prepare("SELECT id, campos FROM formularios").all();
+  for (const f of (forms || [])) {
+    const ids = parsearCamposFormulario(f.campos).filter((c) => c.alta_usuario === rol);
+    if (!ids.length) continue;
+    const { results } = await env.DB.prepare("SELECT id, datos FROM formularios_respuestas WHERE formulario_id = ?").bind(f.id).all();
+    for (const r of (results || [])) {
+      let datos = {};
+      try { datos = JSON.parse(String(r.datos || "{}")) || {}; } catch {}
+      await fn(r.id, datos, ids);
+    }
+  }
+}
+// Al eliminar un usuario: fuera su respuesta del formulario (se reconoce por el nombre y equipo elegidos).
+async function borrarRespuestasDeUsuarioFormulario(env, u) {
+  if (!u || !FORMULARIO_ALTA_ROLES.includes(u.rol)) return;
+  await recorrerRespuestasAltaUsuarios(env, u.rol, async (rid, datos, ids) => {
+    if (ids.some((c) => typeof datos[c.id] === "string" && opcionCoincideConUsuarioFormulario(datos[c.id], u, c.alias_usuarios))) {
+      await env.DB.prepare("DELETE FROM formularios_respuestas WHERE id = ?").bind(rid).run();
+    }
+  });
 }
 async function obtenerFormularioPublico(env, slug) {
   const s = String(slug || "").toLowerCase();
@@ -8817,12 +8958,33 @@ export default {
           }
         }
       } catch (err) { console.error("[formularios/unicas]", err); }
+      // Alta de usuario (campos con "alta_usuario"): se crea ANTES de guardar la respuesta y, si ésta falla, se deshace.
+      let cuentaNueva = null, yaTeniaCuenta = false, usuarioCreado = null;
+      const campoAlta = campos.find((c) => c.alta_usuario && typeof v.datos[c.id] === "string");
+      if (campoAlta) {
+        const campoCorreo = campos.find((c) => c.tipo === "email" && typeof v.datos[c.id] === "string");
+        try {
+          const alta = await crearUsuarioDesdeFormulario(env, { opcion: v.datos[campoAlta.id], rol: campoAlta.alta_usuario, email: campoCorreo ? v.datos[campoCorreo.id] : null, alias: campoAlta.alias_usuarios });
+          cuentaNueva = alta.cuenta; yaTeniaCuenta = !!alta.yaExistia;
+          usuarioCreado = cuentaNueva ? cuentaNueva.username : null;
+        } catch (err) {
+          console.error("[formularios/alta-usuario]", err);
+          return json({ error: "No se pudo crear tu usuario. Inténtalo de nuevo o escribe al equipo de ElOtroFútbol." }, 500);
+        }
+      }
       try {
         await env.DB.prepare("INSERT INTO formularios_respuestas (formulario_id, datos) VALUES (?, ?)")
           .bind(f.id, JSON.stringify(v.datos)).run();
       } catch (err) {
         console.error("[formularios/responder]", err);
+        if (usuarioCreado) { try { await env.DB.prepare("DELETE FROM users WHERE username = ?").bind(usuarioCreado).run(); } catch {} }
         return json({ error: "No se pudo enviar el formulario. Inténtalo de nuevo en unos minutos." }, 500);
+      }
+      let correoCuentaEnviado = false;
+      if (cuentaNueva) {
+        const campoCorreo = campos.find((c) => c.tipo === "email" && typeof v.datos[c.id] === "string");
+        try { correoCuentaEnviado = await enviarCuentaPorCorreoFormulario(env, cuentaNueva, campoCorreo ? v.datos[campoCorreo.id] : null); }
+        catch (err) { console.error("[formularios/correo-cuenta]", err); }
       }
       // Aviso por correo al equipo: es un extra, si falla la respuesta ya está guardada.
       if (Number(f.notificar_email)) {
@@ -8839,7 +9001,7 @@ export default {
           console.error("[formularios/aviso-email]", err);
         }
       }
-      return json({ ok: true });
+      return json({ ok: true, ...(cuentaNueva ? { cuenta: { username: cuentaNueva.username, password: cuentaNueva.password, nombre: cuentaNueva.nombre, correo_enviado: correoCuentaEnviado, enlace: `${SITIO_URL}/admin/login.html` } } : {}), ...(yaTeniaCuenta ? { ya_tenia_cuenta: true } : {}) });
     }
 
     // ---------- Contacto de prensa ----------
@@ -12154,7 +12316,7 @@ async function handlePrimary(request, env, ctx) {
         if (payload.rol !== "admin") return json({ error: "Solo un administrador puede eliminar usuarios" }, 403);
         const id = parseInt(userMatch[1]);
         if (id === payload.uid) return json({ error: "No puedes eliminar tu propia cuenta" }, 400);
-        const userBorrado = await env.DB.prepare("SELECT username FROM users WHERE id = ?").bind(id).first();
+        const userBorrado = await env.DB.prepare("SELECT username, nombre, rol, equipo, categorias_fijas FROM users WHERE id = ?").bind(id).first();
         // tienda_pedidos.usuario_id es NOT NULL y apunta a users(id): si esta
         // persona tiene pedidos, borrarla rompería la clave foránea. Se avisa
         // con un 409 claro (un 5xx o una excepción harían failover a Railway
@@ -12215,6 +12377,9 @@ async function handlePrimary(request, env, ctx) {
           }
           throw e;
         }
+        // Fuera también su respuesta en los formularios con alta de usuario (su nombre vuelve a la lista).
+        try { await borrarRespuestasDeUsuarioFormulario(env, userBorrado); }
+        catch (e) { console.error("[formularios/usuario-eliminado]", e); }
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "eliminar_usuario", entidad: "usuario", entidad_id: id,
           descripcion: `Ha eliminado el usuario "${userBorrado ? userBorrado.username : id}"`,
