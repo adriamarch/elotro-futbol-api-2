@@ -2333,6 +2333,61 @@ function b64urlDecodeTexto(str) {
   const bytes = Uint8Array.from(binario, (c) => c.charCodeAt(0));
   return new TextDecoder("utf-8").decode(bytes);
 }
+// ---------- Clave privada de la cuenta de servicio -> DER PKCS8 ----------
+// El secreto GSC_SERVICE_ACCOUNT_KEY se guarda a mano con "wrangler secret
+// put" o en el panel de Cloudflare, y es muy fácil que llegue deformado:
+// pegado con las comillas y la coma del JSON, con los saltos de línea
+// escritos como \n literales (o doblemente escapados), pegando el JSON
+// entero en vez de solo "private_key", o en formato PKCS1 ("BEGIN RSA
+// PRIVATE KEY"). WebCrypto solo acepta PKCS8 limpio y, si no, responde con
+// el críptico "Invalid PKCS8 input". Aquí se normaliza todo eso y, si aun así
+// no es válida, se lanza un error que explica qué revisar.
+function derLongitud(n) {
+  if (n < 128) return [n];
+  const bytes = [];
+  while (n > 0) { bytes.unshift(n & 255); n = Math.floor(n / 256); }
+  return [0x80 | bytes.length, ...bytes];
+}
+function derEnvolver(tag, contenido) {
+  return [tag, ...derLongitud(contenido.length), ...contenido];
+}
+// Envuelve una clave RSA PKCS1 en la estructura PKCS8 (PrivateKeyInfo).
+function pkcs1APkcs8(pkcs1) {
+  const version = [0x02, 0x01, 0x00];
+  const algoritmo = [0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00];
+  const octetos = derEnvolver(0x04, Array.from(pkcs1));
+  return Uint8Array.from(derEnvolver(0x30, [...version, ...algoritmo, ...octetos]));
+}
+function clavePrivadaADer(raw) {
+  let txt = String(raw == null ? "" : raw).trim();
+  if (!txt) throw new Error("El secreto GSC_SERVICE_ACCOUNT_KEY está vacío.");
+  // Si han pegado el JSON completo de la cuenta de servicio, se coge private_key.
+  if (txt.startsWith("{")) {
+    try {
+      const j = JSON.parse(txt);
+      if (j && j.private_key) txt = String(j.private_key);
+    } catch {}
+  }
+  // \n o \\n literales (una o varias barras) -> salto de línea real.
+  txt = txt.replace(/\\+[nr]/g, "\n");
+  // Comillas / comas / espacios que sobran alrededor.
+  txt = txt.replace(/^["',\s]+|["',\s]+$/g, "");
+  const m = txt.match(/-----BEGIN ([A-Z ]*)PRIVATE KEY-----([\s\S]*?)-----END [A-Z ]*PRIVATE KEY-----/);
+  const esPkcs1 = !!m && m[1].trim() === "RSA";
+  const b64 = (m ? m[2] : txt).replace(/[^A-Za-z0-9+/=]/g, "");
+  if (!b64) throw new Error("GSC_SERVICE_ACCOUNT_KEY no contiene ninguna clave privada.");
+  let der;
+  try {
+    der = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  } catch {
+    throw new Error("GSC_SERVICE_ACCOUNT_KEY no tiene un formato de clave válido (base64 incorrecto).");
+  }
+  if (der.length < 600) {
+    throw new Error(`GSC_SERVICE_ACCOUNT_KEY parece incompleta (${der.length} bytes; una clave RSA real ocupa más de 1.100). Copia el campo private_key entero, hasta -----END PRIVATE KEY-----.`);
+  }
+  return esPkcs1 ? pkcs1APkcs8(der) : der;
+}
+
 // ---------- Firma RS256 (para el JWT de cuenta de servicio de Google) ----------
 // Distinto de signHS256 (arriba, HS256 con secreto compartido, usado
 // para nuestros propios JWT de sesión): la API de Google exige que el
@@ -2341,23 +2396,19 @@ function b64urlDecodeTexto(str) {
 // VERIFICAR (no firmar) los id_token que llegan de Google/Microsoft en
 // verificarGoogleIdToken/verificarMicrosoftIdToken.
 async function signRS256(data, clavePrivadaPem) {
-  // La clave llega en formato PEM estándar (la que descarga la consola
-  // de Google al crear la cuenta de servicio, con las líneas
-  // "-----BEGIN PRIVATE KEY-----"): hay que quitar cabecera/pie y
-  // saltos de línea, decodificar el base64 restante a bytes DER, e
-  // importarla como PKCS8.
-  const pem = clavePrivadaPem
-    .replace(/-----BEGIN PRIVATE KEY-----/, "")
-    .replace(/-----END PRIVATE KEY-----/, "")
-    .replace(/\s+/g, "");
-  const der = Uint8Array.from(atob(pem), (c) => c.charCodeAt(0));
-  const key = await crypto.subtle.importKey(
-    "pkcs8",
-    der,
-    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
+  const der = clavePrivadaADer(clavePrivadaPem);
+  let key;
+  try {
+    key = await crypto.subtle.importKey(
+      "pkcs8",
+      der,
+      { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+      false,
+      ["sign"]
+    );
+  } catch (e) {
+    throw new Error("La clave privada de GSC_SERVICE_ACCOUNT_KEY no es válida (Invalid PKCS8). Vuelve a guardarla con el valor exacto del campo private_key del JSON de la cuenta de servicio (empieza por -----BEGIN PRIVATE KEY-----).");
+  }
   const sig = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, new TextEncoder().encode(data));
   return b64url(String.fromCharCode(...new Uint8Array(sig)));
 }
@@ -2378,7 +2429,7 @@ async function obtenerTokenGoogleServiceAccount(env) {
     iat: now,
     exp: now + 3600,
   };
-  const clavePrivada = env.GSC_SERVICE_ACCOUNT_KEY.replace(/\\n/g, "\n");
+  const clavePrivada = env.GSC_SERVICE_ACCOUNT_KEY;
   const sinFirmar = `${b64urlJSON(header)}.${b64urlJSON(claim)}`;
   const jwt = `${sinFirmar}.${await signRS256(sinFirmar, clavePrivada)}`;
 
@@ -4281,6 +4332,13 @@ async function sha256Hex(arrayBuffer) {
 }
 
 async function borrarDeCloudinary(env, publicId, resourceType, cloudName) {
+  // Contenido pesado guardado en R2 (public_id "r2:<clave>"): este backend no
+  // tiene acceso al bucket, así que no se intenta borrar de Cloudinary (daría
+  // "not found"). El objeto queda en R2 hasta borrarlo desde el worker principal.
+  if (typeof publicId === "string" && publicId.startsWith("r2:")) {
+    console.warn("[media] contenido pesado en R2 no borrable desde el backend secundario:", publicId);
+    return null;
+  }
   // Se borra en la cuenta donde vive el archivo (cloudName, sacado de su
   // URL o de la propia subida). Si no se sabe cuál es, se prueba en todas:
   // destroy en una cuenta que no lo tiene responde "not found" sin más.
@@ -6848,53 +6906,73 @@ async function calcularFuentesAnaliticas(env, desde) {
 }
 
 async function calcularAutoresAnaliticas(env, desde) {
-  // Antes esto sacaba la lista de article_id con vistas y volvía a
-  // consultar articles/article_reading con "WHERE id IN (?,?,?...)",
-  // bindeando un parámetro por artículo -- con más de 100 artículos
-  // distintos con vistas en el rango, D1 rechaza la consulta por
-  // superar su límite de 100 parámetros bindeados por statement (ver
-  // la nota completa en calcularCategoriasAnaliticas). Se reescribe
-  // igual que esa: vistas y lecturas se agregan por separado (evita el
-  // fan-out de un doble JOIN, cada evento se cuenta una vez) pero sin
-  // ninguna lista de IDs dinámica -- article_reading se filtra por
-  // fecha directamente, no por "IN (ids con vistas)".
-  const { results: vistasPorArticulo } = await env.DB.prepare(
-    `SELECT a.id, a.autor_nombre, COUNT(v.id) AS vistas
+  // Rendimiento por autor, comparable entre autores con distinta
+  // producción: se normalizan las vistas por artículo y se expresan
+  // como porcentaje respecto a la media de todos los autores.
+  //  - Vistas y tiempo de lectura: TODO lo registrado en el periodo para
+  //    los artículos del autor (publicados ahora o antes).
+  //  - "noticias": artículos "activos" del autor en el periodo, es decir,
+  //    los publicados en el periodo (aunque no tengan ninguna vista) más
+  //    los que, siendo anteriores, han recibido vistas en el periodo.
+  //    (Antes solo contaba los que tenían vistas, y una versión posterior
+  //    limitaba las vistas a artículos publicados en el periodo, lo que
+  //    dejaba a todos en 0 % si el archivo era anterior al rango.)
+  // Consultas agregadas por separado y sin listas dinámicas de IDs
+  // (límite de 100 parámetros de D1; ver calcularCategoriasAnaliticas).
+  const { results: articulos } = await env.DB.prepare(
+    `SELECT a.autor_nombre, COUNT(*) AS noticias
+     FROM articles a
+     WHERE a.autor_nombre IS NOT NULL
+       AND ( (a.publicado = 1 AND a.fecha_publicacion >= ${desde})
+             OR EXISTS (SELECT 1 FROM article_views v
+                        WHERE v.article_id = a.id AND v.created_at >= ${desde}) )
+     GROUP BY a.autor_nombre`
+  ).all();
+  if (!articulos || articulos.length === 0) return { autores: [], media_vistas_por_noticia: 0 };
+
+  const { results: vistas } = await env.DB.prepare(
+    `SELECT a.autor_nombre, COUNT(v.id) AS vistas
      FROM article_views v
      JOIN articles a ON a.id = v.article_id
      WHERE v.created_at >= ${desde} AND a.autor_nombre IS NOT NULL
-     GROUP BY a.id, a.autor_nombre`
-  ).all();
-  if (!vistasPorArticulo || vistasPorArticulo.length === 0) return { autores: [] };
-
-  const { results: lecturasPorArticulo } = await env.DB.prepare(
-    `SELECT article_id, AVG(segundos) AS tiempo_medio_segundos
-     FROM article_reading WHERE created_at >= ${desde}
-     GROUP BY article_id`
+     GROUP BY a.autor_nombre`
   ).all();
 
-  const lecturaPorId = new Map((lecturasPorArticulo || []).map((r) => [r.article_id, r.tiempo_medio_segundos]));
+  const { results: lecturas } = await env.DB.prepare(
+    `SELECT a.autor_nombre, AVG(r.segundos) AS tiempo_medio_segundos
+     FROM article_reading r
+     JOIN articles a ON a.id = r.article_id
+     WHERE r.created_at >= ${desde} AND a.autor_nombre IS NOT NULL
+     GROUP BY a.autor_nombre`
+  ).all();
 
-  const porAutor = new Map();
-  for (const art of vistasPorArticulo) {
-    const acumulado = porAutor.get(art.autor_nombre) || { autor: art.autor_nombre, noticias: 0, vistas: 0, sumaTiempo: 0, conTiempo: 0 };
-    acumulado.noticias += 1;
-    acumulado.vistas += Number(art.vistas) || 0;
-    const tiempo = lecturaPorId.get(art.id);
-    if (tiempo != null) { acumulado.sumaTiempo += tiempo; acumulado.conTiempo += 1; }
-    porAutor.set(art.autor_nombre, acumulado);
-  }
+  const vistasPorAutor = new Map((vistas || []).map((r) => [r.autor_nombre, Number(r.vistas) || 0]));
+  const tiempoPorAutor = new Map((lecturas || []).map((r) => [r.autor_nombre, Number(r.tiempo_medio_segundos) || 0]));
 
-  const autores = [...porAutor.values()]
-    .map((a) => ({
-      autor: a.autor,
-      noticias: a.noticias,
-      vistas: a.vistas,
-      tiempo_medio_segundos: Math.round(a.conTiempo ? a.sumaTiempo / a.conTiempo : 0),
-    }))
-    .sort((a, b) => b.vistas - a.vistas);
+  const totalNoticias = articulos.reduce((s, r) => s + (Number(r.noticias) || 0), 0);
+  const totalVistas = articulos.reduce((s, r) => s + (vistasPorAutor.get(r.autor_nombre) || 0), 0);
+  const mediaGlobal = totalNoticias ? totalVistas / totalNoticias : 0;
 
-  return { autores };
+  const autores = articulos
+    .map((r) => {
+      const noticias = Number(r.noticias) || 0;
+      const v = vistasPorAutor.get(r.autor_nombre) || 0;
+      const porNoticia = noticias ? v / noticias : 0;
+      return {
+        autor: r.autor_nombre,
+        noticias,
+        vistas: v,
+        vistas_por_noticia: Math.round(porNoticia * 10) / 10,
+        // 100 % = igual que la media de todos los autores
+        rendimiento_pct: mediaGlobal ? Math.round((porNoticia / mediaGlobal) * 100) : 0,
+        // Reparto de vistas sobre el total (para ver el peso de cada autor)
+        cuota_vistas_pct: totalVistas ? Math.round((v / totalVistas) * 1000) / 10 : 0,
+        tiempo_medio_segundos: Math.round(tiempoPorAutor.get(r.autor_nombre) || 0),
+      };
+    })
+    .sort((a, b) => b.rendimiento_pct - a.rendimiento_pct || b.vistas - a.vistas);
+
+  return { autores, media_vistas_por_noticia: Math.round(mediaGlobal * 10) / 10 };
 }
 
 async function calcularTiempoLecturaAnaliticas(env, desde) {
