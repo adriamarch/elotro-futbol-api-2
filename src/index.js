@@ -7194,7 +7194,9 @@ async function borrarDatosAnaliticas(env, { todo, dias }) {
  *
  *   - Referencia de inactividad: la fecha de su última noticia (cualquier
  *     tipo, borrador o publicada, ver articles.fecha_publicacion) o, si
- *     nunca ha subido nada, la fecha de creación de su cuenta.
+ *     nunca ha subido nada, la fecha de creación de su cuenta. Una noticia
+ *     en la que figura como segundo autor (coautor_id) cuenta igual que si
+ *     fuera suya.
  *   - Aviso 1 al cumplirse 30 días desde esa referencia.
  *   - Avisos 2, 3, 4 y 5: uno cada 5 días desde el aviso anterior.
  *   - El aviso 5 lleva además el texto de incumplimiento de las normas
@@ -7341,7 +7343,9 @@ async function enviarRecordatoriosInactividadSiToca(env) {
 
     const { results: redactores } = await env.DB.prepare(
       `SELECT u.id, u.nombre, u.email, u.created_at,
-              (SELECT MAX(a.fecha_publicacion) FROM articles a WHERE a.autor_id = u.id) AS ultima_noticia,
+              (SELECT MAX(t.f) FROM (SELECT a.fecha_publicacion AS f FROM articles a WHERE a.autor_id = u.id
+                                 UNION ALL
+                                 SELECT c.fecha_publicacion FROM articles c WHERE c.coautor_id = u.id) t) AS ultima_noticia,
               r.ref_actividad, r.avisos_enviados, r.ultimo_aviso_at, r.admins_avisados_at
        FROM users u
        LEFT JOIN recordatorios_inactividad r ON r.user_id = u.id
@@ -7505,7 +7509,10 @@ async function cargarEstadoInactividadUsuarios(env, usuarios) {
         "SELECT user_id, ref_actividad, avisos_enviados, ultimo_aviso_at, admins_avisados_at FROM recordatorios_inactividad"
       ).all(),
       env.DB.prepare(
-        "SELECT autor_id, MAX(fecha_publicacion) AS ultima_noticia FROM articles WHERE autor_id IS NOT NULL GROUP BY autor_id"
+        "SELECT t.uid AS autor_id, MAX(t.f) AS ultima_noticia FROM ("
+          + "SELECT autor_id AS uid, fecha_publicacion AS f FROM articles WHERE autor_id IS NOT NULL "
+          + "UNION ALL SELECT coautor_id, fecha_publicacion FROM articles WHERE coautor_id IS NOT NULL"
+          + ") t GROUP BY t.uid"
       ).all(),
     ]);
     // El historial va en una consulta aparte: si la columna aún no existe, el
