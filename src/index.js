@@ -1,5 +1,5 @@
 // ElOtroFútbol - Worker API
-// Rutas: /api/login, /api/me, /api/me/sesiones, /api/articles, /api/results, /api/porras, /api/porras/resumen, /api/porras/ranking, /api/media, /api/custom-clubs, /api/articles/:id/comments, /api/comments/:id/vote, /api/comments/:id/report, /api/admin/comments, /api/admin/comments/reported, /api/club-info, /api/admin/club-info, /api/track/view, /api/track/reading, /api/track/result-view, /api/admin/analiticas/* (resumen, mas-leidas, fuentes, autores, tiempo-lectura, idiomas, partidos-seguidos, gsc), /sitemap-noticias.xml, /sitemap-news.xml, /rss.xml
+// Rutas: /api/login, /api/me, /api/me/sesiones, /api/articles, /api/results, /api/porras, /api/porras/resumen, /api/porras/ranking, /api/media, /api/custom-clubs, /api/articles/:id/comments, /api/comments/:id/vote, /api/comments/:id/report, /api/admin/comments, /api/admin/comments/reported, /api/club-info, /api/admin/club-info, /api/track/view, /api/track/reading, /api/track/result-view, /api/admin/analiticas/* (resumen, mensual, mas-leidas, fuentes, autores, tiempo-lectura, idiomas, partidos-seguidos, gsc), /sitemap-noticias.xml, /sitemap-news.xml, /rss.xml
 
 // Escapa los caracteres especiales de XML para que un título o slug con
 // "&", "<", ">", comillas, etc. no rompa el XML del sitemap.
@@ -2473,6 +2473,14 @@ async function calcularGscAnaliticas(env, dias) {
   try {
     const accessToken = await obtenerTokenGoogleServiceAccount(env);
 
+    // GSC_SITE_URL tal y como aparece en Search Console. Si se guardó solo
+    // el dominio ("elotrofutbol.media"), la API responde 403/404 aunque los
+    // permisos estén bien: se interpreta como propiedad de dominio.
+    let siteUrl = String(env.GSC_SITE_URL).trim();
+    if (!/^(sc-domain:|https?:\/\/)/i.test(siteUrl)) {
+      siteUrl = "sc-domain:" + siteUrl.replace(/\/.*$/, "");
+    }
+
     // GSC solo tiene datos con ~2-3 días de retraso respecto a hoy; se
     // pide hasta hace 2 días para no recibir una cola de días vacíos que
     // desvirtúe la serie/los promedios.
@@ -2485,7 +2493,7 @@ async function calcularGscAnaliticas(env, dias) {
 
     const pedirGsc = async (dimensions, rowLimit) => {
       const resp = await fetch(
-        `https://www.googleapis.com/webmasters/v3/sites/${encodeURIComponent(env.GSC_SITE_URL)}/searchAnalytics/query`,
+        `https://www.googleapis.com/webmasters/v3/sites/${encodeURIComponent(siteUrl)}/searchAnalytics/query`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
@@ -2504,9 +2512,10 @@ async function calcularGscAnaliticas(env, dias) {
       return data.rows || [];
     };
 
-    const [filasDiarias, filasConsultas] = await Promise.all([
+    const [filasDiarias, filasConsultas, filasPaginas] = await Promise.all([
       pedirGsc(["date"], 1000),
       pedirGsc(["query"], 15),
+      pedirGsc(["page"], 10),
     ]);
 
     const totalClics = filasDiarias.reduce((s, f) => s + (f.clicks || 0), 0);
@@ -2521,10 +2530,24 @@ async function calcularGscAnaliticas(env, dias) {
         ctr: totalImpresiones ? Math.round((totalClics / totalImpresiones) * 1000) / 10 : 0,
         posicion: totalImpresiones ? Math.round((posicionPonderada / totalImpresiones) * 10) / 10 : 0,
       },
-      serie: filasDiarias.map((f) => ({
-        fecha: f.keys[0],
+      // Search Console omite los días sin datos: se rellenan con 0 para que
+      // el gráfico no una con una recta dos fechas separadas por un hueco.
+      serie: (() => {
+        const porFecha = new Map(filasDiarias.map((f) => [f.keys[0], f]));
+        const salida = [];
+        for (let d = new Date(inicio); d <= fin; d.setDate(d.getDate() + 1)) {
+          const clave = aFecha(d);
+          const f = porFecha.get(clave);
+          salida.push({ fecha: clave, clics: f ? f.clicks || 0 : 0, impresiones: f ? f.impressions || 0 : 0 });
+        }
+        return salida;
+      })(),
+      paginas: filasPaginas.map((f) => ({
+        pagina: f.keys[0],
         clics: f.clicks || 0,
         impresiones: f.impressions || 0,
+        ctr: Math.round((f.ctr || 0) * 1000) / 10,
+        posicion: Math.round((f.position || 0) * 10) / 10,
       })),
       consultas: filasConsultas.map((f) => ({
         consulta: f.keys[0],
@@ -2536,7 +2559,18 @@ async function calcularGscAnaliticas(env, dias) {
     };
   } catch (err) {
     console.error("[analiticas/gsc] fallo consultando Search Console:", err);
-    return { conectado: true, error: err.message || "Error desconocido consultando Search Console" };
+    const msg = err.message || "Error desconocido consultando Search Console";
+    // Pistas para los fallos de configuración más habituales (el panel
+    // enseña este texto tal cual en la tarjeta de Search Console).
+    let pista = "";
+    if (/sufficient permission|forbidden|permission/i.test(msg)) {
+      pista = " Comprueba que el email de la cuenta de servicio (GSC_SERVICE_ACCOUNT_EMAIL) está añadido en Search Console > Configuración > Usuarios y permisos de la propiedad GSC_SITE_URL.";
+    } else if (/not been used|is disabled|accessNotConfigured/i.test(msg)) {
+      pista = " Activa «Google Search Console API» en el proyecto de Google Cloud de la cuenta de servicio.";
+    } else if (/not found|404/i.test(msg)) {
+      pista = " La propiedad no existe para esa cuenta: GSC_SITE_URL debe ser exactamente como aparece en Search Console (sc-domain:dominio.com, o https://dominio.com/ con la barra final).";
+    }
+    return { conectado: true, error: msg + pista };
   }
 }
 
@@ -6753,19 +6787,32 @@ const CACHE_ANALITICAS_TTL_SEGUNDOS = 600; // 10 minutos
 // cara por hora -- suficiente para frenar tanto un bucle/bot como un
 // admin dejando el dashboard en autorefresco.
 const LIMITE_PETICIONES_PESADAS_POR_HORA = 60;
+// Panel de analíticas: el cortacircuitos cuenta solo las consultas que de
+// verdad llegan a la base de datos (caché KV fallida), no cada petición.
+// Una carga completa del panel son ~15 rutas, así que con el límite
+// general de 60 peticiones/hora bastaban 4 recargas para dejarlo en 503.
+const LIMITE_PETICIONES_ANALITICAS_POR_HORA = 150;
+const OPC_CORTACIRCUITOS_ANALITICAS = { clave: "analiticas", limite: LIMITE_PETICIONES_ANALITICAS_POR_HORA };
+const CACHE_ANALITICAS_MENSUAL_TTL_SEGUNDOS = 6 * 3600; // 6 horas
+
+// Respuesta HTTP de las rutas de analíticas: 503 si el cortacircuitos ha
+// saltado (el panel lo muestra con su mensaje real), 200 en el resto.
+function respuestaAnaliticas(datos) {
+  return json(datos, datos && datos.limitado ? 503 : 200);
+}
 
 // Incrementa el contador de la ventana horaria actual para `clave` y
 // devuelve true si YA se ha superado el límite (es decir: hay que
 // cortar y no tocar D1). Falla "abierto" (deja pasar) si KV no está
 // configurado o falla, para que un problema de KV nunca tumbe el sitio
 // entero -- el cortacircuitos es una capa extra, no la única defensa.
-async function superaLimitePeticionesPesadas(env, clave) {
+async function superaLimitePeticionesPesadas(env, clave, limite = LIMITE_PETICIONES_PESADAS_POR_HORA) {
   if (!env.ELOTROFUTBOL_KV) return false;
   try {
     const ventana = new Date().toISOString().slice(0, 13); // YYYY-MM-DDTHH
     const kvKey = `cortacircuitos:${clave}:${ventana}`;
     const actual = parseInt((await env.ELOTROFUTBOL_KV.get(kvKey)) || "0", 10);
-    if (actual >= LIMITE_PETICIONES_PESADAS_POR_HORA) return true;
+    if (actual >= limite) return true;
     await env.ELOTROFUTBOL_KV.put(kvKey, String(actual + 1), { expirationTtl: 3600 });
     return false;
   } catch (err) {
@@ -6796,7 +6843,7 @@ async function invalidarCacheArticuloPartido(env, resultadoId) {
 // Envuelve una ruta cara en caché de KV: si hay una respuesta reciente
 // guardada bajo `cacheKey`, la devuelve sin tocar D1; si no, ejecuta
 // `generar` (que sí consulta D1), guarda el resultado y lo devuelve.
-async function conCacheKV(env, cacheKey, ttlSegundos, generar) {
+async function conCacheKV(env, cacheKey, ttlSegundos, generar, opciones = {}) {
   if (env.ELOTROFUTBOL_KV) {
     try {
       const cacheado = await env.ELOTROFUTBOL_KV.get(cacheKey, "json");
@@ -6804,6 +6851,17 @@ async function conCacheKV(env, cacheKey, ttlSegundos, generar) {
     } catch (err) {
       console.error("[cache-kv] fallo al leer, se consulta D1:", err);
     }
+  }
+  // Solo las consultas que de verdad van a la base de datos cuentan para el
+  // cortacircuitos (las respuestas servidas desde KV de arriba no llegan aquí).
+  if (opciones.cortacircuitos && await superaLimitePeticionesPesadas(env, opciones.cortacircuitos.clave, opciones.cortacircuitos.limite)) {
+    return {
+      datos: {
+        limitado: true,
+        error: "Panel de analíticas temporalmente limitado para proteger la cuota de la base de datos. Inténtalo de nuevo en unos minutos.",
+      },
+      deCache: false,
+    };
   }
   const datos = await generar();
   // Un resultado con error (p. ej. Search Console con la clave mal
@@ -6826,7 +6884,7 @@ async function conCacheKV(env, cacheKey, ttlSegundos, generar) {
 // las queries. `desde` ya viene con el rango capado a
 // RANGO_ANALITICAS_MAX_DIAS aplicado por el router.
 
-async function calcularResumenAnaliticas(env, desde) {
+async function calcularResumenAnaliticas(env, desde, dias = 28) {
   const kpis = await env.DB.prepare(
     `SELECT
        COUNT(*) AS paginas_vistas,
@@ -6861,7 +6919,32 @@ async function calcularResumenAnaliticas(env, desde) {
     if (fila.dispositivo in dispositivos) dispositivos[fila.dispositivo] = Number(fila.vistas) || 0;
   }
 
+  // Periodo anterior equivalente [2*dias, dias) calculado aquí, para que el
+  // panel no tenga que pedir un segundo resumen del doble de días (que el
+  // capado a 90 días dejaba sin comparativa en el selector de 90 días).
+  let anterior = null;
+  try {
+    const desdeDoble = `datetime('now', '-${dias * 2} days')`;
+    const kpisAnt = await env.DB.prepare(
+      `SELECT COUNT(*) AS paginas_vistas, COUNT(DISTINCT visitante_hash) AS visitantes
+       FROM article_views WHERE created_at >= ${desdeDoble} AND created_at < ${desde}`
+    ).first();
+    const lecturaAnt = await env.DB.prepare(
+      `SELECT AVG(segundos) AS media_segundos, AVG(scroll_maximo) AS media_scroll
+       FROM article_reading WHERE created_at >= ${desdeDoble} AND created_at < ${desde}`
+    ).first();
+    anterior = {
+      vistas: Number(kpisAnt?.paginas_vistas) || 0,
+      visitantes: Number(kpisAnt?.visitantes) || 0,
+      tiempo_medio_segundos: Math.round(lecturaAnt?.media_segundos || 0),
+      completitud: Math.round((lecturaAnt?.media_scroll || 0) * 10) / 10,
+    };
+  } catch (err) {
+    console.error("[analiticas/resumen] no se pudo calcular el periodo anterior:", err);
+  }
+
   return {
+    anterior,
     vistas: kpis?.paginas_vistas || 0,
     visitantes: kpis?.visitantes || 0,
     noticias_con_vistas: kpis?.noticias_con_vistas || 0,
@@ -6875,6 +6958,27 @@ async function calcularResumenAnaliticas(env, desde) {
       noticias_con_vistas: kpis?.noticias_con_vistas || 0,
       tiempo_medio_lectura_segundos: Math.round(lectura?.media_segundos || 0),
     },
+  };
+}
+
+// ---------- Comparativa mensual: visitantes y páginas vistas por mes ----------
+// Ventana de 215 días (cubre 6 meses naturales completos + el mes en curso).
+async function calcularMensualAnaliticas(env) {
+  const { results } = await env.DB.prepare(
+    `SELECT substr(created_at, 1, 7) AS mes,
+            COUNT(*) AS vistas,
+            COUNT(DISTINCT visitante_hash) AS visitantes
+     FROM article_views
+     WHERE created_at >= datetime('now', '-215 days')
+     GROUP BY substr(created_at, 1, 7)
+     ORDER BY mes ASC`
+  ).all();
+  return {
+    meses: (results || []).map((f) => ({
+      mes: f.mes,
+      vistas: Number(f.vistas) || 0,
+      visitantes: Number(f.visitantes) || 0,
+    })),
   };
 }
 
@@ -7230,6 +7334,83 @@ async function calcularCategoriasAnaliticas(env, desde) {
   return { categorias };
 }
 
+// ---------- Noticias rápidas: producción editorial ----------
+// Las noticias rápidas (foto + titular + subtitular) no pasan por el
+// tracking de vistas (article_views solo conoce artículos), así que la
+// estadística disponible es de PRODUCCIÓN: cuántas se publican, a qué
+// ritmo, quién las escribe y a qué hora. Tabla pequeña (cientos de
+// filas): una consulta acotada al doble del periodo (para poder comparar
+// con el periodo anterior) y el resto se agrega aquí. Fechas y horas en
+// hora de Madrid, que es como trabaja la redacción (created_at está en UTC).
+function parseFechaUtcNr(valor) {
+  if (!valor) return null;
+  let s = String(valor).trim().replace(" ", "T");
+  if (/[+-]\d\d$/.test(s)) s += ":00";
+  if (!/[zZ]$|[+-]\d\d:?\d\d$/.test(s)) s += "Z";
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+async function calcularNoticiasRapidasAnaliticas(env, dias) {
+  const { results } = await env.DB.prepare(
+    `SELECT id, autor_id, created_at FROM noticias_rapidas
+     WHERE created_at >= datetime('now', '-${dias * 2} days')
+     ORDER BY created_at DESC
+     LIMIT 5000`
+  ).all();
+  const resumen = await env.DB.prepare(
+    `SELECT COUNT(*) AS total, MAX(created_at) AS ultima FROM noticias_rapidas`
+  ).first();
+  const { results: usuarios } = await env.DB.prepare(`SELECT id, nombre FROM users`).all();
+  const nombrePorId = new Map((usuarios || []).map((u) => [u.id, u.nombre]));
+
+  const fmtDia = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit" });
+  const fmtHora = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Madrid", hour: "2-digit", hourCycle: "h23" });
+
+  const ahora = Date.now();
+  const limiteActual = ahora - dias * 86400000;
+  const porDia = new Map();
+  const porAutor = new Map();
+  const horas = new Array(24).fill(0);
+  let total = 0;
+  let anterior = 0;
+  for (const fila of results || []) {
+    const d = parseFechaUtcNr(fila.created_at);
+    if (!d) continue;
+    if (d.getTime() < limiteActual) { anterior += 1; continue; }
+    total += 1;
+    const dia = fmtDia.format(d);
+    porDia.set(dia, (porDia.get(dia) || 0) + 1);
+    horas[parseInt(fmtHora.format(d), 10) % 24] += 1;
+    const clave = fila.autor_id == null ? 0 : fila.autor_id;
+    porAutor.set(clave, (porAutor.get(clave) || 0) + 1);
+  }
+
+  // Serie diaria sin huecos (los días sin ninguna publicada cuentan 0).
+  const serie = [];
+  for (let i = dias - 1; i >= 0; i--) {
+    const dia = fmtDia.format(new Date(ahora - i * 86400000));
+    serie.push({ fecha: dia, total: porDia.get(dia) || 0 });
+  }
+
+  const autores = [...porAutor.entries()]
+    .map(([id, n]) => ({ autor_id: id || null, nombre: nombrePorId.get(id) || "Sin autor", total: n }))
+    .sort((a, b) => b.total - a.total)
+    .slice(0, 8);
+
+  const ultima = parseFechaUtcNr(resumen && resumen.ultima);
+  return {
+    total,
+    anterior,
+    media_dia: Math.round((total / dias) * 10) / 10,
+    total_historico: Number(resumen && resumen.total) || 0,
+    ultima: ultima ? ultima.toISOString() : null,
+    serie,
+    autores,
+    horas: horas.map((n, h) => ({ hora: h, total: n })),
+  };
+}
+
 // ---------- Lectores nuevos vs. recurrentes ----------
 // "Recurrente" = visitante_estable con vistas en más de un día distinto
 // dentro del rango. OJO: no se puede usar visitante_hash aquí -- ese
@@ -7268,6 +7449,27 @@ async function calcularRecurrenciaAnaliticas(env, desde) {
 // Solo admin (comprobado en el router, igual que el resto de
 // /api/admin/analiticas/*). Devuelve cuántas filas de article_views se
 // han borrado para que el panel pueda confirmarlo en el toast.
+// Tras borrar datos de tracking hay que vaciar la caché KV de analíticas: si no,
+// el panel seguía mostrando las cifras ya borradas hasta 10 min (6 h en la
+// comparativa mensual). Search Console no depende de esos datos y se conserva.
+async function invalidarCacheAnaliticas(env) {
+  if (!env.ELOTROFUTBOL_KV || typeof env.ELOTROFUTBOL_KV.list !== "function") return;
+  try {
+    let cursor;
+    do {
+      const lista = await env.ELOTROFUTBOL_KV.list({ prefix: "analiticas-cache:", cursor });
+      await Promise.all(
+        (lista.keys || [])
+          .filter((k) => !k.name.includes("/gsc:"))
+          .map((k) => env.ELOTROFUTBOL_KV.delete(k.name))
+      );
+      cursor = lista.list_complete ? undefined : lista.cursor;
+    } while (cursor);
+  } catch (err) {
+    console.error("[analiticas] no se pudo vaciar la caché tras borrar datos (no crítico):", err);
+  }
+}
+
 async function borrarDatosAnaliticas(env, { todo, dias }) {
   if (todo) {
     const fila = await env.DB.prepare(`SELECT COUNT(*) AS n FROM article_views`).first();
@@ -8531,17 +8733,8 @@ export default {
      * conCacheKV/RANGO_ANALITICAS_MAX_DIAS para las otras dos capas.
      * ============================================================
      */
-    if (path.startsWith("/api/admin/analiticas")) {
-      if (await superaLimitePeticionesPesadas(env, "analiticas")) {
-        return json(
-          {
-            error:
-              "Panel de analíticas temporalmente limitado para proteger la cuota de la base de datos. Inténtalo de nuevo en unos minutos.",
-          },
-          503
-        );
-      }
-    }
+    // (El conteo del cortacircuitos de analíticas se hace ahora dentro de
+    // conCacheKV, solo cuando la consulta llega a la base de datos.)
 
     /*
      * ============================================================
@@ -17560,59 +17753,78 @@ async function handlePrimary(request, env, ctx) {
         // ---------- Resumen: KPIs + evolución diaria + dispositivos ----------
         if (path === "/api/admin/analiticas/resumen") {
           const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
-            calcularResumenAnaliticas(env, desde)
+            calcularResumenAnaliticas(env, desde, dias),
+            { cortacircuitos: OPC_CORTACIRCUITOS_ANALITICAS }
           );
-          return json(datos);
+          return respuestaAnaliticas(datos);
         }
 
         // ---------- Noticias más leídas ----------
         if (path === "/api/admin/analiticas/mas-leidas") {
           const limit = Math.min(parseInt(url.searchParams.get("limit") || "10", 10), 50);
           const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
-            calcularMasLeidasAnaliticas(env, desde, limit)
+            calcularMasLeidasAnaliticas(env, desde, limit),
+            { cortacircuitos: OPC_CORTACIRCUITOS_ANALITICAS }
           );
-          return json(datos);
+          return respuestaAnaliticas(datos);
         }
 
         // ---------- Tráfico por fuente ----------
         if (path === "/api/admin/analiticas/fuentes") {
           const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
-            calcularFuentesAnaliticas(env, desde)
+            calcularFuentesAnaliticas(env, desde),
+            { cortacircuitos: OPC_CORTACIRCUITOS_ANALITICAS }
           );
-          return json(datos);
+          return respuestaAnaliticas(datos);
         }
 
         // ---------- Rendimiento por autor ----------
         if (path === "/api/admin/analiticas/autores") {
           const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
-            calcularAutoresAnaliticas(env, desde)
+            calcularAutoresAnaliticas(env, desde),
+            { cortacircuitos: OPC_CORTACIRCUITOS_ANALITICAS }
           );
-          return json(datos);
+          return respuestaAnaliticas(datos);
         }
 
         // ---------- Tiempo medio de lectura por categoría ----------
         if (path === "/api/admin/analiticas/tiempo-lectura") {
           const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
-            calcularTiempoLecturaAnaliticas(env, desde)
+            calcularTiempoLecturaAnaliticas(env, desde),
+            { cortacircuitos: OPC_CORTACIRCUITOS_ANALITICAS }
           );
-          return json(datos);
+          return respuestaAnaliticas(datos);
         }
 
         // ---------- Idiomas más usados al leer una noticia ----------
         if (path === "/api/admin/analiticas/idiomas") {
           const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
-            calcularIdiomasAnaliticas(env, desde)
+            calcularIdiomasAnaliticas(env, desde),
+            { cortacircuitos: OPC_CORTACIRCUITOS_ANALITICAS }
           );
-          return json(datos);
+          return respuestaAnaliticas(datos);
         }
 
         // ---------- Partidos más seguidos ----------
         if (path === "/api/admin/analiticas/partidos-seguidos") {
           const limit = Math.min(parseInt(url.searchParams.get("limit") || "10", 10), 50);
           const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
-            calcularPartidosMasSeguidosAnaliticas(env, desde, limit)
+            calcularPartidosMasSeguidosAnaliticas(env, desde, limit),
+            { cortacircuitos: OPC_CORTACIRCUITOS_ANALITICAS }
           );
-          return json(datos);
+          return respuestaAnaliticas(datos);
+        }
+
+        // ---------- Comparativa mensual (últimos 6 meses) ----------
+        // Antes el panel pedía /resumen?dias=365, que el capado a 90 días
+        // dejaba en ~3 meses reales. Esta ruta agrega por mes en la base de
+        // datos (una sola consulta, índice por created_at) y se cachea 6 h.
+        if (path === "/api/admin/analiticas/mensual") {
+          const { datos } = await conCacheKV(env, "analiticas-cache:mensual", CACHE_ANALITICAS_MENSUAL_TTL_SEGUNDOS, () =>
+            calcularMensualAnaliticas(env),
+            { cortacircuitos: OPC_CORTACIRCUITOS_ANALITICAS }
+          );
+          return respuestaAnaliticas(datos);
         }
 
         // ---------- Search Console (Google) ----------
@@ -17626,31 +17838,34 @@ async function handlePrimary(request, env, ctx) {
           const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
             calcularGscAnaliticas(env, dias)
           );
-          return json(datos);
+          return respuestaAnaliticas(datos);
         }
 
         // ---------- Franja horaria con más tráfico ----------
         if (path === "/api/admin/analiticas/horas") {
           const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
-            calcularHorasAnaliticas(env, desde)
+            calcularHorasAnaliticas(env, desde),
+            { cortacircuitos: OPC_CORTACIRCUITOS_ANALITICAS }
           );
-          return json(datos);
+          return respuestaAnaliticas(datos);
         }
 
         // ---------- Rendimiento por tipo de artículo ----------
         if (path === "/api/admin/analiticas/tipos") {
           const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
-            calcularTiposAnaliticas(env, desde)
+            calcularTiposAnaliticas(env, desde),
+            { cortacircuitos: OPC_CORTACIRCUITOS_ANALITICAS }
           );
-          return json(datos);
+          return respuestaAnaliticas(datos);
         }
 
         // ---------- Engagement por scroll ----------
         if (path === "/api/admin/analiticas/engagement-scroll") {
           const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
-            calcularEngagementScrollAnaliticas(env, desde)
+            calcularEngagementScrollAnaliticas(env, desde),
+            { cortacircuitos: OPC_CORTACIRCUITOS_ANALITICAS }
           );
-          return json(datos);
+          return respuestaAnaliticas(datos);
         }
 
         // ---------- Vistas últimas 24 horas ----------
@@ -17661,9 +17876,10 @@ async function handlePrimary(request, env, ctx) {
         // autorefresco del panel no golpee D1 en cada recarga.
         if (path === "/api/admin/analiticas/ultimas-24h") {
           const { datos } = await conCacheKV(env, `analiticas-cache:${path}`, 60, () =>
-            calcularUltimas24hAnaliticas(env)
+            calcularUltimas24hAnaliticas(env),
+            { cortacircuitos: OPC_CORTACIRCUITOS_ANALITICAS }
           );
-          return json(datos);
+          return respuestaAnaliticas(datos);
         }
 
         // ---------- Buscador de noticia por titular ----------
@@ -17673,24 +17889,38 @@ async function handlePrimary(request, env, ctx) {
         if (path === "/api/admin/analiticas/buscar-noticia") {
           const q = (url.searchParams.get("q") || "").trim();
           if (!q) return json({ noticias: [] });
+          if (await superaLimitePeticionesPesadas(env, OPC_CORTACIRCUITOS_ANALITICAS.clave, OPC_CORTACIRCUITOS_ANALITICAS.limite)) {
+            return json({ error: "Panel de analíticas temporalmente limitado para proteger la cuota de la base de datos. Inténtalo de nuevo en unos minutos.", limitado: true }, 503);
+          }
           const datos = await calcularBuscarNoticiaAnaliticas(env, desde, q);
-          return json(datos);
+          return respuestaAnaliticas(datos);
         }
 
         // ---------- Rendimiento por categoría ----------
         if (path === "/api/admin/analiticas/categorias") {
           const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
-            calcularCategoriasAnaliticas(env, desde)
+            calcularCategoriasAnaliticas(env, desde),
+            { cortacircuitos: OPC_CORTACIRCUITOS_ANALITICAS }
           );
-          return json(datos);
+          return respuestaAnaliticas(datos);
+        }
+
+        // ---------- Noticias rápidas (producción) ----------
+        if (path === "/api/admin/analiticas/noticias-rapidas") {
+          const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
+            calcularNoticiasRapidasAnaliticas(env, dias),
+            { cortacircuitos: OPC_CORTACIRCUITOS_ANALITICAS }
+          );
+          return respuestaAnaliticas(datos);
         }
 
         // ---------- Lectores nuevos vs. recurrentes ----------
         if (path === "/api/admin/analiticas/recurrencia") {
           const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
-            calcularRecurrenciaAnaliticas(env, desde)
+            calcularRecurrenciaAnaliticas(env, desde),
+            { cortacircuitos: OPC_CORTACIRCUITOS_ANALITICAS }
           );
-          return json(datos);
+          return respuestaAnaliticas(datos);
         }
 
         return json({ error: "Ruta de analíticas no encontrada" }, 404);
@@ -17713,6 +17943,7 @@ async function handlePrimary(request, env, ctx) {
         if (!Number.isFinite(dias) || dias <= 0) dias = 28;
 
         const datos = await borrarDatosAnaliticas(env, { todo, dias });
+        await invalidarCacheAnaliticas(env);
         return json(datos);
       }
 
