@@ -5619,6 +5619,7 @@ async function iniciarPartidosProgramadosCuyaHoraHaLlegado(env) {
     ({ results: candidatosProgramados = [] } = await env.DB.prepare(
       `SELECT id, fecha_partido FROM results
        WHERE estado = 'programado' AND fecha_partido IS NOT NULL
+         AND fuente NOT LIKE 'auto%'
          AND length(fecha_partido) = 16
          AND fecha_partido <= ?` // "YYYY-MM-DDTHH:MM": solo si se conoce la hora, no solo la fecha
     ).bind(limiteLocalArranque).all());
@@ -9391,9 +9392,623 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
     // más abajo). Se autolimita a una vez por hora internamente, así
     // que es seguro dejarla en el cron de cada minuto.
     ctx.waitUntil(comprobarCuotaD1SiToca(env));
+    // Relleno automatico de partidos que nadie cubre (ver "RELLENO AUTOMATICO
+    // DE PARTIDOS" arriba). Se autolimita: un ciclo diario + refresco vivo.
+    ctx.waitUntil(sincronizarPartidosAutomaticosSiToca(env));
   },
 };
 
+
+/*
+ * ================================================================
+ * RELLENO AUTOMATICO DE PARTIDOS (TheSportsDB)
+ *
+ * Trae de TheSportsDB los partidos de LaLiga Hypermotion, Primera
+ * Federacion y Segunda Federacion que ningun redactor cubre y los guarda
+ * en "results" con fuente = 'auto_api_football' (el valor se mantiene por
+ * compatibilidad con la migracion original), sin autor y sin cronometro.
+ * Asi aparecen en el calendario y cuentan en la clasificacion.
+ *
+ * Reglas que NO se deben romper:
+ *  - Un redactor siempre gana: solo se tocan filas con fuente 'auto%' que
+ *    ningun redactor haya reclamado (autor_id NULL, sin cronometro). El
+ *    PUT /api/results/:id ya cambia fuente a 'redaccion' al editar.
+ *  - Si ya existe un partido de redaccion con la misma pareja de equipos,
+ *    NO se inserta otro (se cuenta como "cubierto por redaccion").
+ *  - Solo se escriben los estados 'programado' y 'finalizado'. 'en_juego'
+ *    lo gestiona el cron de Minuto a Minuto y esos partidos estan
+ *    excluidos de iniciarPartidosProgramadosCuyaHoraHaLlegado.
+ *
+ * Coste (D1 tiene limite de lecturas y el plan gratuito de Workers solo
+ * 50 subrequests por invocacion):
+ *  - Un "ciclo" completo (todas las rondas de todas las ligas) se hace una
+ *    vez al dia, repartido en varias pasadas de 5 min con un presupuesto
+ *    de subrequests por pasada y un cursor de ronda por liga.
+ *  - Entre ciclos, una pasada "vivo" cada 15 min SOLO si hay partidos
+ *    automaticos que ya deberian haber empezado y siguen sin resultado.
+ *  - Solo se escriben las filas que cambian (insert/update puntual).
+ *
+ * Configuracion: ajuste "sync_partidos_config" (panel > Resultados >
+ * Calendario de jornadas > Relleno automatico). Sin ligas configuradas no
+ * hace nada. Clave opcional: secreto THESPORTSDB_API_KEY (con clave
+ * premium se usa eventsseason.php: 1 peticion por liga).
+ * ================================================================
+ */
+const SYNC_FUENTE = "auto_api_football";
+const SYNC_CONFIG_KEY = "sync_partidos_config";
+const SYNC_ESTADO_KEY = "sync_partidos_estado";
+const SYNC_API_BASE = "https://www.thesportsdb.com/api/v1/json";
+const SYNC_COMPETICIONES = ["hypermotion", "primera_federacion", "segunda_federacion"];
+const SYNC_RONDAS_POR_DEFECTO = { hypermotion: 42, primera_federacion: 38, segunda_federacion: 34 };
+const SYNC_RESERVA_SUBREQUESTS = 8; // consultas D1 que cuesta aplicar los eventos de una liga
+let SYNC_PROXIMA_COMPROBACION_MS = 0;
+let SYNC_ULTIMO_VIVO_MS = 0;
+
+function syncSinAcentos(s) {
+  return String(s ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+// Clave "gruesa" de un equipo para emparejar variantes del mismo nombre
+// ("Racing Ferrol" / "Racing Club Ferrol", "Deportivo Fabril" / "RC
+// Deportivo Fabril"). Quita prefijos genericos pero conserva sufijos
+// como "B" o "Castilla".
+function syncClaveEquipo(nombre) {
+  return syncSinAcentos(nombre)
+    .replace(/\b(cd|cf|ud|rc|rcd|sd|ad|ce|ue|cp|fc|sad|club|de|del|la|el|real|deportivo|atletico|balompie|futbol)\b/g, " ")
+    .replace(/\s+/g, "");
+}
+
+function syncClaveLiga(liga) {
+  return `${liga.competicion}|${liga.grupo || ""}`;
+}
+
+// Fecha/hora en Madrid de un instante (UTC) -> { fecha: "YYYY-MM-DD", hora: "HH:MM" }
+function syncPartesMadrid(instante) {
+  const partes = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).formatToParts(instante).reduce((acc, p) => { acc[p.type] = p.value; return acc; }, {});
+  return { fecha: `${partes.year}-${partes.month}-${partes.day}`, hora: `${partes.hour}:${partes.minute}` };
+}
+
+// Temporada "2026-2027" segun la fecha (a partir de julio empieza la nueva).
+function syncTemporada(instante = new Date()) {
+  const { fecha } = syncPartesMadrid(instante);
+  const anio = parseInt(fecha.slice(0, 4), 10);
+  const mes = parseInt(fecha.slice(5, 7), 10);
+  return mes >= 7 ? `${anio}-${anio + 1}` : `${anio - 1}-${anio}`;
+}
+
+// strTime de TheSportsDB es UTC. Si no hay hora fiable (vacia o 00:00:00,
+// que usan para "hora por confirmar") se guarda solo la fecha.
+function syncFechaLocalEvento(ev) {
+  const dia = String(ev.dateEvent || "").slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dia)) return { fechaLocal: null, instanteMs: null };
+  const hora = String(ev.strTime || "").slice(0, 5);
+  if (!/^\d{2}:\d{2}$/.test(hora) || hora === "00:00") return { fechaLocal: dia, instanteMs: Date.parse(`${dia}T12:00:00Z`) };
+  const instanteMs = Date.parse(`${dia}T${hora}:00Z`);
+  if (Number.isNaN(instanteMs)) return { fechaLocal: dia, instanteMs: null };
+  const { fecha, hora: horaLocal } = syncPartesMadrid(new Date(instanteMs));
+  return { fechaLocal: `${fecha}T${horaLocal}`, instanteMs };
+}
+
+function syncEnteroONull(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const n = parseInt(v, 10);
+  return Number.isInteger(n) && n >= 0 ? n : null;
+}
+
+// 'finalizado' solo con estado de fin de partido (o marcador completo y
+// el partido empezo hace mas de 3 h); cualquier otro caso -> 'programado'.
+function syncEstadoEvento(ev, golesL, golesV, instanteMs) {
+  const estadoApi = String(ev.strStatus || "");
+  const aplazado = String(ev.strPostponed || "").toLowerCase() === "yes" || /postp|cancel|abandon|suspend/i.test(estadoApi);
+  if (aplazado) return "programado";
+  if (golesL === null || golesV === null) return "programado";
+  if (/finish|^ft$|^aet$|^pen$|full.?time/i.test(estadoApi)) return "finalizado";
+  if (instanteMs && Date.now() - instanteMs > 3 * 60 * 60 * 1000 && !/^(1h|2h|ht|et|live|in.?play)/i.test(estadoApi)) return "finalizado";
+  return "programado";
+}
+
+async function syncLeerConfigYEstado(env) {
+  const { results } = await env.DB.prepare("SELECT key, value FROM settings WHERE key IN (?, ?)")
+    .bind(SYNC_CONFIG_KEY, SYNC_ESTADO_KEY).all();
+  const filas = {};
+  for (const f of results || []) filas[f.key] = f.value;
+  let config = {};
+  let estado = {};
+  try { config = JSON.parse(filas[SYNC_CONFIG_KEY] || "{}") || {}; } catch { config = {}; }
+  try { estado = JSON.parse(filas[SYNC_ESTADO_KEY] || "{}") || {}; } catch { estado = {}; }
+  return { config: syncNormalizarConfig(config), estado };
+}
+
+function syncNormalizarConfig(raw) {
+  const ligas = [];
+  const vistas = new Set();
+  for (const l of Array.isArray(raw?.ligas) ? raw.ligas : []) {
+    if (!SYNC_COMPETICIONES.includes(l?.competicion)) continue;
+    const leagueId = String(l.leagueId ?? "").trim();
+    if (!/^\d{1,9}$/.test(leagueId)) continue;
+    const grupo = l.competicion === "hypermotion" ? null : (String(l.grupo || "").trim() || null);
+    const rondas = Math.min(60, Math.max(1, parseInt(l.rondas, 10) || SYNC_RONDAS_POR_DEFECTO[l.competicion]));
+    const liga = { competicion: l.competicion, grupo, leagueId, rondas, nombre: String(l.nombre || "").slice(0, 80) };
+    const clave = syncClaveLiga(liga);
+    if (vistas.has(clave)) continue;
+    vistas.add(clave);
+    ligas.push(liga);
+  }
+  return {
+    activo: raw?.activo !== false,
+    temporada: /^\d{4}-\d{4}$/.test(String(raw?.temporada || "")) ? raw.temporada : null,
+    ligas,
+  };
+}
+
+async function syncGuardarSetting(env, key, objeto) {
+  await env.DB.prepare(
+    `INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+  ).bind(key, JSON.stringify(objeto)).run();
+}
+
+async function syncFetchJson(env, ruta, ctr) {
+  ctr.sub++;
+  const clave = env.THESPORTSDB_API_KEY || "3";
+  const resp = await fetch(`${SYNC_API_BASE}/${encodeURIComponent(clave)}/${ruta}`, {
+    headers: { Accept: "application/json" },
+    signal: AbortSignal.timeout(12000),
+  });
+  if (resp.status === 429) throw new Error("TheSportsDB: limite de peticiones alcanzado (429)");
+  if (!resp.ok) throw new Error(`TheSportsDB respondio ${resp.status} en ${ruta.split("?")[0]}`);
+  return resp.json();
+}
+
+// Rangos de jornada definidos a mano en jornadas_calendario: tienen
+// prioridad sobre el intRound de la API.
+async function syncCargarCalendario(env, liga, ctr) {
+  ctr.sub++;
+  const { results } = await env.DB.prepare(
+    `SELECT jornada, fecha_inicio, fecha_fin FROM jornadas_calendario
+     WHERE competicion = ? AND (grupo IS ? OR grupo = ?) ORDER BY fecha_inicio DESC`
+  ).bind(liga.competicion, liga.grupo, liga.grupo).all();
+  return results || [];
+}
+
+function syncJornadaDeCalendario(calendario, fecha) {
+  const dia = String(fecha || "").slice(0, 10);
+  if (!dia) return null;
+  const fila = calendario.find((r) => r.fecha_inicio <= dia && r.fecha_fin >= dia);
+  return fila ? fila.jornada : null;
+}
+
+async function syncCargarAlias(env, ctr, cache) {
+  if (cache.alias) return cache.alias;
+  ctr.sub++;
+  const { results } = await env.DB.prepare("SELECT nombre_externo, nombre_interno FROM equipo_alias_externo").all();
+  const mapa = new Map();
+  for (const a of results || []) mapa.set(syncSinAcentos(a.nombre_externo), a.nombre_interno);
+  cache.alias = mapa;
+  return mapa;
+}
+
+// Aplica los eventos de UNA liga: resuelve nombres, deduplica contra los
+// partidos existentes y escribe solo lo que cambia. Devuelve contadores.
+async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cache) {
+  const resumen = { eventos: eventos.length, insertados: 0, actualizados: 0, cubiertos_redaccion: 0, sin_alias: [], omitidos: 0, error: null };
+  if (!eventos.length) return resumen;
+
+  const alias = await syncCargarAlias(env, ctr, cache);
+  const calendario = await syncCargarCalendario(env, liga, ctr);
+  const inicioTemporada = `${temporada.slice(0, 4)}-07-01`;
+
+  // Partidos existentes de esta competicion/grupo (y los sin grupo, que
+  // son los que un redactor dejo sin grupo) en la temporada actual.
+  ctr.sub++;
+  const { results: filas } = await env.DB.prepare(
+    `SELECT id, jornada, equipo_local, equipo_visitante, goles_local, goles_visitante, fecha_partido,
+            estado, ubicacion, fuente, external_id, autor_id, inicio_cronometro_at
+     FROM results
+     WHERE competicion = ? AND (grupo IS ? OR grupo = ? OR grupo IS NULL)
+       AND (fecha_partido IS NULL OR fecha_partido >= ?)`
+  ).bind(liga.competicion, liga.grupo, liga.grupo, inicioTemporada).all();
+  const existentes = filas || [];
+
+  const conocidos = new Set();
+  const porClave = new Map();
+  const ubicacionPorLocal = new Map();
+  const porExternalId = new Map();
+  const porPareja = new Map();
+  for (const f of existentes) {
+    for (const n of [f.equipo_local, f.equipo_visitante]) {
+      if (conocidos.has(n)) continue;
+      conocidos.add(n);
+      const k = syncClaveEquipo(n);
+      porClave.set(k, [...(porClave.get(k) || []), n]);
+    }
+    if (f.ubicacion && !ubicacionPorLocal.has(f.equipo_local)) ubicacionPorLocal.set(f.equipo_local, f.ubicacion);
+    if (f.external_id) porExternalId.set(f.external_id, f);
+    const pk = `${syncClaveEquipo(f.equipo_local)}|${syncClaveEquipo(f.equipo_visitante)}`;
+    porPareja.set(pk, [...(porPareja.get(pk) || []), f]);
+  }
+
+  const resolver = (nombreExt) => {
+    const a = alias.get(syncSinAcentos(nombreExt));
+    if (a) return { nombre: a, ok: true };
+    if (conocidos.has(nombreExt)) return { nombre: nombreExt, ok: true };
+    const candidatos = porClave.get(syncClaveEquipo(nombreExt));
+    if (candidatos && candidatos.length === 1) return { nombre: candidatos[0], ok: true };
+    return { nombre: nombreExt, ok: false };
+  };
+
+  // Salvaguarda: si ya conocemos equipos de esta competicion y casi
+  // ninguno de la API encaja, lo mas probable es que leagueId sea de
+  // otra liga. Mejor no escribir nada que contaminar el calendario.
+  if (conocidos.size >= 8) {
+    const nombresApi = new Set();
+    for (const ev of eventos) { if (ev.strHomeTeam) nombresApi.add(ev.strHomeTeam); if (ev.strAwayTeam) nombresApi.add(ev.strAwayTeam); }
+    let encajan = 0;
+    for (const n of nombresApi) if (resolver(n).ok) encajan++;
+    if (nombresApi.size >= 6 && encajan / nombresApi.size < 0.4) {
+      resumen.error = `Solo ${encajan} de ${nombresApi.size} equipos de la API coinciden con los del sitio: revisa el ID de liga o los alias.`;
+      return resumen;
+    }
+  }
+
+  const sentencias = [];
+  const sinAlias = new Set();
+  for (const ev of eventos) {
+    if (!ev.idEvent || !ev.strHomeTeam || !ev.strAwayTeam) { resumen.omitidos++; continue; }
+    const local = resolver(ev.strHomeTeam);
+    const visitante = resolver(ev.strAwayTeam);
+    if (!local.ok && conocidos.size) sinAlias.add(ev.strHomeTeam);
+    if (!visitante.ok && conocidos.size) sinAlias.add(ev.strAwayTeam);
+
+    const externalId = `tsdb:${ev.idEvent}`;
+    const { fechaLocal, instanteMs } = syncFechaLocalEvento(ev);
+    const golesL = syncEnteroONull(ev.intHomeScore);
+    const golesV = syncEnteroONull(ev.intAwayScore);
+    const estado = syncEstadoEvento(ev, golesL, golesV, instanteMs);
+    const jornada = syncJornadaDeCalendario(calendario, fechaLocal)
+      ?? syncEnteroONull(ev.intRound) ?? ronda ?? null;
+    const ubicacion = String(ev.strVenue || "").trim() || ubicacionPorLocal.get(local.nombre) || null;
+
+    let fila = porExternalId.get(externalId);
+    if (!fila) {
+      const pk = `${syncClaveEquipo(local.nombre)}|${syncClaveEquipo(visitante.nombre)}`;
+      const candidatas = porPareja.get(pk) || [];
+      // La de fecha mas cercana (o la primera si alguna no tiene fecha).
+      fila = candidatas.slice().sort((a, b) => {
+        const da = a.fecha_partido && fechaLocal ? Math.abs(Date.parse(a.fecha_partido) - Date.parse(fechaLocal)) : 0;
+        const db = b.fecha_partido && fechaLocal ? Math.abs(Date.parse(b.fecha_partido) - Date.parse(fechaLocal)) : 0;
+        return da - db;
+      })[0];
+    }
+
+    if (!fila) {
+      if (jornada === null) { resumen.omitidos++; continue; }
+      sentencias.push(env.DB.prepare(
+        `INSERT INTO results (competicion, grupo, jornada, equipo_local, equipo_visitante, goles_local, goles_visitante,
+                              fecha_partido, estado, ubicacion, fuente, external_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind(
+        liga.competicion, liga.grupo, jornada, local.nombre, visitante.nombre,
+        estado === "finalizado" ? golesL : null, estado === "finalizado" ? golesV : null,
+        fechaLocal, estado, ubicacion, SYNC_FUENTE, externalId
+      ));
+      // Se registra para que otro evento del mismo lote no lo duplique.
+      const nuevo = { id: null, fuente: SYNC_FUENTE, external_id: externalId };
+      porExternalId.set(externalId, nuevo);
+      const pk = `${syncClaveEquipo(local.nombre)}|${syncClaveEquipo(visitante.nombre)}`;
+      porPareja.set(pk, [...(porPareja.get(pk) || []), { ...nuevo, equipo_local: local.nombre, equipo_visitante: visitante.nombre, fecha_partido: fechaLocal }]);
+      resumen.insertados++;
+      continue;
+    }
+
+    // Existe: solo se toca si es automatico y nadie lo ha reclamado.
+    const esAutomatico = String(fila.fuente || "").startsWith("auto");
+    if (!fila.id || !esAutomatico || fila.autor_id || fila.inicio_cronometro_at || !["programado", "finalizado"].includes(fila.estado)) {
+      if (!esAutomatico) resumen.cubiertos_redaccion++;
+      continue;
+    }
+    const cambios = {};
+    if (!fila.external_id) cambios.external_id = externalId;
+    if (jornada !== null && jornada !== fila.jornada) cambios.jornada = jornada;
+    if (local.ok && local.nombre !== fila.equipo_local) cambios.equipo_local = local.nombre;
+    if (visitante.ok && visitante.nombre !== fila.equipo_visitante) cambios.equipo_visitante = visitante.nombre;
+    if (fechaLocal) {
+      // No se pierde una hora ya conocida si la API ahora solo da el dia.
+      const sustituyeHoraPorDia = fechaLocal.length === 10 && String(fila.fecha_partido || "").slice(0, 10) === fechaLocal && String(fila.fecha_partido || "").length === 16;
+      if (!sustituyeHoraPorDia && fechaLocal !== fila.fecha_partido) cambios.fecha_partido = fechaLocal;
+    }
+    if (ubicacion && !fila.ubicacion) cambios.ubicacion = ubicacion;
+    if (estado === "finalizado") {
+      if (fila.estado !== "finalizado") cambios.estado = "finalizado";
+      if (golesL !== fila.goles_local) cambios.goles_local = golesL;
+      if (golesV !== fila.goles_visitante) cambios.goles_visitante = golesV;
+    }
+    const campos = Object.keys(cambios);
+    if (!campos.length) continue;
+    sentencias.push(env.DB.prepare(
+      `UPDATE results SET ${campos.map((c) => `${c} = ?`).join(", ")} WHERE id = ? AND fuente LIKE 'auto%' AND autor_id IS NULL`
+    ).bind(...campos.map((c) => cambios[c]), fila.id));
+    resumen.actualizados++;
+  }
+
+  resumen.sin_alias = [...sinAlias];
+  for (let i = 0; i < sentencias.length; i += 40) {
+    const lote = sentencias.slice(i, i + 40);
+    ctr.sub++;
+    try {
+      await env.DB.batch(lote);
+    } catch (err) {
+      // Un conflicto (p.ej. otro isolate inserto el mismo external_id) no
+      // debe tirar el lote entero: se reintenta una a una.
+      for (const s of lote) {
+        try { ctr.sub++; await s.run(); } catch (e2) { resumen.omitidos++; console.error("[sync-partidos] fila omitida:", e2.message); }
+      }
+    }
+  }
+  return resumen;
+}
+
+function syncSumarResumen(informe, liga, resumen) {
+  const clave = syncClaveLiga(liga);
+  const acc = informe.ligas[clave] || { eventos: 0, insertados: 0, actualizados: 0, cubiertos_redaccion: 0, omitidos: 0, error: null };
+  for (const k of ["eventos", "insertados", "actualizados", "cubiertos_redaccion", "omitidos"]) acc[k] += resumen[k] || 0;
+  if (resumen.error) acc.error = resumen.error;
+  informe.ligas[clave] = acc;
+  const actuales = new Set(informe.sin_alias || []);
+  for (const n of resumen.sin_alias || []) actuales.add(n);
+  informe.sin_alias = [...actuales].slice(0, 80);
+}
+
+// Una pasada de sincronizacion. modo "ciclo": recorre rondas con cursor
+// hasta agotar el presupuesto. modo "vivo": solo las rondas de partidos
+// automaticos que ya deberian haber empezado y no tienen resultado.
+async function syncEjecutarPasada(env, { modo, reiniciar = false, forzar = false } = {}) {
+  const inicioMs = Date.now();
+  const { config, estado } = await syncLeerConfigYEstado(env);
+  const ligas = config.ligas;
+  if (!ligas.length) return { ok: false, error: "No hay ligas configuradas", estado };
+  if (!forzar && estado.en_ejecucion_hasta && Date.parse(estado.en_ejecucion_hasta) > Date.now()) {
+    return { ok: false, error: "Ya hay una sincronizacion en curso", estado };
+  }
+
+  const ctr = { sub: 1, max: parseInt(env.SYNC_MAX_SUBREQUESTS, 10) || 40 };
+  const cache = {};
+  const temporada = config.temporada || syncTemporada();
+  const premium = !!env.THESPORTSDB_API_KEY && env.THESPORTSDB_API_KEY !== "3";
+  const errores = [];
+
+  if (modo === "ciclo") {
+    if (reiniciar || !estado.ciclo_en_curso) {
+      estado.ciclo_en_curso = true;
+      estado.ciclo_inicio = new Date().toISOString();
+      estado.cursores = {};
+      estado.informe = { ciclo_inicio: estado.ciclo_inicio, ligas: {}, sin_alias: [] };
+    }
+    estado.en_ejecucion_hasta = new Date(Date.now() + 4 * 60 * 1000).toISOString();
+    await syncGuardarSetting(env, SYNC_ESTADO_KEY, estado);
+    ctr.sub++;
+  }
+  estado.informe = estado.informe || { ligas: {}, sin_alias: [] };
+  estado.cursores = estado.cursores || {};
+
+  try {
+    if (modo === "ciclo") {
+      for (const liga of ligas) {
+        const clave = syncClaveLiga(liga);
+        let cursor = estado.cursores[clave] ?? 1;
+        if (cursor > liga.rondas) continue;
+        if (ctr.sub + SYNC_RESERVA_SUBREQUESTS > ctr.max) break;
+        const eventos = [];
+        try {
+          if (premium) {
+            const datos = await syncFetchJson(env, `eventsseason.php?id=${liga.leagueId}&s=${encodeURIComponent(temporada)}`, ctr);
+            eventos.push(...(datos?.events || []));
+            cursor = liga.rondas + 1;
+          } else {
+            let vaciasSeguidas = 0;
+            while (cursor <= liga.rondas && ctr.sub + SYNC_RESERVA_SUBREQUESTS < ctr.max) {
+              const datos = await syncFetchJson(env, `eventsround.php?id=${liga.leagueId}&r=${cursor}&s=${encodeURIComponent(temporada)}`, ctr);
+              const evs = (datos?.events || []).map((e) => ({ ...e, _ronda: cursor }));
+              if (evs.length) { eventos.push(...evs); vaciasSeguidas = 0; } else vaciasSeguidas++;
+              cursor++;
+              // Rondas futuras todavia sin publicar: no se gasta presupuesto.
+              if (vaciasSeguidas >= 3) { cursor = liga.rondas + 1; break; }
+            }
+          }
+        } catch (err) {
+          errores.push(`${clave}: ${err.message}`);
+          syncSumarResumen(estado.informe, liga, { eventos: 0, error: err.message });
+          // Se salta esta liga en este ciclo para no bloquear el resto.
+          cursor = liga.rondas + 1;
+        }
+        estado.cursores[clave] = cursor;
+        if (eventos.length) {
+          // Agrupa por ronda pedida para poder usarla como jornada de reserva.
+          const porRonda = new Map();
+          for (const e of eventos) porRonda.set(e._ronda ?? null, [...(porRonda.get(e._ronda ?? null) || []), e]);
+          for (const [ronda, evs] of porRonda) {
+            const resumen = await syncAplicarEventos(env, liga, evs, ronda, temporada, ctr, cache);
+            syncSumarResumen(estado.informe, liga, resumen);
+            if (resumen.error) errores.push(`${clave}: ${resumen.error}`);
+          }
+        }
+      }
+      const todasHechas = ligas.every((l) => (estado.cursores[syncClaveLiga(l)] ?? 1) > l.rondas);
+      if (todasHechas) {
+        estado.ciclo_en_curso = false;
+        estado.ultimo_ciclo_fin = new Date().toISOString();
+        estado.informe.ciclo_fin = estado.ultimo_ciclo_fin;
+      }
+    } else {
+      // Modo "vivo": partidos automaticos que ya han empezado y siguen sin resultado.
+      const ahora = syncPartesMadrid(new Date());
+      const ayer = syncPartesMadrid(new Date(Date.now() - 36 * 60 * 60 * 1000)).fecha;
+      ctr.sub++;
+      const { results: pend } = await env.DB.prepare(
+        `SELECT DISTINCT competicion, grupo, jornada FROM results
+         WHERE fuente LIKE 'auto%' AND estado = 'programado' AND autor_id IS NULL
+           AND fecha_partido <= ? AND fecha_partido >= ?`
+      ).bind(`${ahora.fecha}T${ahora.hora}`, ayer).all();
+      for (const p of pend || []) {
+        const liga = ligas.find((l) => l.competicion === p.competicion && (l.grupo || null) === (p.grupo || null))
+          || ligas.find((l) => l.competicion === p.competicion && !p.grupo);
+        if (!liga || !p.jornada) continue;
+        if (ctr.sub + SYNC_RESERVA_SUBREQUESTS > ctr.max) break;
+        try {
+          const datos = await syncFetchJson(env, `eventsround.php?id=${liga.leagueId}&r=${p.jornada}&s=${encodeURIComponent(temporada)}`, ctr);
+          const resumen = await syncAplicarEventos(env, liga, datos?.events || [], p.jornada, temporada, ctr, cache);
+          syncSumarResumen(estado.informe, liga, resumen);
+          if (resumen.error) errores.push(`${syncClaveLiga(liga)}: ${resumen.error}`);
+        } catch (err) {
+          errores.push(`${syncClaveLiga(liga)}: ${err.message}`);
+        }
+      }
+      estado.ultimo_vivo = new Date().toISOString();
+    }
+  } catch (err) {
+    errores.push(err.message);
+  }
+
+  estado.en_ejecucion_hasta = null;
+  estado.ultima_pasada = {
+    modo, at: new Date().toISOString(), ms: Date.now() - inicioMs, subrequests: ctr.sub,
+    errores: errores.slice(0, 10),
+  };
+  await syncGuardarSetting(env, SYNC_ESTADO_KEY, estado);
+  try {
+    await env.DB.prepare(
+      "UPDATE sync_partidos_auto SET ultimo_sync_at = ?, ultimo_sync_ok = ?, ultimo_error = ? WHERE id = 1"
+    ).bind(new Date().toISOString(), errores.length ? 0 : 1, errores.length ? errores.join(" | ").slice(0, 500) : null).run();
+  } catch (err) {
+    console.error("[sync-partidos] no se pudo actualizar sync_partidos_auto:", err.message);
+  }
+  return { ok: !errores.length, errores, estado };
+}
+
+// Llamado desde el cron de cada minuto. Se autolimita a una comprobacion
+// cada 5 min por isolate y, ademas, decide si toca ciclo, vivo o nada.
+async function sincronizarPartidosAutomaticosSiToca(env) {
+  if (Date.now() < SYNC_PROXIMA_COMPROBACION_MS) return;
+  SYNC_PROXIMA_COMPROBACION_MS = Date.now() + 5 * 60 * 1000;
+  try {
+    const { config, estado } = await syncLeerConfigYEstado(env);
+    if (!config.activo || !config.ligas.length) return;
+    if (estado.en_ejecucion_hasta && Date.parse(estado.en_ejecucion_hasta) > Date.now()) return;
+
+    let modo = null;
+    if (estado.ciclo_en_curso) {
+      modo = "ciclo";
+    } else {
+      const ultimoFin = estado.ultimo_ciclo_fin ? Date.parse(estado.ultimo_ciclo_fin) : 0;
+      const horaMadrid = parseInt(syncPartesMadrid(new Date()).hora.slice(0, 2), 10);
+      // Un ciclo completo al dia, de madrugada (o ya, si nunca se ha hecho).
+      if (!ultimoFin || (Date.now() - ultimoFin > 22 * 60 * 60 * 1000 && horaMadrid >= 4)) modo = "ciclo";
+      else if (Date.now() - SYNC_ULTIMO_VIVO_MS > 15 * 60 * 1000) { modo = "vivo"; SYNC_ULTIMO_VIVO_MS = Date.now(); }
+    }
+    if (modo) await syncEjecutarPasada(env, { modo });
+  } catch (err) {
+    console.error("[sync-partidos] error en la comprobacion programada:", err.message);
+  }
+}
+
+// Une partidos automaticos que, tras crear/cambiar un alias, han quedado
+// duplicados de uno de redaccion (misma pareja y competicion).
+async function syncEliminarDuplicadosDeRedaccion(env) {
+  const r = await env.DB.prepare(
+    `DELETE FROM results
+     WHERE fuente LIKE 'auto%' AND autor_id IS NULL AND inicio_cronometro_at IS NULL
+       AND EXISTS (SELECT 1 FROM results r2
+                   WHERE r2.id <> results.id AND r2.fuente = 'redaccion'
+                     AND r2.competicion = results.competicion
+                     AND r2.equipo_local = results.equipo_local
+                     AND r2.equipo_visitante = results.equipo_visitante)`
+  ).run();
+  return r?.meta?.changes ?? 0;
+}
+
+async function syncRutasAdmin(request, env, path, method, url) {
+  const payload = await requireAuth(request, env);
+  if (!payload) return json({ error: "No autorizado" }, 401);
+  if (payload.rol !== "admin") return json({ error: "Solo un administrador puede gestionar el relleno automatico" }, 403);
+
+  if (path === "/api/admin/sync-partidos" && method === "GET") {
+    const { config, estado } = await syncLeerConfigYEstado(env);
+    const fila = await env.DB.prepare("SELECT ultimo_sync_at, ultimo_sync_ok, ultimo_error FROM sync_partidos_auto WHERE id = 1").first();
+    const conteo = await env.DB.prepare("SELECT COUNT(*) AS n FROM results WHERE fuente LIKE 'auto%'").first();
+    return json({
+      config, estado, sync: fila || null,
+      partidos_automaticos: conteo?.n ?? 0,
+      clave_premium: !!env.THESPORTSDB_API_KEY && env.THESPORTSDB_API_KEY !== "3",
+      temporada_actual: config.temporada || syncTemporada(),
+    });
+  }
+
+  if (path === "/api/admin/sync-partidos/config" && method === "PUT") {
+    const body = await request.json().catch(() => null);
+    if (!body) return json({ error: "Cuerpo no valido" }, 400);
+    const config = syncNormalizarConfig(body);
+    await syncGuardarSetting(env, SYNC_CONFIG_KEY, config);
+    return json({ ok: true, config });
+  }
+
+  if (path === "/api/admin/sync-partidos/ejecutar" && method === "POST") {
+    const body = await request.json().catch(() => ({}));
+    const modo = body.modo === "vivo" ? "vivo" : "ciclo";
+    const resultado = await syncEjecutarPasada(env, { modo, reiniciar: !!body.reiniciar, forzar: true });
+    return json({
+      ok: resultado.ok, error: resultado.error || null, errores: resultado.errores || [],
+      ciclo_en_curso: !!resultado.estado?.ciclo_en_curso,
+      cursores: resultado.estado?.cursores || {},
+      informe: resultado.estado?.informe || null,
+    });
+  }
+
+  if (path === "/api/admin/sync-partidos/ligas" && method === "GET") {
+    const ctr = { sub: 0 };
+    const datos = await syncFetchJson(env, "search_all_leagues.php?c=Spain&s=Soccer", ctr);
+    const ligas = (datos?.countries || datos?.leagues || []).map((l) => ({ id: l.idLeague, nombre: l.strLeague, alternativo: l.strLeagueAlternate || null }));
+    return json({ ligas });
+  }
+
+  if (path === "/api/admin/alias-equipos" && method === "GET") {
+    const { results: alias } = await env.DB.prepare(
+      "SELECT id, nombre_externo, nombre_interno FROM equipo_alias_externo ORDER BY nombre_interno, nombre_externo"
+    ).all();
+    const { results: equipos } = await env.DB.prepare(
+      `SELECT equipo_local AS nombre FROM results WHERE fuente = 'redaccion'
+       UNION SELECT equipo_visitante FROM results WHERE fuente = 'redaccion' ORDER BY 1 LIMIT 1500`
+    ).all();
+    return json({ alias: alias || [], equipos_conocidos: (equipos || []).map((e) => e.nombre) });
+  }
+
+  if (path === "/api/admin/alias-equipos" && method === "POST") {
+    const body = await request.json().catch(() => null);
+    const externo = String(body?.nombre_externo || "").trim();
+    const interno = String(body?.nombre_interno || "").trim();
+    if (!externo || !interno) return json({ error: "Faltan el nombre de la API y el nombre del sitio" }, 400);
+    await env.DB.prepare(
+      `INSERT INTO equipo_alias_externo (nombre_externo, nombre_interno) VALUES (?, ?)
+       ON CONFLICT(nombre_externo) DO UPDATE SET nombre_interno = excluded.nombre_interno`
+    ).bind(externo, interno).run();
+    // Renombra lo que el relleno ya habia insertado con el nombre de la API.
+    await env.DB.prepare("UPDATE results SET equipo_local = ? WHERE fuente LIKE 'auto%' AND autor_id IS NULL AND equipo_local = ?").bind(interno, externo).run();
+    await env.DB.prepare("UPDATE results SET equipo_visitante = ? WHERE fuente LIKE 'auto%' AND autor_id IS NULL AND equipo_visitante = ?").bind(interno, externo).run();
+    const duplicadosEliminados = await syncEliminarDuplicadosDeRedaccion(env);
+    return json({ ok: true, duplicados_eliminados: duplicadosEliminados });
+  }
+
+  const aliasBorrar = path.match(/^\/api\/admin\/alias-equipos\/(\d+)$/);
+  if (aliasBorrar && method === "DELETE") {
+    await env.DB.prepare("DELETE FROM equipo_alias_externo WHERE id = ?").bind(parseInt(aliasBorrar[1], 10)).run();
+    return json({ ok: true });
+  }
+
+  return null;
+}
 
 /*
  * ================================================================
@@ -18816,6 +19431,12 @@ async function handlePrimary(request, env, ctx) {
         const id = parseInt(jornadaCalendarioMatch[1], 10);
         await env.DB.prepare("DELETE FROM jornadas_calendario WHERE id = ?").bind(id).run();
         return json({ ok: true });
+      }
+
+      // Relleno automatico: config, estado, ejecucion manual y alias de equipos.
+      if (path.startsWith("/api/admin/sync-partidos") || path === "/api/admin/alias-equipos" || path.startsWith("/api/admin/alias-equipos/")) {
+        const respuestaSync = await syncRutasAdmin(request, env, path, method, url);
+        if (respuestaSync) return respuestaSync;
       }
 
       if (path === "/api/jornadas-calendario/recalcular" && method === "POST") {
