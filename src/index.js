@@ -2590,6 +2590,42 @@ function pinAcreditacionCorrecto(esperado, recibido) {
   return diff === 0;
 }
 
+// Modo de acceso al formulario público de acreditaciones (lo elige un admin):
+//   "pin"      -> hay que introducir el PIN (por defecto, como siempre)
+//   "login"    -> hay que iniciar sesión con una cuenta de colaborador (admin/redactor/fotógrafo)
+//   "solicitar"-> sin PIN ni cuenta: cualquiera puede enviar su solicitud directamente
+// Se guarda en settings (clave "acreditacion_acceso").
+const ACREDITACION_ACCESO_KEY = "acreditacion_acceso";
+const ACREDITACION_ACCESOS = ["pin", "login", "solicitar"];
+async function obtenerAccesoAcreditacion(env) {
+  try {
+    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind(ACREDITACION_ACCESO_KEY).first();
+    const v = row && row.value ? String(row.value) : "";
+    if (ACREDITACION_ACCESOS.includes(v)) return v;
+  } catch {}
+  return "pin";
+}
+async function guardarAccesoAcreditacion(env, modo) {
+  await env.DB.prepare(
+    "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+  ).bind(ACREDITACION_ACCESO_KEY, modo).run();
+}
+// Comprueba si la petición puede usar el formulario según el modo vigente.
+async function comprobarAccesoAcreditacion(request, env, pinRecibido) {
+  const modo = await obtenerAccesoAcreditacion(env);
+  if (modo === "solicitar") return { ok: true, modo };
+  if (modo === "login") {
+    let payload = null;
+    try { payload = await requireAuth(request, env); } catch {}
+    if (!payload) return { ok: false, status: 401, modo, error: "Inicia sesión con tu cuenta de colaborador para rellenar el formulario." };
+    return { ok: true, modo, usuario: { nombre: payload.nombre || payload.username || "" } };
+  }
+  const esperado = await obtenerPinAcreditacion(env);
+  if (!esperado) return { ok: false, status: 503, modo, error: "El formulario de acreditación no está disponible todavía." };
+  if (!pinAcreditacionCorrecto(esperado, String(pinRecibido || "").trim())) return { ok: false, status: 401, modo, error: "PIN incorrecto" };
+  return { ok: true, modo };
+}
+
 // Tipos de acreditación que acepta el formulario público (acreditacion.html).
 // Deben coincidir con las opciones de esa página.
 const ACREDITACION_TIPOS_ACREDITACION = [
@@ -8391,7 +8427,8 @@ export default {
       try { const pl = await requireAuth(request, env); esAdminCfg = !!(pl && pl.rol === "admin"); } catch {}
       if (!esAdminCfg) { delete cfgPublica.recogida; delete cfgPublica.instrucciones_aprobada; }
       // Solo se expone cuántos dígitos tiene el PIN (para pintar las casillas), nunca el PIN.
-      return json({ ...cfgPublica, pin_longitud: pinLongitud });
+      const accesoCfg = await obtenerAccesoAcreditacion(env);
+      return json({ ...cfgPublica, acceso: accesoCfg, pin_longitud: accesoCfg === "pin" ? pinLongitud : null });
     }
 
     // Comprobación del PIN al entrar al formulario (acreditacion.html).
@@ -8400,12 +8437,10 @@ export default {
         return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
       }
       const body = await request.json().catch(() => ({}));
-      const esperado = await obtenerPinAcreditacion(env);
-      if (!esperado) return json({ error: "El formulario de acreditación no está disponible todavía." }, 503);
-      if (!pinAcreditacionCorrecto(esperado, String((body && body.pin) || "").trim())) {
-        return json({ error: "PIN incorrecto" }, 401);
-      }
-      return json({ ok: true });
+      // Según el modo: PIN correcto, sesión de colaborador válida o acceso libre.
+      const acc = await comprobarAccesoAcreditacion(request, env, body && body.pin);
+      if (!acc.ok) return json({ error: acc.error, acceso: acc.modo }, acc.status);
+      return json({ ok: true, acceso: acc.modo, usuario: acc.usuario || null });
     }
 
     if (path === "/api/acreditaciones" && method === "POST") {
@@ -8422,12 +8457,10 @@ export default {
       // Campo trampa para bots: un humano nunca lo ve ni lo rellena.
       if (body.web) return json({ ok: true });
 
-      // Sin el PIN correcto no se acepta ninguna solicitud (aunque se salten la pantalla del PIN).
-      const pinEsperado = await obtenerPinAcreditacion(env);
-      if (!pinEsperado) return json({ error: "El formulario de acreditación no está disponible todavía." }, 503);
-      if (!pinAcreditacionCorrecto(pinEsperado, String(body.pin || "").trim())) {
-        return json({ error: "PIN incorrecto" }, 401);
-      }
+      // Sin el acceso que exija el modo vigente (PIN, sesión de colaborador o libre)
+      // no se acepta ninguna solicitud, aunque se salten la pantalla de acceso.
+      const accPost = await comprobarAccesoAcreditacion(request, env, body.pin);
+      if (!accPost.ok) return json({ error: accPost.error, acceso: accPost.modo }, accPost.status);
 
       const limpiar = (v, max) => (v ? String(v) : "").replace(/\s+/g, " ").trim().slice(0, max);
       const cfgAcred = await obtenerConfigAcreditacion(env);
@@ -11005,6 +11038,28 @@ async function handlePrimary(request, env, ctx) {
           ultimo_envio_at: ultimoEnvioAt,
           proximo_envio_at: proximoEnvioAt || (ultimoEnvioAt ? null : new Date().toISOString()),
         });
+      }
+
+      // ---------- ACREDITACIONES: modo de acceso al formulario (solo admins) ----------
+      if (path === "/api/acreditaciones/acceso" && (method === "GET" || method === "PUT")) {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede cambiar el acceso" }, 403);
+        let acceso = await obtenerAccesoAcreditacion(env);
+        if (method === "PUT") {
+          const body = await request.json().catch(() => ({}));
+          const pedido = body && typeof body.acceso === "string" ? body.acceso.trim() : "";
+          if (!ACREDITACION_ACCESOS.includes(pedido)) return json({ error: "Modo de acceso no válido" }, 400);
+          await guardarAccesoAcreditacion(env, pedido);
+          acceso = pedido;
+          const etiquetas = { pin: "con PIN", login: "con login de colaborador", solicitar: "libre (solicitar sin PIN ni cuenta)" };
+          await registrarActividad(env, request, payload, {
+            accion: "acreditacion_acceso",
+            entidad: "acreditacion",
+            descripcion: "Cambiado el acceso al formulario de acreditaciones: " + etiquetas[pedido],
+          });
+        }
+        return json({ acceso });
       }
 
       // ---------- ACREDITACIONES: PIN de acceso al formulario (solo admins) ----------
