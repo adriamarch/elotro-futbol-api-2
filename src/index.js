@@ -9803,6 +9803,7 @@ async function syncEjecutarPasada(env, { modo, reiniciar = false, forzar = false
         if (cursor > liga.rondas) continue;
         if (ctr.sub + SYNC_RESERVA_SUBREQUESTS > ctr.max) break;
         const eventos = [];
+        let limiteApi = false;
         try {
           if (premium) {
             const datos = await syncFetchJson(env, `eventsseason.php?id=${liga.leagueId}&s=${encodeURIComponent(temporada)}`, ctr);
@@ -9821,9 +9822,16 @@ async function syncEjecutarPasada(env, { modo, reiniciar = false, forzar = false
           }
         } catch (err) {
           errores.push(`${clave}: ${err.message}`);
-          syncSumarResumen(estado.informe, liga, { eventos: 0, error: err.message });
-          // Se salta esta liga en este ciclo para no bloquear el resto.
-          cursor = liga.rondas + 1;
+          if (/\(429\)/.test(String(err.message))) {
+            // Limite de peticiones de TheSportsDB: no es un fallo de la liga.
+            // El cursor sigue apuntando a la ronda que fallo y se corta la
+            // pasada; el ciclo sigue en curso y se retoma en la siguiente.
+            limiteApi = true;
+          } else {
+            syncSumarResumen(estado.informe, liga, { eventos: 0, error: err.message });
+            // Se salta esta liga en este ciclo para no bloquear el resto.
+            cursor = liga.rondas + 1;
+          }
         }
         estado.cursores[clave] = cursor;
         if (eventos.length) {
@@ -9836,6 +9844,7 @@ async function syncEjecutarPasada(env, { modo, reiniciar = false, forzar = false
             if (resumen.error) errores.push(`${clave}: ${resumen.error}`);
           }
         }
+        if (limiteApi) break;
       }
       const todasHechas = ligas.every((l) => (estado.cursores[syncClaveLiga(l)] ?? 1) > l.rondas);
       if (todasHechas) {
