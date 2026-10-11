@@ -104,6 +104,30 @@ function fechaParaRss(valor) {
   return fecha.toUTCString();
 }
 
+// <lastmod> de los sitemaps de noticias: fecha Y HORA en W3C Datetime (ISO
+// 8601, UTC). Google recomienda la precisión completa; con solo el día, una
+// noticia de última hora corregida a las 18:00 parece "actualizada hoy" igual
+// que una de la mañana y se pierde la señal de frescura.
+function fechaHoraParaSitemap(valor) {
+  if (!valor) return null;
+  const txt = String(valor);
+  const fecha = new Date(txt.includes("T") || txt.endsWith("Z") ? txt : `${txt.replace(" ", "T")}Z`);
+  if (Number.isNaN(fecha.getTime())) return null;
+  return fecha.toISOString();
+}
+
+// Imagen de portada recortada 16:9 para feeds RSS y sitemaps (agregadores y
+// Google Discover prefieren 1200 px de ancho). Solo toca URLs de Cloudinary,
+// igual que seoImagenSocialWorker en public/src-worker.js; el resto se
+// devuelve tal cual. Siempre JPG: algunos lectores RSS no entienden webp/avif.
+function imagenParaFeed(url) {
+  if (!url || typeof url !== "string") return "";
+  const marca = "/upload/";
+  const i = url.indexOf(marca);
+  if (i === -1 || !/res\.cloudinary\.com/.test(url)) return url;
+  return url.slice(0, i + marca.length) + "f_jpg,q_auto:good,c_fill,g_auto,w_1200,h_675/" + url.slice(i + marca.length);
+}
+
 // Quita etiquetas HTML y colapsa espacios para obtener un extracto de
 // texto plano a partir del contenido (HTML) de una noticia, usable como
 // <description> en RSS. Trunca a "limite" caracteres sin cortar una
@@ -2423,7 +2447,8 @@ async function obtenerTokenGoogleServiceAccount(env) {
   const now = Math.floor(Date.now() / 1000);
   const header = { alg: "RS256", typ: "JWT" };
   const claim = {
-    iss: env.GSC_SERVICE_ACCOUNT_EMAIL,
+    // Sin espacios, saltos de línea ni comillas sobrantes al pegar el secreto.
+    iss: String(env.GSC_SERVICE_ACCOUNT_EMAIL).trim().replace(/^['"]+|['"]+$/g, ""),
     scope: "https://www.googleapis.com/auth/webmasters.readonly",
     aud: "https://oauth2.googleapis.com/token",
     iat: now,
@@ -2563,7 +2588,10 @@ async function calcularGscAnaliticas(env, dias) {
     // Pistas para los fallos de configuración más habituales (el panel
     // enseña este texto tal cual en la tarjeta de Search Console).
     let pista = "";
-    if (/sufficient permission|forbidden|permission/i.test(msg)) {
+    if (/invalid.?grant|account not found|invalid.?client|unauthorized.?client|invalid jwt/i.test(msg)) {
+      // Fallo al canjear el token en Google: es la CUENTA DE SERVICIO, no la propiedad.
+      pista = " Google no reconoce la cuenta de servicio. Comprueba que GSC_SERVICE_ACCOUNT_EMAIL es exactamente el campo client_email del JSON de la clave (algo@proyecto.iam.gserviceaccount.com), que la cuenta no está borrada ni desactivada en Google Cloud > IAM > Cuentas de servicio, y que GSC_SERVICE_ACCOUNT_KEY es el private_key de ESA misma cuenta (si creaste una clave nueva o cuenta nueva, actualiza los dos secretos).";
+    } else if (/sufficient permission|forbidden|permission/i.test(msg)) {
       pista = " Comprueba que el email de la cuenta de servicio (GSC_SERVICE_ACCOUNT_EMAIL) está añadido en Search Console > Configuración > Usuarios y permisos de la propiedad GSC_SITE_URL.";
     } else if (/not been used|is disabled|accessNotConfigured/i.test(msg)) {
       pista = " Activa «Google Search Console API» en el proyecto de Google Cloud de la cuenta de servicio.";
@@ -4365,12 +4393,36 @@ async function sha256Hex(arrayBuffer) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+// ---------- Contenido MUY pesado: enlace externo manual (MediaFire, Drive, Mega...) ----------
+// Los archivos que no caben en Cloudinary (vídeos de más de ~90 MB) NO se suben
+// a ningún almacenamiento del servidor: la persona los sube a mano a MediaFire
+// (u otro servicio parecido) y en el panel solo pega el enlace. Se guarda en la
+// mediateca como contenido PRIVADO (solo se ve en el panel): un enlace de
+// MediaFire es una página de descarga, no un vídeo directo, así que no se
+// puede reproducir en la web pública. Ver LEEME-ENLACE-EXTERNO.md.
+const CONTENT_TYPE_ENLACE_EXTERNO = "enlace/externo";
+
+function normalizarEnlaceExterno(valor) {
+  const texto = String(valor || "").trim();
+  if (!texto || texto.length > 2000) return null;
+  let u;
+  try { u = new URL(texto); } catch { return null; }
+  // Solo https y sin usuario/contraseña en la URL.
+  if (u.protocol !== "https:" || u.username || u.password) return null;
+  return u.toString();
+}
+
+function nombreServicioEnlace(enlace) {
+  try { return new URL(enlace).hostname.replace(/^www\./, ""); } catch { return "enlace externo"; }
+}
+
 async function borrarDeCloudinary(env, publicId, resourceType, cloudName) {
-  // Contenido pesado guardado en R2 (public_id "r2:<clave>"): este backend no
-  // tiene acceso al bucket, así que no se intenta borrar de Cloudinary (daría
-  // "not found"). El objeto queda en R2 hasta borrarlo desde el worker principal.
-  if (typeof publicId === "string" && publicId.startsWith("r2:")) {
-    console.warn("[media] contenido pesado en R2 no borrable desde el backend secundario:", publicId);
+  // Enlaces externos (public_id "ext:<uuid>"): no hay nada propio que borrar.
+  // Restos de la antigua subida a R2 (public_id "r2:<clave>"): R2 ya no se usa
+  // desde este código; si queda algún objeto en el bucket, se borra a mano
+  // desde el panel de Cloudflare.
+  if (typeof publicId === "string" && (publicId.startsWith("ext:") || publicId.startsWith("r2:"))) {
+    if (publicId.startsWith("r2:")) console.warn("[media] contenido antiguo de R2: se quita de la mediateca pero el objeto sigue en el bucket:", publicId);
     return null;
   }
   // Se borra en la cuenta donde vive el archivo (cloudName, sacado de su
@@ -5091,6 +5143,77 @@ function slugify(text) {
     .replace(/\s+/g, "-")
     .replace(/-+/g, "-")
     .slice(0, 90);
+}
+
+// ---------- SEO de previas/crónicas: slug con los dos equipos ----------
+// Para previa/crónica vinculada a un partido el slug se deriva de los equipos
+// y la fecha ("cronica-valladolid-lugo-2026-10-04") en vez del titular: la
+// URL contiene el cruce "equipo1-equipo2" que busca la gente, y no cambia
+// aunque el redactor reescriba el titular. Solo afecta a artículos cuyo slug
+// aún no está congelado (los ya publicados conservan su URL).
+const SLUG_CLUB_PREFIJOS = new Set(["cf", "cd", "ud", "sd", "fc", "ad", "ce", "rcd", "rc", "cp", "ue"]);
+const SLUG_CLUB_SUFIJOS = new Set(["cf", "fc", "cd", "ud", "sd", "sad"]);
+function nombreCortoEquipoSlug(nombre) {
+  const original = String(nombre || "").trim();
+  const partes = original.split(/\s+/).filter(Boolean);
+  if (partes.length > 1 && SLUG_CLUB_PREFIJOS.has(slugify(partes[0]))) partes.shift();
+  if (partes.length > 1 && SLUG_CLUB_SUFIJOS.has(slugify(partes[partes.length - 1]))) partes.pop();
+  return partes.join(" ") || original;
+}
+
+async function slugBasePartidoArticulo(env, tipo, resultadoId) {
+  if (tipo !== "previa" && tipo !== "cronica") return null;
+  const id = parseInt(resultadoId, 10);
+  if (!id) return null;
+  try {
+    const r = await env.DB.prepare("SELECT equipo_local, equipo_visitante, fecha_partido FROM results WHERE id = ?").bind(id).first();
+    if (!r || !r.equipo_local || !r.equipo_visitante) return null;
+    const fecha = (String(r.fecha_partido || "").match(/^\d{4}-\d{2}-\d{2}/) || [""])[0];
+    const base = slugify(`${tipo} ${nombreCortoEquipoSlug(r.equipo_local)} ${nombreCortoEquipoSlug(r.equipo_visitante)} ${fecha}`);
+    return base || null;
+  } catch (err) {
+    console.error("[slug-partido] no se pudo derivar el slug del partido:", err && err.message);
+    return null;
+  }
+}
+
+// Previa <-> crónica del mismo partido (la "hermana"): enlace interno que
+// refuerza el SEO del cruce y ayuda al lector. Caché corta en memoria del
+// isolate: no añade lecturas de D1 por cada visita.
+async function relacionadosDelPartido(env, article) {
+  try {
+    const filas = await memoCorta(`rel-partido:${article.resultado_id}:${article.tipo}`, 60000, async () => {
+      const { results } = await env.DB.prepare(
+        "SELECT id, tipo, titulo, slug, categoria FROM articles WHERE resultado_id = ? AND publicado = 1 AND tipo IN ('previa', 'cronica') AND tipo != ? ORDER BY id ASC LIMIT 6"
+      ).bind(article.resultado_id, article.tipo).all();
+      return results || [];
+    });
+    const vistos = new Set();
+    const salida = [];
+    for (const f of filas) {
+      if (vistos.has(f.tipo)) continue; // si hay varias del mismo tipo (fusionadas), la primera
+      vistos.add(f.tipo);
+      salida.push({ tipo: f.tipo, titulo: f.titulo, slug: f.slug, categoria: f.categoria });
+    }
+    return salida;
+  } catch (err) {
+    console.error("[relacionados-partido] fallo no crítico:", err && err.message);
+    return [];
+  }
+}
+
+// Búsqueda por cruce: "valladolid-lugo", "Valladolid vs Lugo", "valladolid
+// contra lugo" -> términos sueltos ["valladolid", "lugo"]; cada uno debe
+// aparecer en el título o en el club (previas/crónicas guardan los dos
+// equipos en "club"). Antes solo se buscaba la frase exacta en el título.
+function terminosBusquedaArticulos(texto) {
+  return String(texto || "")
+    .toLowerCase()
+    .replace(/[%_]/g, " ")
+    .split(/\s*(?:[-–—|/:]|\bvs\.?(?=\s|$)|\bcontra\b)\s*|\s+/i)
+    .map((t) => t.trim())
+    .filter((t) => t.length >= 2)
+    .slice(0, 6);
 }
 
 // Genera un slug único a partir de un título, evitando choques con el
@@ -7061,23 +7184,33 @@ async function calcularAutoresAnaliticas(env, desde) {
   const totalVistas = articulos.reduce((s, r) => s + (vistasPorAutor.get(r.autor_nombre) || 0), 0);
   const mediaGlobal = totalNoticias ? totalVistas / totalNoticias : 0;
 
-  const autores = articulos
-    .map((r) => {
-      const noticias = Number(r.noticias) || 0;
-      const v = vistasPorAutor.get(r.autor_nombre) || 0;
-      const porNoticia = noticias ? v / noticias : 0;
-      return {
-        autor: r.autor_nombre,
-        noticias,
-        vistas: v,
-        vistas_por_noticia: Math.round(porNoticia * 10) / 10,
-        // 100 % = igual que la media de todos los autores
-        rendimiento_pct: mediaGlobal ? Math.round((porNoticia / mediaGlobal) * 100) : 0,
-        // Reparto de vistas sobre el total (para ver el peso de cada autor)
-        cuota_vistas_pct: totalVistas ? Math.round((v / totalVistas) * 1000) / 10 : 0,
-        tiempo_medio_segundos: Math.round(tiempoPorAutor.get(r.autor_nombre) || 0),
-      };
-    })
+  // Rendimiento acotado a 0-100 %: el mejor autor del periodo es el 100 % y
+  // el resto va en proporción. Antes el 100 % era la media global, y con
+  // pocos autores o un artículo viral salían cifras de cientos o miles de %.
+  // Las vistas por artículo se "suavizan" con K artículos ficticios a la
+  // media global para que 1-2 artículos sueltos no copien el primer puesto.
+  const K_SUAVIZADO = 3;
+  const calculados = articulos.map((r) => {
+    const noticias = Number(r.noticias) || 0;
+    const v = vistasPorAutor.get(r.autor_nombre) || 0;
+    const porNoticia = noticias ? v / noticias : 0;
+    const suavizado = (v + K_SUAVIZADO * mediaGlobal) / (noticias + K_SUAVIZADO);
+    return { r, noticias, v, porNoticia, suavizado };
+  });
+  const maxSuavizado = Math.max(0, ...calculados.map((c) => c.suavizado));
+
+  const autores = calculados
+    .map(({ r, noticias, v, porNoticia, suavizado }) => ({
+      autor: r.autor_nombre,
+      noticias,
+      vistas: v,
+      vistas_por_noticia: Math.round(porNoticia * 10) / 10,
+      // 100 % = el mejor autor del periodo
+      rendimiento_pct: v > 0 && maxSuavizado ? Math.round((suavizado / maxSuavizado) * 100) : 0,
+      // Reparto de vistas sobre el total (para ver el peso de cada autor)
+      cuota_vistas_pct: totalVistas ? Math.round((v / totalVistas) * 1000) / 10 : 0,
+      tiempo_medio_segundos: Math.round(tiempoPorAutor.get(r.autor_nombre) || 0),
+    }))
     .sort((a, b) => b.rendimiento_pct - a.rendimiento_pct || b.vistas - a.vistas);
 
   return { autores, media_vistas_por_noticia: Math.round(mediaGlobal * 10) / 10 };
@@ -8765,7 +8898,7 @@ export default {
         ).all();
 
         const urls = results.map((articulo) => {
-          const lastmod = fechaParaSitemap(articulo.updated_at || articulo.fecha_publicacion);
+          const lastmod = fechaHoraParaSitemap(articulo.updated_at || articulo.fecha_publicacion);
 
           // Extensión "image:" del protocolo de sitemaps: además de la
           // <loc> de la noticia, se listan sus imágenes para que Google
@@ -8844,7 +8977,7 @@ export default {
     if (path === "/sitemap-news.xml" && method === "GET") {
       try {
         const { results } = await env.DB.prepare(
-          `SELECT slug, titulo, categoria, fecha_publicacion FROM articles
+          `SELECT slug, titulo, categoria, imagen_url, fecha_publicacion FROM articles
            WHERE publicado = 1${SQL_OCULTAR_SEGUNDO_DE_FUSION}
              AND fecha_publicacion >= datetime('now', '-48 hours')
            ORDER BY fecha_publicacion DESC
@@ -8872,13 +9005,20 @@ export default {
             "      </news:publication>",
             `      <news:publication_date>${fecha.toISOString()}</news:publication_date>`,
             `      <news:title>${escaparXml(articulo.titulo)}</news:title>`,
-            articulo.categoria ? `      <news:keywords>${escaparXml(articulo.categoria)}</news:keywords>` : null,
+            // news:keywords está obsoleto (Google ya no lo lee) y además aquí
+            // llevaba el identificador interno de la categoría
+            // ("primera_federacion"), no una palabra clave real: se quita.
             "    </news:news>",
+            // La foto de portada también en el sitemap de News: ayuda a que la
+            // noticia salga con imagen en Top Stories y Google Discover.
+            articulo.imagen_url
+              ? `    <image:image>\n      <image:loc>${escaparXml(imagenParaFeed(articulo.imagen_url))}</image:loc>\n    </image:image>`
+              : null,
             "  </url>",
           ].filter(Boolean).join("\n");
         }).filter(Boolean).join("\n");
 
-        const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:news="http://www.google.com/schemas/sitemap-news/0.9">\n${urls}\n</urlset>\n`;
+        const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:news="http://www.google.com/schemas/sitemap-news/0.9" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">\n${urls}\n</urlset>\n`;
 
         return cors(new Response(xml, {
           status: 200,
@@ -8967,7 +9107,7 @@ export default {
     if (path === "/rss.xml" && method === "GET") {
       try {
         const { results } = await env.DB.prepare(
-          `SELECT slug, titulo, subtitulo, contenido, categoria, autor_nombre, fecha_publicacion, updated_at
+          `SELECT slug, titulo, subtitulo, contenido, categoria, autor_nombre, imagen_url, fecha_publicacion, updated_at
            FROM articles
            WHERE publicado = 1${SQL_OCULTAR_SEGUNDO_DE_FUSION}
            ORDER BY fecha_publicacion DESC
@@ -8978,22 +9118,28 @@ export default {
           const link = urlNoticia(articulo.categoria, articulo.slug);
           const pubDate = fechaParaRss(articulo.fecha_publicacion);
           const descripcion = articulo.subtitulo?.trim() || extractoTexto(articulo.contenido);
+          const imagenItem = imagenParaFeed(articulo.imagen_url);
           return [
             "  <item>",
             `    <title>${escaparXml(articulo.titulo)}</title>`,
             `    <link>${link}</link>`,
             `    <guid isPermaLink="true">${link}</guid>`,
             descripcion ? `    <description>${escaparXml(descripcion)}</description>` : null,
-            articulo.categoria ? `    <category>${escaparXml(articulo.categoria)}</category>` : null,
-            articulo.autor_nombre ? `    <author>${escaparXml(articulo.autor_nombre)}</author>` : null,
+            // Nombre legible ("Primera Federación"), no el identificador interno.
+            articulo.categoria ? `    <category>${escaparXml(categoriaLabelEmail(articulo.categoria))}</category>` : null,
+            // <author> en RSS 2.0 exige un correo ("a@b.com (Nombre)"); un nombre
+            // suelto lo invalida en los validadores. dc:creator es la forma estándar.
+            articulo.autor_nombre ? `    <dc:creator>${escaparXml(articulo.autor_nombre)}</dc:creator>` : null,
             pubDate ? `    <pubDate>${pubDate}</pubDate>` : null,
+            imagenItem ? `    <media:content url="${escaparXml(imagenItem)}" medium="image" type="image/jpeg" width="1200" height="675"/>` : null,
+            imagenItem ? `    <media:thumbnail url="${escaparXml(imagenItem)}" width="1200" height="675"/>` : null,
             "  </item>",
           ].filter(Boolean).join("\n");
         }).join("\n");
 
         const ultimaActualizacion = fechaParaRss(results[0]?.updated_at || results[0]?.fecha_publicacion) || new Date().toUTCString();
 
-        const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0" xmlns:atom="https://www.w3.org/2005/Atom">\n<channel>\n  <title>ELOTROFÚTBOLTV</title>\n  <link>https://elotrofutbol.media</link>\n  <description>Últimas noticias de fútbol modesto: Primera Federación, Segunda Federación y más.</description>\n  <language>es</language>\n  <lastBuildDate>${ultimaActualizacion}</lastBuildDate>\n  <atom:link href="https://elotrofutbol.media/rss.xml" rel="self" type="application/rss+xml" />\n${items}\n</channel>\n</rss>\n`;
+        const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:media="http://search.yahoo.com/mrss/">\n<channel>\n  <title>ELOTROFÚTBOLTV</title>\n  <link>https://elotrofutbol.media/</link>\n  <description>Últimas noticias de fútbol modesto: Primera Federación, Segunda Federación y más.</description>\n  <language>es</language>\n  <copyright>ELOTROFÚTBOLTV</copyright>\n  <ttl>15</ttl>\n  <lastBuildDate>${ultimaActualizacion}</lastBuildDate>\n  <image>\n    <url>https://elotrofutbol.media/img/logo.png</url>\n    <title>ELOTROFÚTBOLTV</title>\n    <link>https://elotrofutbol.media/</link>\n    <width>144</width>\n    <height>132</height>\n  </image>\n  <atom:link href="https://elotrofutbol.media/rss.xml" rel="self" type="application/rss+xml" />\n${items}\n</channel>\n</rss>\n`;
 
         return cors(new Response(xml, {
           status: 200,
@@ -13665,6 +13811,66 @@ async function handlePrimary(request, env, ctx) {
         if (!payload) return json({ error: "No autorizado" }, 401);
 
         const form = await request.formData();
+        // ---------- Contenido MUY pesado: enlace externo (manual) ----------
+        // No se sube ningún archivo: solo se registra el enlace que la persona
+        // ha pegado (MediaFire, Drive, Mega...). Siempre queda PRIVADO.
+        const enlaceExternoRaw = (form.get("enlaceExterno") || "").toString().trim();
+        if (enlaceExternoRaw) {
+          const enlace = normalizarEnlaceExterno(enlaceExternoRaw);
+          if (!enlace) return json({ error: "El enlace no es válido: debe empezar por https:// (copia la dirección completa que te da MediaFire, Drive, Mega...)" }, 400);
+          const tituloEnlace = (form.get("titulo") || "").toString().trim();
+          const descripcionEnlace = (form.get("descripcion") || "").toString().trim();
+          const clubEnlace = (form.get("club") || "").toString().trim();
+          const avisoEnLoteEnlace = (form.get("avisoLote") || "").toString() === "1";
+          if (!tituloEnlace) return json({ error: "Falta el título" }, 400);
+          if (tituloEnlace.length > 200) return json({ error: "El título es demasiado largo (máximo 200 caracteres)" }, 400);
+          if (descripcionEnlace.length > 2000) return json({ error: "La descripción es demasiado larga (máximo 2000 caracteres)" }, 400);
+          const nombreEnlace = (form.get("enlaceNombre") || "").toString().trim().slice(0, 200) || nombreServicioEnlace(enlace);
+          const esFotoEnlace = (form.get("enlaceTipo") || "").toString() === "foto";
+          const tamanoEnlace = Math.max(1, Math.round(Number(form.get("enlaceTamano")) || 0));
+          let duplicadoEnlace = null;
+          try {
+            duplicadoEnlace = await env.DB.prepare("SELECT id, titulo, autor_nombre FROM media WHERE cloudinary_url = ?").bind(enlace).first();
+          } catch (err) {
+            console.error("Comprobación de enlace duplicado falló (se continúa):", err.message);
+          }
+          if (duplicadoEnlace) {
+            return json({
+              error: `Este enlace ya se registró antes con el título "${duplicadoEnlace.titulo}"${duplicadoEnlace.autor_nombre ? ` (por ${duplicadoEnlace.autor_nombre})` : ""}.`,
+              duplicado: true,
+              mediaId: duplicadoEnlace.id,
+            }, 409);
+          }
+          try {
+            await env.DB.prepare(
+              `INSERT INTO media (cloudinary_public_id, cloudinary_resource_type, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, visibilidad)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'privado')`
+            ).bind(
+              `ext:${crypto.randomUUID()}`, "enlace", enlace, tituloEnlace, descripcionEnlace || null,
+              esFotoEnlace ? "foto" : "video", nombreEnlace, CONTENT_TYPE_ENLACE_EXTERNO, tamanoEnlace,
+              payload.uid, payload.nombre, clubEnlace || null
+            ).run();
+          } catch (err) {
+            return json({ error: "No se pudo guardar el enlace. Inténtalo de nuevo (si persiste, falta ejecutar migracion_media_visibilidad.sql).", detail: err.message }, 500);
+          }
+          if (!avisoEnLoteEnlace) {
+            ctx.waitUntil(enviarEmailNotificacion(env, {
+              asunto: `Nuevo enlace de contenido pesado: ${tituloEnlace}`,
+              texto: `${payload.nombre} ha registrado un enlace externo para "${tituloEnlace}" (${esFotoEnlace ? "foto" : "vídeo"} muy pesado).${clubEnlace ? `\nClub: ${clubEnlace}` : ""}${descripcionEnlace ? `\nDescripción: ${descripcionEnlace}` : ""}\nEnlace: ${enlace}\n\nEntra en el panel de administración para abrirlo y descargarlo.`,
+              html: plantillaEmail({
+                etiqueta: "Contenido pesado (enlace)",
+                titulo: tituloEnlace,
+                parrafo: descripcionEnlace || null,
+                filas: [
+                  { etiqueta: "Registrado por", valor: payload.nombre },
+                  { etiqueta: "Club", valor: clubEnlace },
+                  { etiqueta: "Enlace", valor: enlace },
+                ],
+              }),
+            }));
+          }
+          return json({ ok: true, enlaceExterno: true });
+        }
         const file = form.get("archivo");
         const titulo = (form.get("titulo") || "").toString().trim();
         const descripcion = (form.get("descripcion") || "").toString().trim();
@@ -14264,6 +14470,16 @@ async function handlePrimary(request, env, ctx) {
         const registro = await env.DB.prepare("SELECT * FROM media WHERE id = ?").bind(id).first();
         if (!registro) return json({ error: "No encontrado" }, 404);
 
+        // Contenido pesado registrado como enlace externo (MediaFire, Drive...):
+        // no hay archivo propio que servir, se redirige al enlace.
+        if (registro.content_type === CONTENT_TYPE_ENLACE_EXTERNO) {
+          ctx.waitUntil(registrarActividad(env, request, payload, {
+            accion: "descargar_media", entidad: "media", entidad_id: id,
+            descripcion: `Ha abierto el enlace externo de "${registro.nombre_archivo}"`,
+          }));
+          return cors(new Response(null, { status: 302, headers: { Location: registro.cloudinary_url } }), ORIGEN_PETICION_ACTUAL);
+        }
+
         const objeto = await fetch(registro.cloudinary_url);
         if (!objeto.ok) return json({ error: "El archivo ya no está disponible" }, 404);
 
@@ -14815,7 +15031,17 @@ async function handlePrimary(request, env, ctx) {
         // scan leyendo el contenido completo de cada artículo. Si hace
         // falta buscar también en el cuerpo, la solución correcta es una
         // tabla FTS5 de SQLite, no este LIKE.
-        if (busqueda) { query += " AND titulo LIKE ?"; binds.push(`%${busqueda}%`); }
+        if (busqueda) {
+          const terminos = terminosBusquedaArticulos(busqueda);
+          if (terminos.length) {
+            for (const t of terminos) {
+              query += " AND (LOWER(titulo) LIKE ? OR LOWER(club) LIKE ?)";
+              binds.push(`%${t}%`, `%${t}%`);
+            }
+          } else {
+            query += " AND titulo LIKE ?"; binds.push(`%${busqueda}%`);
+          }
+        }
         query += " ORDER BY fecha_publicacion DESC LIMIT ?";
         binds.push(limit);
 
@@ -14922,7 +15148,8 @@ async function handlePrimary(request, env, ctx) {
             return json({ error: `El contenido no puede superar los ${CONTENIDO_MAX} caracteres (tiene ${longitudContenido}).` }, 400);
           }
         }
-        let slug = await slugUnico(env, body.slug || body.titulo, null);
+        const slugPartido = await slugBasePartidoArticulo(env, body.tipo, body.resultado_id);
+        let slug = await slugUnico(env, slugPartido || body.slug || body.titulo, null);
 
         // Varias fotos: se guardan como JSON (con su posición dentro del
         // texto y su foco de recorte); la marcada como portada hace además
@@ -15321,6 +15548,9 @@ async function handlePrimary(request, env, ctx) {
             article.resultado.url_galeria = `${SITIO_URL}/galeria/${await slugPartidoUnico(env, article.resultado)}`;
             article.resultado.galeria_disponible = !!portada;
             article.resultado.foto_portada_galeria = portada ? portada.cloudinary_url : null;
+            if (article.tipo === "previa" || article.tipo === "cronica") {
+              article.relacionados_partido = await relacionadosDelPartido(env, article);
+            }
           }
         } else {
           article.resultado = null;
@@ -15730,7 +15960,8 @@ async function handlePrimary(request, env, ctx) {
         const slugSigueVivo = !articuloParaPermiso.slug_congelado && !articuloParaPermiso.publicado;
         let slug = articuloParaPermiso.slug;
         if (slugSigueVivo && body.titulo) {
-          slug = await slugUnico(env, body.titulo, id);
+          const slugPartido = await slugBasePartidoArticulo(env, tipoFinal, resultadoIdFinal);
+          slug = await slugUnico(env, slugPartido || body.titulo, id);
         }
         const slugCongeladoFinal = (articuloParaPermiso.slug_congelado || vaAPublicarseAhora) ? 1 : 0;
 
