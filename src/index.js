@@ -10990,6 +10990,7 @@ async function fetchRailway(
 const CACHE_PUBLICA_TTL_MS = {
   "/api/articles": 15000,
   "/api/articles/banner-urgente": 10000,
+  "/api/articles/ranking": 120000,
   "/api/noticias-rapidas": 15000,
   "/api/polls/portada": 15000,
   "/api/settings": 60000,
@@ -14919,6 +14920,63 @@ async function handlePrimary(request, env, ctx) {
         return json({ ok: true });
       }
 
+      // ---------- Ranking público de portada: más leídas y tendencias ----------
+      // "Más leídas" = noticias con más visitas en los últimos 7 días.
+      // "Tendencias" = las que MÁS SUBEN hoy: visitas de las últimas 24 h
+      // frente a su media diaria de los 6 días anteriores (así una noticia
+      // que siempre es la más vista no ocupa también este hueco), sin repetir
+      // las que ya salen en "Más leídas". Solo noticias publicadas; no se
+      // devuelven cifras de visitas. Respuesta cacheable (ver
+      // CACHE_PUBLICA_TTL_MS), no depende de quién pregunta.
+      if (path === "/api/articles/ranking" && method === "GET") {
+        const limitRankPedido = parseInt(url.searchParams.get("limit") || "5", 10);
+        const limitRank = Number.isInteger(limitRankPedido) && limitRankPedido > 0 ? Math.min(limitRankPedido, 10) : 5;
+        const { results: filasSemana } = await env.DB.prepare(
+          `SELECT article_id, COUNT(*) AS vistas FROM article_views
+           WHERE created_at >= datetime('now', '-7 days') AND article_id IS NOT NULL
+           GROUP BY article_id ORDER BY vistas DESC LIMIT 40`
+        ).all();
+        const { results: filasDia } = await env.DB.prepare(
+          `SELECT article_id, COUNT(*) AS vistas FROM article_views
+           WHERE created_at >= datetime('now', '-1 days') AND article_id IS NOT NULL
+           GROUP BY article_id ORDER BY vistas DESC LIMIT 40`
+        ).all();
+        const vistasSemana = new Map((filasSemana || []).map((f) => [Number(f.article_id), Number(f.vistas) || 0]));
+        const vistasDia = new Map((filasDia || []).map((f) => [Number(f.article_id), Number(f.vistas) || 0]));
+        const idsRanking = [...new Set([...vistasSemana.keys(), ...vistasDia.keys()])];
+        if (!idsRanking.length) return json({ mas_leidas: [], tendencias: [] });
+        const { results: articulosRank } = await env.DB.prepare(
+          `SELECT id, slug, titulo, subtitulo, tipo, categoria, club, imagen_url, imagenes,
+                  autor_nombre, coautor_nombre, fecha_publicacion
+           FROM articles
+           WHERE publicado = 1 AND id IN (${idsRanking.map(() => "?").join(",")})${SQL_OCULTAR_SEGUNDO_DE_FUSION}`
+        ).bind(...idsRanking).all();
+        const articulosPorId = new Map((articulosRank || []).map((a) => [Number(a.id), a]));
+        const masLeidas = [...vistasSemana.entries()]
+          .filter(([id]) => articulosPorId.has(id))
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, limitRank)
+          .map(([id]) => articulosPorId.get(id));
+        const idsMasLeidas = new Set(masLeidas.map((a) => Number(a.id)));
+        const tendencias = [...vistasDia.entries()]
+          .filter(([id, v24]) => articulosPorId.has(id) && !idsMasLeidas.has(id) && v24 >= 2)
+          .map(([id, v24]) => {
+            const previas = Math.max(0, (vistasSemana.get(id) || v24) - v24);
+            return { id, puntuacion: v24 - previas / 6 };
+          })
+          .filter((t) => t.puntuacion > 0)
+          .sort((a, b) => b.puntuacion - a.puntuacion)
+          .slice(0, limitRank)
+          .map((t) => articulosPorId.get(t.id));
+        // imagen_foco (foco de recorte de la portada) lo calcula
+        // conIdiomasDisponibles, igual que en el listado normal.
+        const paraPortada = (a) => {
+          const { idiomas_disponibles, categorias_adicionales, ...resto } = conIdiomasDisponibles(a);
+          return resto;
+        };
+        return json({ mas_leidas: masLeidas.map(paraPortada), tendencias: tendencias.map(paraPortada) });
+      }
+
       if (path === "/api/articles" && method === "GET") {
         const categoria = url.searchParams.get("categoria");
         const club = url.searchParams.get("club");
@@ -14940,6 +14998,13 @@ async function handlePrimary(request, env, ctx) {
         // traído), aunque siguiera existiendo en la base de datos.
         const limitPedido = parseInt(url.searchParams.get("limit") || "30", 10);
         const limit = Number.isInteger(limitPedido) && limitPedido > 0 ? Math.min(limitPedido, 2000) : 30;
+        // Paginación (botón "Cargar más" de la portada): "offset" salta las N
+        // primeras noticias del mismo orden. Se pide una fila de más para
+        // saber si quedan noticias después de esta página ("hay_mas") sin
+        // hacer un COUNT aparte. Sin "offset" el resultado es idéntico al de
+        // siempre.
+        const offsetPedido = parseInt(url.searchParams.get("offset") || "0", 10);
+        const offsetArticulos = Number.isInteger(offsetPedido) && offsetPedido > 0 ? Math.min(offsetPedido, 5000) : 0;
         let admin = url.searchParams.get("admin") === "1";
         if (admin) {
           // La vista "admin" incluye borradores no publicados, así que
@@ -15025,6 +15090,14 @@ async function handlePrimary(request, env, ctx) {
         if (autorId) { query += " AND autor_id = ?"; binds.push(parseInt(autorId, 10)); }
         if (destacado === "1") { query += " AND destacado = 1"; }
         if (destacado === "0") { query += " AND destacado = 0"; }
+        // "excluir=1,2,3": ids que no deben salir (la portada pide así las
+        // noticias recientes sin repetir las del hero). Máximo 30 ids.
+        const excluirIds = (url.searchParams.get("excluir") || "")
+          .split(",").map((v) => parseInt(v, 10)).filter((v) => Number.isInteger(v) && v > 0).slice(0, 30);
+        if (excluirIds.length) {
+          query += ` AND id NOT IN (${excluirIds.map(() => "?").join(",")})`;
+          binds.push(...excluirIds);
+        }
         // Solo se busca en el título, no en "contenido" (el cuerpo entero
         // del artículo): un LIKE '%x%' sobre una columna de texto largo no
         // puede usar índice por el comodín inicial y provoca un full table
@@ -15042,10 +15115,12 @@ async function handlePrimary(request, env, ctx) {
             query += " AND titulo LIKE ?"; binds.push(`%${busqueda}%`);
           }
         }
-        query += " ORDER BY fecha_publicacion DESC LIMIT ?";
-        binds.push(limit);
+        query += " ORDER BY fecha_publicacion DESC LIMIT ? OFFSET ?";
+        binds.push(limit + 1, offsetArticulos);
 
-        const { results: resultadosBD } = await env.DB.prepare(query).bind(...binds).all();
+        const { results: resultadosBDConExtra } = await env.DB.prepare(query).bind(...binds).all();
+        const hayMasArticulos = resultadosBDConExtra.length > limit;
+        const resultadosBD = hayMasArticulos ? resultadosBDConExtra.slice(0, limit) : resultadosBDConExtra;
         // Vista admin: se reevalúa el horario al leer (ver aplicarFueraCalendarioEnLectura).
         const results = admin ? await aplicarFueraCalendarioEnLectura(env, resultadosBD) : resultadosBD;
         // Reconstruye, a partir de las longitudes pedidas, los mismos
@@ -15063,6 +15138,7 @@ async function handlePrimary(request, env, ctx) {
             const { contenido_eu_len, contenido_ca_len, contenido_gl_len, contenido_en_len, ...resto } = conIdiomasDisponibles(a);
             return resto;
           }),
+          hay_mas: hayMasArticulos,
         });
       }
       if (path === "/api/articles" && method === "POST") {
