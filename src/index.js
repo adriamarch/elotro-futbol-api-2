@@ -1,4 +1,9 @@
 // ElOtroFútbol - Worker API
+import {
+  busquedaFtsDisponible, planificarBusqueda, expresionParaIntento, fragmentosRanking,
+  extractosBusqueda, facetasBusqueda, indexarArticuloBusqueda, eliminarArticuloBusqueda,
+  reconciliarIndiceBusqueda, reiniciarIndiceBusqueda,
+} from "./busqueda.js";
 // Rutas: /api/login, /api/me, /api/me/sesiones, /api/articles, /api/results, /api/porras, /api/porras/resumen, /api/porras/ranking, /api/media, /api/custom-clubs, /api/articles/:id/comments, /api/comments/:id/vote, /api/comments/:id/report, /api/admin/comments, /api/admin/comments/reported, /api/club-info, /api/admin/club-info, /api/track/view, /api/track/reading, /api/track/result-view, /api/admin/analiticas/* (resumen, mensual, mas-leidas, fuentes, autores, tiempo-lectura, idiomas, partidos-seguidos, gsc), /sitemap-noticias.xml, /sitemap-news.xml, /rss.xml
 
 // Escapa los caracteres especiales de XML para que un título o slug con
@@ -9761,6 +9766,12 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
   // al panel a esa hora.
   async scheduled(event, env, ctx) {
     ctx.waitUntil(publicarArticulosProgramados(env));
+    // Red de seguridad del índice de búsqueda (src/busqueda.js): cada 5 min
+    // mientras haya backfill pendiente; después, una vez por hora.
+    {
+      const mm = new Date(event?.scheduledTime || Date.now()).getUTCMinutes();
+      if (mm % 5 === 3) ctx.waitUntil(reconciliarIndiceBusqueda(env, { soloBackfill: mm !== 3 }));
+    }
     ctx.waitUntil(iniciarPartidosProgramadosCuyaHoraHaLlegado(env));
 
     // Reducción de CPU del cron (corre cada minuto, 1440 veces/día):
@@ -12778,6 +12789,20 @@ async function handlePrimary(request, env, ctx) {
         });
       }
 
+      // ---------- REINDEXAR LA BÚSQUEDA (solo admins) ----------
+      // Indexa un lote de artículos pendientes (20 por defecto). Repetir hasta
+      // que responda "listo": true. "?reset=1" vacía el índice y reempieza.
+      if (path === "/api/admin/busqueda/reindexar" && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede reindexar la búsqueda" }, 403);
+        if (url.searchParams.get("reset") === "1") await reiniciarIndiceBusqueda(env);
+        return json(await reconciliarIndiceBusqueda(env, {
+          limite: parseInt(url.searchParams.get("limite") || "20", 10) || 20,
+          forzarCompleto: true,
+        }));
+      }
+
       // ---------- HISTORIAL DE ACCIONES (solo admins) ----------
       // Permite filtrar por usuario, acción, entidad, texto libre (busca
       // en la descripción) y rango de fechas. Paginado con limit/offset.
@@ -15104,7 +15129,13 @@ async function handlePrimary(request, env, ctx) {
         // scan leyendo el contenido completo de cada artículo. Si hace
         // falta buscar también en el cuerpo, la solución correcta es una
         // tabla FTS5 de SQLite, no este LIKE.
-        if (busqueda) {
+        // Búsqueda de texto (q): índice FTS5 en D1 / tsvector en PostgreSQL, ver
+        // src/busqueda.js. Pondera título/club sobre el cuerpo, resta peso a lo
+        // antiguo y tolera erratas (solo si la consulta tal cual no da nada).
+        // Mientras el índice no exista o no esté completo (busquedaFtsDisponible)
+        // se usa el LIKE de siempre, así que el orden de despliegue es indiferente.
+        const usarFts = !!busqueda && (await busquedaFtsDisponible(env));
+        if (busqueda && !usarFts) {
           const terminos = terminosBusquedaArticulos(busqueda);
           if (terminos.length) {
             for (const t of terminos) {
@@ -15115,10 +15146,53 @@ async function handlePrimary(request, env, ctx) {
             query += " AND titulo LIKE ?"; binds.push(`%${busqueda}%`);
           }
         }
-        query += " ORDER BY fecha_publicacion DESC LIMIT ? OFFSET ?";
-        binds.push(limit + 1, offsetArticulos);
+        // Rango de fechas de publicación (YYYY-MM-DD, ambos incluidos). Vale
+        // para cualquier listado; la página de búsqueda lo usa como filtro.
+        const reFecha = /^\d{4}-\d{2}-\d{2}$/;
+        const fechaDesde = reFecha.test(url.searchParams.get("desde") || "") ? url.searchParams.get("desde") : null;
+        const fechaHasta = reFecha.test(url.searchParams.get("hasta") || "") ? url.searchParams.get("hasta") : null;
+        if (fechaDesde) { query += " AND substr(fecha_publicacion, 1, 10) >= ?"; binds.push(fechaDesde); }
+        if (fechaHasta) { query += " AND substr(fecha_publicacion, 1, 10) <= ?"; binds.push(fechaHasta); }
 
-        const { results: resultadosBDConExtra } = await env.DB.prepare(query).bind(...binds).all();
+        const planBusqueda = usarFts ? planificarBusqueda(busqueda, { corregir: url.searchParams.get("exacto") !== "1" }) : null;
+        const ordenPorFecha = url.searchParams.get("orden") === "fecha";
+        const pedirFacetas = url.searchParams.get("facetas") === "1" && offsetArticulos === 0;
+
+        // Devuelve las filas (limit + 1) y, si es búsqueda FTS, los datos extra.
+        // Intentos: 0 = términos tal cual (AND), 1 = con erratas corregidas,
+        // 2 = cualquiera de los términos (OR). "intento" fija uno (lo manda el
+        // cliente al paginar para no cambiar de criterio entre páginas).
+        const ejecutarListado = async () => {
+          if (!usarFts) {
+            const { results } = await env.DB.prepare(query + " ORDER BY fecha_publicacion DESC LIMIT ? OFFSET ?")
+              .bind(...binds, limit + 1, offsetArticulos).all();
+            return { filas: results, info: null };
+          }
+          const vacio = { q: busqueda, intento: 0, modo: "and", corregido: null, expr: null, extractos: {}, facetas: null };
+          if (!planBusqueda.terminos.length) return { filas: [], info: vacio };
+          const pedido = parseInt(url.searchParams.get("intento"), 10);
+          const fijo = Number.isInteger(pedido) && pedido >= 0 && pedido <= 2;
+          for (let intento = fijo ? pedido : 0; intento <= 2; intento++) {
+            const e = await expresionParaIntento(env, planBusqueda, intento);
+            if (!e) { if (fijo) break; continue; }
+            const r = fragmentosRanking(env, e.expr);
+            const sql = query.replace("FROM articles WHERE 1=1", `FROM articles ${r.join} WHERE 1=1`)
+              + ` ORDER BY ${ordenPorFecha ? "fecha_publicacion DESC" : r.order} LIMIT ? OFFSET ?`;
+            const { results } = await env.DB.prepare(sql).bind(...r.binds, ...binds, limit + 1, offsetArticulos).all();
+            if (results.length || fijo || offsetArticulos > 0) {
+              const extractos = await extractosBusqueda(env, results.slice(0, limit).map((a) => a.id), e.expr);
+              const facetas = pedirFacetas && results.length
+                ? await facetasBusqueda(env, e.expr, { admin, fusionSql: SQL_OCULTAR_SEGUNDO_DE_FUSION }).catch(() => null)
+                : null;
+              return {
+                filas: results,
+                info: { q: busqueda, intento: e.intento, modo: e.modo, corregido: e.corregido, expr: e.expr, extractos: Object.fromEntries(extractos), facetas },
+              };
+            }
+          }
+          return { filas: [], info: vacio };
+        };
+        const { filas: resultadosBDConExtra, info: busquedaInfo } = await ejecutarListado();
         const hayMasArticulos = resultadosBDConExtra.length > limit;
         const resultadosBD = hayMasArticulos ? resultadosBDConExtra.slice(0, limit) : resultadosBDConExtra;
         // Vista admin: se reevalúa el horario al leer (ver aplicarFueraCalendarioEnLectura).
@@ -15136,9 +15210,16 @@ async function handlePrimary(request, env, ctx) {
         return json({
           articles: articulosParaIdiomas.map((a) => {
             const { contenido_eu_len, contenido_ca_len, contenido_gl_len, contenido_en_len, ...resto } = conIdiomasDisponibles(a);
+            if (busquedaInfo) resto.extracto_html = busquedaInfo.extractos[a.id] || "";
             return resto;
           }),
           hay_mas: hayMasArticulos,
+          ...(busquedaInfo ? {
+            busqueda: {
+              q: busquedaInfo.q, intento: busquedaInfo.intento, modo: busquedaInfo.modo,
+              corregido: busquedaInfo.corregido, facetas: busquedaInfo.facetas,
+            },
+          } : {}),
         });
       }
       if (path === "/api/articles" && method === "POST") {
@@ -15429,6 +15510,7 @@ async function handlePrimary(request, env, ctx) {
             : `Ha ${publicado ? "publicado" : "guardado el borrador de"} "${tipoLabel.toLowerCase()}": "${body.titulo}"${estadoBorrador ? ` (${estadoBorrador === "terminado" ? "terminado" : "en proceso"})` : ""}${esUltimaHora ? " (Última hora)" : ""}`,
         }));
 
+        ctx.waitUntil(indexarArticuloBusqueda(env, filaArticuloCreado.id));
         return json({ ok: true, slug, publicado, fuera_calendario: fueraCalendario, estado_borrador: estadoBorrador, programado_para: programadoPara, fecha_preferencia_desde: preferenciaFechas.desde, fecha_preferencia_hasta: preferenciaFechas.hasta, avisos_traduccion: avisosTraduccion });
       }
 
@@ -16197,6 +16279,7 @@ async function handlePrimary(request, env, ctx) {
           // Aviso a los buscadores (IndexNow) en el mismo momento de publicar.
           ctx.waitUntil(notificarIndexNow(env, [urlNoticia(categoriaFinal, slug)]));
         }
+        ctx.waitUntil(indexarArticuloBusqueda(env, id));
         return json({ ok: true, slug, publicado: body.publicado === false ? 0 : 1, fuera_calendario: fueraCalendario, estado_borrador: estadoBorrador, programado_para: programadoPara, fecha_preferencia_desde: preferenciaFechas.desde, fecha_preferencia_hasta: preferenciaFechas.hasta, avisos_traduccion: avisosTraduccion });
       }
 
@@ -16222,6 +16305,7 @@ async function handlePrimary(request, env, ctx) {
           return json({ error: "No puedes eliminar esta noticia porque no es tuya. Solicita permiso al autor o a un administrador." }, 403);
         }
         await env.DB.prepare("DELETE FROM articles WHERE id = ?").bind(id).run();
+        ctx.waitUntil(eliminarArticuloBusqueda(env, id));
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "eliminar_articulo", entidad: "articulo", entidad_id: id,
           descripcion: `Ha eliminado la noticia/crónica "${articuloBorrado ? articuloBorrado.titulo : id}"`,
