@@ -5486,28 +5486,21 @@ async function construirProgresoNivel(env, usuario, conteoPrecalculado) {
 }
 
 // ---------- HORARIO DE PUBLICACIÓN (calendario editorial) ----------
-// Un admin define, para cada día de la semana, qué tipos de contenido
-// se pueden subir ese día (p. ej. "crónicas de la jornada anterior" de
+// El calendario de contenido (fijo, ver HORARIO_FIJO) define, para cada día
+// de la semana, qué tipos de contenido se pueden subir ese día (p. ej. "crónicas de la jornada anterior" de
 // viernes a miércoles, pero no el jueves). Lo ven todos los redactores en
 // Funcionalidades > Horario. Una noticia publicada un día en el que su
 // tipo NO está permitido queda marcada como "fuera de calendario"
 // (articles.fuera_calendario = 1): se publica igualmente en la web, pero
 // no se sube a redes sociales, así que el panel no ofrece "Compartir".
 //
-// Se guarda en settings (clave 'horario_publicacion') como
-//   {"activo": true, "dias": {"lunes": ["noticia","cronica_anterior"], ...}}
-// Por defecto (sin nada guardado) el horario está activo y lo que no esté
-// marcado cuenta como desactivado. Solo si un admin lo apaga (activo:false)
-// se puede subir cualquier tipo cualquier día y nada se marca como fuera de calendario.
+// Ya no se guarda en settings: está definido en código (HORARIO_FIJO).
 const DIAS_HORARIO = ["lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo"];
 const TIPOS_HORARIO = [
   { id: "noticia", etiqueta: "Noticias" },
   { id: "previa", etiqueta: "Previas" },
   { id: "cronica_actual", etiqueta: "Crónicas de la jornada en curso" },
   { id: "cronica_anterior", etiqueta: "Crónicas de la jornada anterior" },
-  { id: "analisis", etiqueta: "Análisis" },
-  { id: "opinion", etiqueta: "Opinión" },
-  { id: "entrevista", etiqueta: "Entrevistas" },
 ];
 const IDS_TIPOS_HORARIO = TIPOS_HORARIO.map((t) => t.id);
 const DIA_SEMANA_POR_INDICE = { Mon: "lunes", Tue: "martes", Wed: "miercoles", Thu: "jueves", Fri: "viernes", Sat: "sabado", Sun: "domingo" };
@@ -5522,23 +5515,26 @@ function hoyEnMadrid(ahora = new Date()) {
   return { dia: DIA_SEMANA_POR_INDICE[get("weekday")], ymd: `${get("year")}-${get("month")}-${get("day")}` };
 }
 
-function normalizarHorarioPublicacion(raw) {
-  const dias = {};
-  for (const dia of DIAS_HORARIO) {
-    const lista = raw && raw.dias && Array.isArray(raw.dias[dia]) ? raw.dias[dia] : [];
-    dias[dia] = IDS_TIPOS_HORARIO.filter((id) => lista.includes(id));
-  }
-  // Sin horario guardado (o ilegible) el horario está ACTIVO: todo lo que no
-  // esté marcado en la tabla cuenta como desactivado. Solo se desactiva si un
-  // admin lo apaga a propósito (raw.activo === false).
-  return { activo: raw ? raw.activo !== false : true, dias };
-}
+// El calendario es fijo (el mismo que se ve en Funcionalidades > Horario) y
+// ya no se edita desde el panel. Solo cuentan los tipos que son artículos:
+// noticias, previas y crónicas. El resto de bloques del calendario
+// (clasificación, matchdays, resultados, posts data, reels, comité
+// disciplinario) no son artículos y no se evalúan.
+const HORARIO_FIJO = {
+  activo: true,
+  dias: {
+    lunes: ["noticia", "cronica_actual", "cronica_anterior"],
+    martes: ["noticia", "cronica_actual", "cronica_anterior"],
+    miercoles: ["noticia"],
+    jueves: ["previa"],
+    viernes: ["previa"],
+    sabado: ["noticia", "cronica_actual", "cronica_anterior"],
+    domingo: ["noticia", "cronica_actual", "cronica_anterior"],
+  },
+};
 
 async function obtenerHorarioPublicacion(env) {
-  const row = await memoCorta("horario_publicacion", 30000, () => env.DB.prepare("SELECT value FROM settings WHERE key = 'horario_publicacion'").first());
-  let raw = null;
-  if (row) { try { raw = JSON.parse(row.value); } catch { raw = null; } }
-  return normalizarHorarioPublicacion(raw);
+  return HORARIO_FIJO;
 }
 
 // ¿La crónica es de una jornada que ya terminó? Se mira el rango de
@@ -12713,27 +12709,6 @@ async function handlePrimary(request, env, ctx) {
         return json({ ...horario, tipos: TIPOS_HORARIO, dias_semana: DIAS_HORARIO, hoy: hoyEnMadrid().dia });
       }
 
-      if (path === "/api/horario-publicacion" && method === "PUT") {
-        const payload = await requireAuth(request, env);
-        if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede modificar el horario de publicación" }, 403);
-        const body = await request.json();
-        if (!body || typeof body.dias !== "object" || body.dias === null || Array.isArray(body.dias)) {
-          return json({ error: "Falta el horario" }, 400);
-        }
-        const horario = normalizarHorarioPublicacion({ activo: body.activo === true, dias: body.dias });
-        await env.DB.prepare(
-          `INSERT INTO settings (key, value, updated_at) VALUES ('horario_publicacion', ?, datetime('now'))
-           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
-        ).bind(JSON.stringify(horario)).run();
-        invalidarCacheCorta("horario_publicacion");
-        ctx.waitUntil(registrarActividad(env, request, payload, {
-          accion: "editar_settings", entidad: "settings",
-          descripcion: `Ha ${horario.activo ? "actualizado" : "desactivado"} el horario de publicación`,
-        }));
-        return json({ ok: true, ...horario });
-      }
-
       // ---------- AUTORES (cualquier usuario logueado) ----------
       // Lista ligera (solo id + nombre) de redactores/admins activos, para
       // poder elegir "quién ha hecho la noticia" al crear o editar una
@@ -15169,7 +15144,7 @@ async function handlePrimary(request, env, ctx) {
             return { filas: results, info: null };
           }
           const vacio = { q: busqueda, intento: 0, modo: "and", corregido: null, expr: null, extractos: {}, facetas: null };
-          if (!planBusqueda.terminos.length) return { filas: [], info: vacio };
+          if (planBusqueda.vacio) return { filas: [], info: vacio };
           const pedido = parseInt(url.searchParams.get("intento"), 10);
           const fijo = Number.isInteger(pedido) && pedido >= 0 && pedido <= 2;
           for (let intento = fijo ? pedido : 0; intento <= 2; intento++) {

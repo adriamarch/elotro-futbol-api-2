@@ -16,7 +16,7 @@
 //    Damerau-Levenshtein. Solo se aplica si la consulta original no da
 //    resultados, para no "corregir" palabras válidas.
 
-const KV_VOCAB = "busqueda:vocab:v1";
+const KV_VOCAB = "busqueda:vocab:v2"; // v2: ya sin palabras de borradores
 const MARCA_INI = "\u27E6"; // ⟦  (resaltado: se sustituye por <mark> tras escapar)
 const MARCA_FIN = "\u27E7"; // ⟧
 const FLAG_BACKFILL = "busqueda_backfill_completo";
@@ -34,13 +34,25 @@ export function esRailway(env) {
 
 // ---------- Normalización y términos ----------
 
+// Caracteres que el tokenizador de FTS5 (y NFD) NO descomponen: sin esto,
+// "Ødegaard", "Łukasz", "Çalhanoğlu" (ı sin punto) o "Großkreutz" no se
+// encuentran escribiéndolos sin esos signos. Se aplica igual al indexar y al
+// consultar para que ambos lados coincidan. ª y º (2ª RFEF, 1º) se descartan.
+const PLEGADO_ESPECIAL = { "ß": "ss", "æ": "ae", "œ": "oe", "ø": "o", "ł": "l", "đ": "d", "ð": "d", "þ": "th", "ı": "i", "ħ": "h", "ª": "", "º": "" };
+export function plegarEspeciales(s) {
+  return String(s ?? "").replace(/[ßæœøłđðþıħªºÆŒØŁĐÐÞĦ]/g, (c) => {
+    const l = c.toLowerCase();
+    const r = PLEGADO_ESPECIAL[l] ?? c;
+    return c === l ? r : r.charAt(0).toUpperCase() + r.slice(1);
+  });
+}
+
 // Minúsculas, sin tildes (ñ -> n, ç -> c) y solo [a-z0-9]: lo mismo que hace
 // el tokenizador de FTS5 (remove_diacritics 2) y la configuración es_unaccent
 // de Postgres, y a la vez lo que garantiza que el término es seguro dentro de
 // una expresión MATCH / tsquery (no hay comillas ni operadores posibles).
 export function normalizarTexto(s) {
-  return String(s ?? "")
-    .toLowerCase()
+  return plegarEspeciales(String(s ?? "").toLowerCase())
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .replace(/[^a-z0-9]+/g, " ")
@@ -59,6 +71,38 @@ export function terminosConsulta(q) {
     if (out.length >= 6) break;
   }
   return out;
+}
+
+// Sintaxis admitida además de las palabras sueltas:
+//   "real madrid"   frase exacta (palabras seguidas y en orden)
+//   -fichaje        excluye los artículos que contienen esa palabra
+//   2-1, 0-0, 20:30 marcadores y horas: se buscan como frase ("2 1")
+// Devuelve { terminos, frases, excluidos, vacio }.
+export function analizarConsulta(q) {
+  let resto = String(q ?? "").slice(0, 160);
+  const frases = [];
+  const excluidos = [];
+  resto = resto.replace(/["“”«»]([^"“”«»]{2,100})["“”«»]/g, (_, f) => {
+    const toks = normalizarTexto(f).split(" ").filter(Boolean);
+    if (toks.length >= 2) { if (frases.length < 3) frases.push(toks.slice(0, 8)); return " "; }
+    return ` ${f} `;
+  });
+  resto = resto.replace(/(^|\s)[-\u2212\u2013]([^\s"“”«»\-\u2212\u2013][^\s]*)/g, (_, pre, palabra) => {
+    const t = normalizarTexto(palabra).split(" ")[0] || "";
+    if (t.length >= 2 && !STOPWORDS.has(t) && excluidos.length < 3 && !excluidos.includes(t)) excluidos.push(t);
+    return pre;
+  });
+  resto = resto.replace(/(^|[^\d])(\d{1,2})\s*[-\u2013\u2014:]\s*(\d{1,2})(?!\d)/g, (_, pre, a, b) => {
+    if (frases.length < 3) frases.push([a, b]);
+    return `${pre} `;
+  });
+  let terminos = terminosConsulta(resto);
+  if (!terminos.length && !frases.length) {
+    // Solo palabras vacías ("el", "de la"): mejor buscarlas tal cual que no dar nada.
+    const vistos = new Set();
+    terminos = normalizarTexto(resto).split(" ").filter((t) => t.length >= 2 && !vistos.has(t) && vistos.add(t)).slice(0, 3);
+  }
+  return { terminos, frases, excluidos, vacio: !terminos.length && !frases.length };
 }
 
 export function textoPlanoDeHtml(html) {
@@ -162,27 +206,95 @@ export function corregirTerminos(terminos, vocab) {
 
 // ---------- Expresiones de consulta ----------
 
-// FTS5: ("valladolid"* OR "valadolid"*) AND "lugo"*. Los términos ya son
-// [a-z0-9], así que las comillas son seguras. Prefijo solo con 3+ letras.
-export function construirMatchSqlite(items, modo) {
-  const frag = (it) => {
-    const partes = [it.t, ...it.alts].map((a) => `"${a}"${a.length >= 3 ? "*" : ""}`);
-    return partes.length > 1 ? `(${partes.join(" OR ")})` : partes[0];
-  };
-  return items.map(frag).join(modo === "or" ? " OR " : " AND ");
+// Grupos de palabras equivalentes (en ambos sentidos): apodos de clubes y la
+// doble forma "RFEF" / "Federación" de las categorías. Se amplían a mano.
+const GRUPOS_SINONIMOS = [
+  ["barca", "barcelona"],
+  ["atleti", "atletico"],
+  ["depor", "deportivo"],
+  ["rfef", "federacion"],
+];
+const SINONIMOS = new Map();
+for (const g of GRUPOS_SINONIMOS) for (const w of g) SINONIMOS.set(w, g.filter((x) => x !== w));
+
+function conSinonimos(items) {
+  return items.map((it) => {
+    const alts = [];
+    for (const w of [it.t, ...it.alts]) {
+      if (!alts.includes(w) && w !== it.t) alts.push(w);
+      for (const sin of SINONIMOS.get(w) || []) if (sin !== it.t && !alts.includes(sin)) alts.push(sin);
+    }
+    return { t: it.t, alts };
+  });
 }
 
-// tsquery: (valladolid:* | valadolid:*) & lugo:*
-export function construirTsquery(items, modo) {
+function excluidosConSinonimos(excluidos) {
+  const out = [];
+  for (const w of excluidos || []) for (const x of [w, ...(SINONIMOS.get(w) || [])]) if (!out.includes(x)) out.push(x);
+  return out;
+}
+
+// Singular probable de un plural español (solo FTS5, que no tiene stemmer;
+// Postgres ya lo hace con su configuración española): goles -> gol,
+// jugadores -> jugador, equipos -> equipo, jueces -> juez. Como las formas
+// largas se buscan por prefijo, "jugador"* ya cubre jugador y jugadores.
+function singularProbable(t) {
+  let s = null;
+  if (t.length >= 6 && t.endsWith("ces")) s = t.slice(0, -3) + "z";
+  else if (t.length >= 5 && t.endsWith("es") && !/[aeiou]/.test(t[t.length - 3])) s = t.slice(0, -2);
+  else if (t.length >= 4 && t.endsWith("s") && !t.endsWith("ss")) s = t.slice(0, -1);
+  return s && s.length >= 3 && s !== t ? s : null;
+}
+
+// FTS5: (\"valladolid\"* OR \"valadolid\"*) AND \"lugo\"* AND \"2 1\" NOT (\"fichaje\").
+// Los términos ya son [a-z0-9], así que las comillas son seguras. Prefijo solo
+// con 3+ letras (y las raíces de 3 letras, exactas, para que \"goles\" encuentre
+// \"gol\" sin traer \"golpe\").
+export function construirMatchSqlite(items, modo, extra = {}) {
+  const frag = (it) => {
+    const partes = [it.t, ...it.alts].map((a) => `"${a}"${a.length >= 3 ? "*" : ""}`);
+    for (const w of [it.t, ...it.alts]) {
+      const sing = singularProbable(w);
+      if (sing) partes.push(`"${sing}"${sing.length >= 4 ? "*" : ""}`);
+    }
+    const unicas = [...new Set(partes)];
+    return unicas.length > 1 ? `(${unicas.join(" OR ")})` : unicas[0];
+  };
+  const fraseFts = (toks) => {
+    const ult = toks[toks.length - 1];
+    return `"${toks.join(" ")}"${ult.length >= 3 ? "*" : ""}`;
+  };
+  const piezas = [...items.map(frag), ...(extra.frases || []).map(fraseFts)];
+  if (!piezas.length) return "";
+  let expr = piezas.join(modo === "or" ? " OR " : " AND ");
+  const ex = excluidosConSinonimos(extra.excluidos);
+  if (ex.length) expr = `(${expr}) NOT (${ex.map((x) => `"${x}"`).join(" OR ")})`;
+  return expr;
+}
+
+// tsquery: (valladolid:* | valadolid:*) & lugo:* & (real <-> madrid) & !(fichaje)
+export function construirTsquery(items, modo, extra = {}) {
   const frag = (it) => {
     const partes = [it.t, ...it.alts].map((a) => `${a}${a.length >= 3 ? ":*" : ""}`);
     return partes.length > 1 ? `(${partes.join(" | ")})` : partes[0];
   };
-  return items.map(frag).join(modo === "or" ? " | " : " & ");
+  const fraseTs = (toks) => {
+    const ult = toks[toks.length - 1];
+    const cola = `${ult}${ult.length >= 3 ? ":*" : ""}`;
+    return `(${[...toks.slice(0, -1), cola].join(" <-> ")})`;
+  };
+  const piezas = [...items.map(frag), ...(extra.frases || []).map(fraseTs)];
+  if (!piezas.length) return "";
+  let expr = piezas.join(modo === "or" ? " | " : " & ");
+  const ex = excluidosConSinonimos(extra.excluidos);
+  if (ex.length) expr = `(${expr}) & !(${ex.join(" | ")})`;
+  return expr;
 }
 
-function construirExpresion(env, items, modo) {
-  return esRailway(env) ? construirTsquery(items, modo) : construirMatchSqlite(items, modo);
+function construirExpresion(env, plan, items, modo) {
+  const extra = { frases: plan.frases || [], excluidos: plan.excluidos || [] };
+  const conSin = conSinonimos(items);
+  return esRailway(env) ? construirTsquery(conSin, modo, extra) : construirMatchSqlite(conSin, modo, extra);
 }
 
 // ---------- Disponibilidad ----------
@@ -261,19 +373,20 @@ async function cargarVocabulario(env) {
 //   0  términos tal cual, todos obligatorios (AND)
 //   1  con correcciones de erratas, AND           (solo si hay algo que corregir)
 //   2  cualquier término (OR), ordenado por relevancia (solo con 2+ términos)
+// Las frases entre comillas y las exclusiones (-palabra) valen en los tres.
 export function planificarBusqueda(q, { corregir = true } = {}) {
-  const terminos = terminosConsulta(q);
-  return { terminos, corregir, items: terminos.map((t) => ({ t, alts: [] })), _corr: null };
+  const { terminos, frases, excluidos, vacio } = analizarConsulta(q);
+  return { terminos, frases, excluidos, vacio, corregir, items: terminos.map((t) => ({ t, alts: [] })), _corr: null };
 }
 
 export async function expresionParaIntento(env, plan, intento) {
-  if (!plan.terminos.length) return null;
+  if (plan.vacio) return null;
   if (intento === 0) {
-    return { intento: 0, modo: "and", expr: construirExpresion(env, plan.items, "and"), corregido: null };
+    return { intento: 0, modo: "and", expr: construirExpresion(env, plan, plan.items, "and"), corregido: null };
   }
   let items = plan.items;
   let sugerencia = null;
-  if (plan.corregir) {
+  if (plan.corregir && plan.terminos.length) {
     if (!plan._corr) {
       try { plan._corr = corregirTerminos(plan.terminos, await cargarVocabulario(env)); }
       catch (err) { console.error("[busqueda] vocabulario no disponible:", err?.message); plan._corr = { items: plan.items, cambiado: false, sugerencia: null }; }
@@ -284,11 +397,11 @@ export async function expresionParaIntento(env, plan, intento) {
   const hayCorreccion = !!sugerencia;
   if (intento === 1) {
     if (!hayCorreccion) return null; // nada que corregir: se salta al siguiente
-    return { intento: 1, modo: "and", expr: construirExpresion(env, items, "and"), corregido: sugerencia };
+    return { intento: 1, modo: "and", expr: construirExpresion(env, plan, items, "and"), corregido: sugerencia };
   }
   if (intento === 2) {
-    if (plan.terminos.length < 2) return null;
-    return { intento: 2, modo: "or", expr: construirExpresion(env, items, "or"), corregido: sugerencia };
+    if (plan.terminos.length + plan.frases.length < 2) return null;
+    return { intento: 2, modo: "or", expr: construirExpresion(env, plan, items, "or"), corregido: sugerencia };
   }
   return null;
 }
@@ -385,7 +498,7 @@ export async function indexarArticuloBusqueda(env, id) {
   if (esRailway(env)) return { omitido: true };
   try {
     const a = await env.DB.prepare(
-      `SELECT id, titulo, subtitulo, contenido, club, autor_nombre, coautor_nombre, updated_at,
+      `SELECT id, titulo, subtitulo, contenido, club, autor_nombre, coautor_nombre, updated_at, publicado,
               titulo_eu, subtitulo_eu, titulo_ca, subtitulo_ca, titulo_gl, subtitulo_gl, titulo_en, subtitulo_en
        FROM articles WHERE id = ?`
     ).bind(id).first();
@@ -396,14 +509,17 @@ export async function indexarArticuloBusqueda(env, id) {
     const extra = [a.titulo_eu, a.subtitulo_eu, a.titulo_ca, a.subtitulo_ca, a.titulo_gl, a.subtitulo_gl, a.titulo_en, a.subtitulo_en]
       .filter(Boolean).join(" ");
     const cuerpo = textoPlanoDeHtml(a.contenido);
+    const pl = plegarEspeciales;
 
     const stmts = [
       env.DB.prepare("DELETE FROM articles_fts WHERE rowid = ?").bind(a.id),
       env.DB.prepare(
         "INSERT INTO articles_fts (rowid, titulo, subtitulo, club, autor, extra, cuerpo, actualizado) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-      ).bind(a.id, a.titulo || "", a.subtitulo || "", club, autor, extra, cuerpo, a.updated_at ?? null),
+      ).bind(a.id, pl(a.titulo || ""), pl(a.subtitulo || ""), pl(club), pl(autor), pl(extra), pl(cuerpo), a.updated_at ?? null),
     ];
-    for (const t of tokensVocabulario([a.titulo, a.subtitulo, club, autor])) {
+    // El vocabulario de erratas solo sale de artículos publicados: si no, una
+    // palabra de un borrador podría asomar como "Mostrando resultados para…".
+    for (const t of a.publicado ? tokensVocabulario([a.titulo, a.subtitulo, club, autor]) : []) {
       stmts.push(env.DB.prepare(
         "INSERT INTO busqueda_vocab (term, n) VALUES (?, 1) ON CONFLICT(term) DO UPDATE SET n = MIN(n + 1, 1000)"
       ).bind(t));
