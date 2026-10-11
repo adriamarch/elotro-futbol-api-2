@@ -2680,6 +2680,81 @@ async function limiteExcedido(request, env, accion, max, ventanaSeg, extra = "")
   }
 }
 
+// ---------- Alertas de incidencias (Discord) ----------
+// Si la variable/secreto ALERT_WEBHOOK_URL contiene la URL de un webhook de
+// Discord, aquí se avisa de: el principal respondiendo 5xx o lanzando una
+// excepción (failover a Railway) y fallos del cron. Sin esa variable no hace
+// nada (el sitio funciona igual). Antirrepetición: la misma clave solo avisa
+// una vez cada 15 min (memoria del isolate + KV si existe), para no inundar
+// el canal durante una caída que genera miles de errores.
+const ALERTAS_ULTIMO_AVISO = new Map();
+async function enviarAlerta(env, clave, titulo, detalle) {
+  try {
+    const url = env && env.ALERT_WEBHOOK_URL;
+    if (!url) return;
+    const ahora = Date.now();
+    if (ahora - (ALERTAS_ULTIMO_AVISO.get(clave) || 0) < 15 * 60 * 1000) return;
+    ALERTAS_ULTIMO_AVISO.set(clave, ahora);
+    if (env.ELOTROFUTBOL_KV) {
+      const k = `alerta:${clave}`;
+      if (await env.ELOTROFUTBOL_KV.get(k)) return;
+      await env.ELOTROFUTBOL_KV.put(k, "1", { expirationTtl: 900 });
+    }
+    const texto = `🚨 **${titulo}**\n${String(detalle ?? "").slice(0, 1500)}`;
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: texto.slice(0, 1900) }),
+    });
+  } catch {
+    /* una alerta que falla nunca debe tumbar la petición ni el cron */
+  }
+}
+
+// Envuelve ctx para que cualquier tarea del cron que termine rechazada
+// (excepción no controlada) genere una alerta además del log.
+function ctxConAlertas(ctx, env, origen) {
+  return {
+    waitUntil(promesa) {
+      ctx.waitUntil(
+        Promise.resolve(promesa).catch((err) => {
+          console.error(`[${origen}] tarea fallida:`, err);
+          const msg = err && err.message ? String(err.message) : "error";
+          return enviarAlerta(env, `${origen}:${msg.slice(0, 60)}`, `Fallo en ${origen}`, err && err.stack ? err.stack : String(err));
+        })
+      );
+    },
+    passThroughOnException() {
+      if (ctx.passThroughOnException) ctx.passThroughOnException();
+    },
+  };
+}
+
+// ---------- Antispam: Cloudflare Turnstile ----------
+// Si el secreto TURNSTILE_SECRET_KEY está configurado, los formularios públicos
+// sin sesión (comentarios de visitantes, registro de lectores y contacto)
+// exigen un token válido en el campo "turnstileToken". Sin secreto no se
+// comprueba nada (despliegue gradual: ver public/js/turnstile.js).
+async function verificarTurnstile(request, env, token) {
+  const secreto = env && env.TURNSTILE_SECRET_KEY;
+  if (!secreto) return true;
+  if (!token || typeof token !== "string" || token.length > 2048) return false;
+  try {
+    const datos = new FormData();
+    datos.append("secret", secreto);
+    datos.append("response", token);
+    const ip = request.headers.get("CF-Connecting-IP");
+    if (ip) datos.append("remoteip", ip);
+    const r = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", { method: "POST", body: datos });
+    const j = await r.json();
+    return !!(j && j.success);
+  } catch {
+    // Si Cloudflare no responde no se bloquea a gente real; los límites por IP siguen activos.
+    return true;
+  }
+}
+const RESPUESTA_TURNSTILE = "No hemos podido verificar que eres una persona. Recarga la página e inténtalo de nuevo.";
+
 // ---------- FORMULARIOS (constructor de formularios públicos) ----------
 // Sección "Formularios" del panel (Solicitudes > Formularios). El formulario de
 // acreditaciones es un formulario ya creado con su propio sistema (arriba: PIN,
@@ -9521,6 +9596,7 @@ export default {
       const email = (body && body.email ? String(body.email) : "").trim().toLowerCase();
       const medio = (body && body.medio ? String(body.medio) : "").trim().slice(0, 200);
       const mensaje = (body && body.mensaje ? String(body.mensaje) : "").trim().slice(0, 5000);
+      if (!(await verificarTurnstile(request, env, body && body.turnstileToken))) return json({ error: RESPUESTA_TURNSTILE }, 400);
 
       if (!nombre) return json({ error: "Indica tu nombre" }, 400);
       if (!emailValido(email)) return json({ error: "Introduce un email válido" }, 400);
@@ -9715,6 +9791,7 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
         `[FAILOVER] Principal respondió ${primaryResponse.status}. ` +
         `Activando Railway. Body: ${cuerpoErrorPrimario}`
       );
+      ctx.waitUntil(enviarAlerta(env, `failover:${primaryResponse.status}`, `El principal respondió ${primaryResponse.status} (activando Railway)`, `${method} ${path}\n${String(cuerpoErrorPrimario).slice(0, 800)}`));
 
       return await fetchRailway(
         requestParaFailover,
@@ -9738,6 +9815,7 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
         "[FAILOVER] Error en backend principal:",
         primaryError
       );
+      ctx.waitUntil(enviarAlerta(env, "failover:excepcion", "El principal lanzó una excepción (activando Railway)", `${method} ${path}\n${primaryError && primaryError.stack ? primaryError.stack : String(primaryError)}`));
 
       if (esSubidaDeArchivo) {
         return json({
@@ -9761,6 +9839,7 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
   // llegado y, si es así, la publica sola sin que nadie tenga que entrar
   // al panel a esa hora.
   async scheduled(event, env, ctx) {
+    ctx = ctxConAlertas(ctx, env, "cron");
     ctx.waitUntil(publicarArticulosProgramados(env));
     // Red de seguridad del índice de búsqueda (src/busqueda.js): cada 5 min
     // mientras haya backfill pendiente; después, una vez por hora.
@@ -11144,6 +11223,7 @@ async function handlePrimary(request, env, ctx) {
         const body = await request.json().catch(() => ({}));
         const nombre = normalizarTexto(body.nombre);
         const email = normalizarTexto(body.email)?.toLowerCase() || null;
+        if (!(await verificarTurnstile(request, env, body.turnstileToken))) return json({ error: RESPUESTA_TURNSTILE }, 400);
         const password = typeof body.password === "string" ? body.password : "";
 
         if (!nombre) return json({ error: "Falta tu nombre" }, 400);
@@ -17431,6 +17511,7 @@ async function handlePrimary(request, env, ctx) {
         if (!readerId) {
           nombre = normalizarTexto(body.nombre);
           email = normalizarTexto(body.email);
+          if (!(await verificarTurnstile(request, env, body.turnstileToken))) return json({ error: RESPUESTA_TURNSTILE }, 400);
         }
 
         const texto = normalizarTexto(body.texto);
