@@ -3711,6 +3711,14 @@ function sanearHtmlArticulo(html) {
 // abierta indefinidamente para una sesión revocada de verdad.
 const TOLERANCIA_SESION_NO_REPLICADA_SEGUNDOS = 5 * 60;
 
+// ¿Sigue existiendo la cuenta? Se usa en requireAuth cuando la fila de la
+// sesión no está (cuenta eliminada desde "Usuarios", réplica con retraso...)
+// para no dar por buena una sesión de alguien que ya no existe.
+async function usuarioSigueExistiendo(env, uid) {
+  const fila = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(uid).first();
+  return !!fila;
+}
+
 async function requireAuth(request, env, url) {
   const auth = request.headers.get("Authorization") || "";
   let token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
@@ -3770,6 +3778,9 @@ async function requireAuth(request, env, url) {
       // replicación, no un salvoconducto permanente.
       const emitidoHaceSegundos = payload.iat ? Math.floor(Date.now() / 1000) - payload.iat : Infinity;
       if (emitidoHaceSegundos > TOLERANCIA_SESION_NO_REPLICADA_SEGUNDOS) return null;
+      // La tolerancia es solo para el hueco de replicación de una sesión que
+      // SÍ existe. Si la cuenta ha sido eliminada, la sesión se cierra ya.
+      if (!(await usuarioSigueExistiendo(env, payload.uid))) return null;
     } else {
       // No bloqueamos la respuesta por esto: es solo para que la lista de
       // "Mis sesiones" muestre cuándo se ha usado cada una por última vez.
@@ -3785,6 +3796,10 @@ async function requireAuth(request, env, url) {
         sesion.last_seen_at = new Date().toISOString().slice(0, 19).replace("T", " "); // evita repetir el UPDATE mientras la fila está en caché
       }
     }
+  } else if (!(await usuarioSigueExistiendo(env, payload.uid))) {
+    // JWT antiguo sin "sid": no hay fila de sesión que borrar, así que la
+    // única forma de cerrarlo al eliminar la cuenta es comprobar que existe.
+    return null;
   }
   return payload;
 }
@@ -15247,6 +15262,9 @@ async function handlePrimary(request, env, ctx) {
         await env.DB.prepare("DELETE FROM staff_push_subscriptions WHERE user_id = ?").bind(id).run();
         await env.DB.prepare("DELETE FROM staff_push_prefs WHERE user_id = ?").bind(id).run();
         await env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(id).run();
+        // La validación de sesión se cachea 20 s por isolate: se vacía para que la
+        // persona eliminada pierda el acceso en su siguiente petición.
+        invalidarCacheCorta("sesion:");
         // usuario_id es NOT NULL en nivel_historial: no se puede poner a
         // NULL, así que se borra su historial de cambios de nivel.
         await env.DB.prepare("DELETE FROM nivel_historial WHERE usuario_id = ?").bind(id).run();
