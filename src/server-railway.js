@@ -61,6 +61,14 @@ const env = {
   // BORRAR esta línea junto con ese endpoint una vez usado.
   PGPOOL: pool,
   JWT_SECRET: process.env.JWT_SECRET,
+  // Secreto de Cloudflare Turnstile (captcha de los formularios públicos). Mismo
+  // valor que el secret TURNSTILE_SECRET_KEY del worker principal. Sin él, el
+  // worker rechaza los envíos de formularios públicos durante un failover.
+  TURNSTILE_SECRET_KEY: process.env.TURNSTILE_SECRET_KEY,
+  // Webhook de Discord para alertas (ver enviarAlerta en src/index.js). Sin esta
+  // variable el servicio de Railway nunca avisa de sus propios fallos.
+  ALERT_WEBHOOK_URL: process.env.ALERT_WEBHOOK_URL,
+  TURNSTILE_DESACTIVADO: process.env.TURNSTILE_DESACTIVADO,
   RESEND_API_KEY: process.env.RESEND_API_KEY,
   RESEND_FROM: process.env.RESEND_FROM,
   // Cuenta secundaria de Resend (opcional): se usa solo cuando la principal

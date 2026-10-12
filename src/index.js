@@ -1857,6 +1857,116 @@ async function enviarEmailNotificacion(env, { asunto, texto, html }, { destinata
 }
 
 
+// ---------- Avisos por correo de comentarios ----------
+// A quien comenta con cuenta de lector VERIFICADA se le avisa por correo
+// cuando (1) la redacción aprueba su comentario y (2) se aprueba una
+// respuesta a un comentario suyo (la respuesta cuenta al publicarse, no al
+// enviarse). Nunca se avisa a: quien comentó sin cuenta (su email no está
+// verificado, sería un vector de spam hacia direcciones ajenas), quien se dio
+// de baja (readers.avisos_comentarios = 0), emails sintéticos del login con X
+// (no entregables) ni quien se responde a sí mismo. Cada aviso se "reclama" en
+// la BD ANTES de enviarse (aviso_aprobado / respuesta_avisada): aprobar dos
+// veces el mismo comentario no duplica el correo, y si el envío falla se
+// libera para poder reintentarlo.
+const DOMINIO_EMAIL_SINTETICO_X = "@x.elotrofutbol.media";
+
+function emailLectorEntregable(email) {
+  const e = String(email || "").trim().toLowerCase();
+  return emailAnuncioValido(e) && !e.endsWith(DOMINIO_EMAIL_SINTETICO_X);
+}
+
+// Enlace de baja de estos avisos: un token firmado (sin estado en la BD) que
+// vale 2 años y solo sirve para esto.
+async function enlaceBajaAvisosComentarios(env, readerId) {
+  const token = await createJWT({ rid: readerId, tipo: "baja-avisos-comentarios" }, env.JWT_SECRET, 60 * 60 * 24 * 730);
+  return `${API_URL}/api/comentarios/baja-avisos?token=${encodeURIComponent(token)}`;
+}
+
+function recortarTextoComentario(texto, max = 300) {
+  const t = String(texto || "").replace(/\s+/g, " ").trim();
+  return t.length > max ? t.slice(0, max - 1).trimEnd() + "…" : t;
+}
+
+// Lector al que SÍ se puede avisar, o null.
+async function lectorParaAvisoComentario(env, readerId) {
+  if (!readerId) return null;
+  const l = await env.DB.prepare(
+    "SELECT id, nombre, email, email_verificado, activo, avisos_comentarios FROM readers WHERE id = ?"
+  ).bind(readerId).first();
+  if (!l || !l.activo || !l.email_verificado || !l.avisos_comentarios) return null;
+  return emailLectorEntregable(l.email) ? l : null;
+}
+
+async function enviarAvisoComentario(env, lector, { tipo, autorNombre, texto, articulo, comentarioId }) {
+  const esRespuesta = tipo === "respuesta";
+  const quien = String(autorNombre || "Alguien").replace(/[\r\n]+/g, " ").trim().slice(0, 80) || "Alguien";
+  const enlace = `${urlNoticia(articulo.categoria, articulo.slug)}#comentario-${comentarioId}`;
+  const bajaUrl = await enlaceBajaAvisosComentarios(env, lector.id);
+  const asunto = esRespuesta ? `${quien} ha respondido a tu comentario` : "Tu comentario ya está publicado";
+  const intro = esRespuesta
+    ? `${quien} ha respondido a tu comentario en «${articulo.titulo}».`
+    : `Tu comentario en «${articulo.titulo}» ya está publicado.`;
+  const cita = recortarTextoComentario(texto);
+  const bloqueHtml =
+    `<p style="margin:0 0 14px;font-size:15px;line-height:1.6;color:#2a3140;">${escapeHtmlEmail(intro)}</p>` +
+    `<blockquote style="margin:0 0 6px;padding:12px 16px;border-left:3px solid #d1132e;background:#f4f6fa;font-size:15px;line-height:1.55;color:#2a3140;">${escapeHtmlEmail(cita)}</blockquote>`;
+  const pie = `Recibes este aviso porque tienes una cuenta de lector en ELOTROFÚTBOLTV. <a href="${escapeHtmlEmail(bajaUrl)}" style="color:#8a93a3;text-decoration:underline;">Dejar de recibir avisos de comentarios</a>.`;
+  const html = plantillaEmail({
+    etiqueta: "Comentarios",
+    titulo: asunto,
+    preheader: cita.slice(0, 110),
+    bloqueHtml,
+    boton: { texto: esRespuesta ? "Ver la respuesta" : "Ver mi comentario", url: escapeHtmlEmail(enlace) },
+    pieHtml: pie,
+  });
+  const textoPlano = `${intro}\n\n«${cita}»\n\n${enlace}\n\n— ELOTROFÚTBOLTV\nDejar de recibir estos avisos: ${bajaUrl}`;
+  return enviarEmailNotificacion(env, { asunto, texto: textoPlano, html }, { destinatario: lector.email });
+}
+
+// Se llama cuando un comentario pasa a "aprobado". Nunca lanza: un fallo
+// enviando correos no puede romper la moderación.
+async function avisarComentarioAprobado(env, comentarioId) {
+  try {
+    const c = await env.DB.prepare(
+      `SELECT c.id, c.nombre, c.texto, c.estado, c.oculto_por_denuncia, c.reader_id, c.parent_id, c.responde_a_id,
+              a.titulo AS articulo_titulo, a.slug AS articulo_slug, a.categoria AS articulo_categoria
+       FROM comments c JOIN articles a ON a.id = c.article_id
+       WHERE c.id = ?`
+    ).bind(comentarioId).first();
+    // Aprobado pero oculto por denuncias = no visible: todavía no se avisa.
+    if (!c || c.estado !== "aprobado" || c.oculto_por_denuncia) return;
+    const articulo = { titulo: c.articulo_titulo, slug: c.articulo_slug, categoria: c.articulo_categoria };
+
+    // 1) A quien escribió el comentario: ya está publicado.
+    const autor = await lectorParaAvisoComentario(env, c.reader_id);
+    if (autor) {
+      const r = await env.DB.prepare("UPDATE comments SET aviso_aprobado = 1 WHERE id = ? AND aviso_aprobado = 0").bind(c.id).run();
+      if (r.meta && r.meta.changes) {
+        const ok = await enviarAvisoComentario(env, autor, { tipo: "aprobado", autorNombre: c.nombre, texto: c.texto, articulo, comentarioId: c.id });
+        if (!ok) await env.DB.prepare("UPDATE comments SET aviso_aprobado = 0 WHERE id = ?").bind(c.id).run();
+      }
+    }
+
+    // 2) Si es una respuesta: a quien escribió el comentario contestado.
+    const objetivoId = c.responde_a_id || c.parent_id;
+    if (objetivoId) {
+      const objetivo = await env.DB.prepare("SELECT id, reader_id FROM comments WHERE id = ?").bind(objetivoId).first();
+      if (objetivo && objetivo.reader_id && Number(objetivo.reader_id) !== Number(c.reader_id || 0)) {
+        const destino = await lectorParaAvisoComentario(env, objetivo.reader_id);
+        if (destino) {
+          const r = await env.DB.prepare("UPDATE comments SET respuesta_avisada = 1 WHERE id = ? AND respuesta_avisada = 0").bind(c.id).run();
+          if (r.meta && r.meta.changes) {
+            const ok = await enviarAvisoComentario(env, destino, { tipo: "respuesta", autorNombre: c.nombre, texto: c.texto, articulo, comentarioId: c.id });
+            if (!ok) await env.DB.prepare("UPDATE comments SET respuesta_avisada = 0 WHERE id = ?").bind(c.id).run();
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.log("Error avisando de un comentario aprobado:", err && err.message);
+  }
+}
+
 // ---------- Anuncios por correo (panel de admin) ----------
 // Un admin escribe un anuncio y lo manda a colaboradores (admins, redactores,
 // fotógrafos) y/o a lectores (cuentas verificadas y/o suscriptores del
@@ -2731,27 +2841,53 @@ function ctxConAlertas(ctx, env, origen) {
 }
 
 // ---------- Antispam: Cloudflare Turnstile ----------
-// Si el secreto TURNSTILE_SECRET_KEY está configurado, los formularios públicos
-// sin sesión (comentarios de visitantes, registro de lectores y contacto)
-// exigen un token válido en el campo "turnstileToken". Sin secreto no se
-// comprueba nada (despliegue gradual: ver public/js/turnstile.js).
+// Los formularios públicos
+// sin sesión (comentarios de visitantes, registro de lectores, contacto, newsletter,
+// acreditaciones, formularios públicos y recuperación de contraseña) exigen un
+// token válido en "turnstileToken". Sin secreto NO se deja pasar (falla cerrado)
+// salvo que se ponga TURNSTILE_DESACTIVADO=1 como interruptor de emergencia.
 async function verificarTurnstile(request, env, token) {
   const secreto = env && env.TURNSTILE_SECRET_KEY;
-  if (!secreto) return true;
-  if (!token || typeof token !== "string" || token.length > 2048) return false;
-  try {
-    const datos = new FormData();
-    datos.append("secret", secreto);
-    datos.append("response", token);
-    const ip = request.headers.get("CF-Connecting-IP");
-    if (ip) datos.append("remoteip", ip);
-    const r = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", { method: "POST", body: datos });
-    const j = await r.json();
-    return !!(j && j.success);
-  } catch {
-    // Si Cloudflare no responde no se bloquea a gente real; los límites por IP siguen activos.
-    return true;
+  if (!secreto) {
+    // Interruptor de emergencia EXPLÍCITO (TURNSTILE_DESACTIVADO=1). Sin él, la
+    // ausencia del secreto ya no deja pasar a nadie: antes un bot podía saltarse
+    // el captcha simplemente porque faltara la variable en un worker (p. ej. en
+    // Railway durante un failover).
+    const off = env && env.TURNSTILE_DESACTIVADO;
+    if (off === true || off === 1 || off === "1" || off === "true") return true;
+    console.error("[turnstile] TURNSTILE_SECRET_KEY no configurado: se rechazan los envíos de formularios públicos");
+    request.__tsMotivo = "sin-secreto-en-servidor";
+    return false;
   }
+  if (!token || typeof token !== "string" || token.length > 2048) {
+    request.__tsMotivo = "sin-token-del-navegador";
+    return false;
+  }
+  // Hasta 2 intentos si Cloudflare no responde. Si sigue sin responder se
+  // rechaza el envío (antes se dejaba pasar, lo que permitía saltarse el captcha).
+  for (let intento = 0; intento < 2; intento++) {
+    try {
+      const datos = new FormData();
+      datos.append("secret", secreto);
+      datos.append("response", token);
+      // Sin "remoteip": es opcional y, si la página se cargó por IPv6 y la API por
+      // IPv4 (o al revés), la IP no coincide y se rechazaban visitantes reales.
+      const r = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+        method: "POST",
+        body: datos,
+        signal: AbortSignal.timeout(4000),
+      });
+      const j = await r.json();
+      if (j && j.success === true) return true;
+      request.__tsMotivo = "cloudflare:" + ((j && j["error-codes"] && j["error-codes"].join(",")) || "rechazado");
+      console.error("[turnstile] verificación rechazada:", request.__tsMotivo);
+      return false;
+    } catch (e) {
+      request.__tsMotivo = "cloudflare-no-responde";
+      if (intento === 1) console.error("[turnstile] siteverify no disponible:", e && e.message);
+    }
+  }
+  return false;
 }
 const RESPUESTA_TURNSTILE = "No hemos podido verificar que eres una persona. Recarga la página e inténtalo de nuevo.";
 
@@ -3587,7 +3723,7 @@ async function requireAuth(request, env, url) {
   const payload = await verifyJWT(token, env.JWT_SECRET);
   // "uid" obligatorio: un token de LECTOR (lleva "rid", no "uid") jamás debe
   // valer como sesión de redactor/admin.
-  if (!payload || !payload.uid) return null;
+  if (!payload || !payload.uid || sesionSinSegundoFactor(payload)) return null;
   // Además de que el JWT en sí sea válido, la sesión (fila en la tabla
   // "sessions") tiene que seguir existiendo y no estar revocada: así,
   // cerrar una sesión desde "Mis sesiones" la invalida al momento aunque
@@ -3675,7 +3811,7 @@ async function requireAuthTienda(request, env) {
   } catch {
     return null;
   }
-  if (!payload || !payload.uid) return null;
+  if (!payload || !payload.uid || sesionSinSegundoFactor(payload)) return null;
 
   try {
     if (payload.sid) {
@@ -3861,6 +3997,229 @@ function describirDispositivo(userAgent) {
   return `${navegador} en ${so}`;
 }
 
+// =====================================================================
+// VERIFICACIÓN EN DOS PASOS (TOTP, RFC 6238): OBLIGATORIA PARA ADMINISTRADORES, OPCIONAL PARA REDACTORES
+// =====================================================================
+// Los usuarios con un rol de ROLES_CON_2FA_OBLIGATORIO NO obtienen sesión solo con
+// usuario + contraseña: además deben tener configurada una app de
+// autenticación (Google Authenticator, Authy, Microsoft Authenticator...)
+// y escribir el código de 6 dígitos. Para hacerlo obligatorio en otro rol
+// basta con ponerlo en ROLES_CON_2FA_OBLIGATORIO; para que sea voluntario,
+// en ROLES_CON_2FA_OPCIONAL (más abajo).
+//
+// Flujo (ver /api/login y /api/login/2fa*):
+//   1) /api/login con contraseña correcta devuelve un "desafío" (JWT de
+//      10 min SIN "uid", así que no vale como sesión) y NO un token.
+//   2a) Con 2FA ya activo: /api/login/2fa {desafio, codigo} -> sesión.
+//   2b) Sin 2FA: /api/login/2fa/setup (genera el secreto) y
+//       /api/login/2fa/activar {desafio, codigo} -> sesión + 8 códigos de
+//       recuperación de un solo uso.
+// La sesión de un admin lleva "tfa: true" en el JWT; requireAuth (y las
+// variantes de subida/tienda) rechazan a un admin cuyo token no lo lleve,
+// así que las sesiones antiguas sin 2FA dejan de valer al desplegar.
+const ROLES_CON_2FA_OBLIGATORIO = ["admin"];
+// Roles que PUEDEN activar el 2FA por su cuenta (Ajustes de cuenta > Seguridad)
+// pero no están obligados: mientras no lo activen entran solo con contraseña,
+// como siempre; una vez activo, el login les pide el código igual que a un
+// admin. A diferencia de los admins, pueden desactivarlo (contraseña + código).
+// Su 2FA se configura ya con sesión (/api/me/2fa/*), nunca desde el desafío del
+// login: ese desafío solo les sirve para VERIFICAR un 2FA que ya tienen activo.
+// TODOS los colaboradores (cualquier rol válido que no sea de 2FA obligatorio:
+// redactor, fotógrafo y los que se añadan a ROLES_VALIDOS).
+const ROLES_CON_2FA_OPCIONAL = ROLES_VALIDOS.filter((r) => !ROLES_CON_2FA_OBLIGATORIO.includes(r));
+function sesionSinSegundoFactor(payload) {
+  return Boolean(payload) && ROLES_CON_2FA_OBLIGATORIO.includes(payload.rol) && payload.tfa !== true;
+}
+
+const BASE32_ALFABETO = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+function base32Codificar(bytes) {
+  let bits = 0, valor = 0, salida = "";
+  for (const b of bytes) {
+    valor = (valor << 8) | b;
+    bits += 8;
+    while (bits >= 5) {
+      salida += BASE32_ALFABETO[(valor >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) salida += BASE32_ALFABETO[(valor << (5 - bits)) & 31];
+  return salida;
+}
+function base32Decodificar(texto) {
+  const limpio = String(texto || "").toUpperCase().replace(/[^A-Z2-7]/g, "");
+  let bits = 0, valor = 0;
+  const bytes = [];
+  for (const c of limpio) {
+    valor = (valor << 5) | BASE32_ALFABETO.indexOf(c);
+    bits += 5;
+    if (bits >= 8) {
+      bytes.push((valor >>> (bits - 8)) & 255);
+      bits -= 8;
+    }
+  }
+  return new Uint8Array(bytes);
+}
+function generarSecretoTotp() {
+  return base32Codificar(crypto.getRandomValues(new Uint8Array(20)));
+}
+function construirOtpauth(username, secreto) {
+  const emisor = "ElOtroFutbol";
+  return `otpauth://totp/${encodeURIComponent(emisor)}:${encodeURIComponent(username)}?secret=${secreto}&issuer=${encodeURIComponent(emisor)}&algorithm=SHA1&digits=6&period=30`;
+}
+async function totpCodigo(secretoBytes, paso) {
+  const clave = await crypto.subtle.importKey("raw", secretoBytes, { name: "HMAC", hash: "SHA-1" }, false, ["sign"]);
+  const contador = new Uint8Array(8);
+  let resto = paso;
+  for (let i = 7; i >= 0; i--) { contador[i] = resto & 255; resto = Math.floor(resto / 256); }
+  const h = new Uint8Array(await crypto.subtle.sign("HMAC", clave, contador));
+  const o = h[h.length - 1] & 15;
+  const n = ((h[o] & 127) << 24) | (h[o + 1] << 16) | (h[o + 2] << 8) | h[o + 3];
+  return String(n % 1000000).padStart(6, "0");
+}
+// Devuelve el "paso" de 30 s que ha validado el código (admite ±1 paso por
+// desfase de reloj), o null. Un código ya usado (paso <= ultimoPaso) se
+// rechaza, para que no se pueda reutilizar uno espiado.
+async function totpVerificar(secretoBase32, codigo, ultimoPaso) {
+  const limpio = String(codigo || "").replace(/\s/g, "");
+  if (!/^\d{6}$/.test(limpio)) return null;
+  const secreto = base32Decodificar(secretoBase32);
+  if (!secreto.length) return null;
+  const actual = Math.floor(Date.now() / 30000);
+  for (const delta of [0, -1, 1]) {
+    const paso = actual + delta;
+    if (ultimoPaso != null && paso <= Number(ultimoPaso)) continue;
+    if (comparacionConstante(await totpCodigo(secreto, paso), limpio)) return paso;
+  }
+  return null;
+}
+// El secreto TOTP se guarda cifrado (AES-GCM) con una clave derivada de
+// JWT_SECRET, que ya debe ser idéntico en el Worker principal y el
+// secundario: así una fuga de la base de datos sola no regala los secretos.
+async function claveCifradoTotp(env) {
+  const base = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("eof-totp-v1:" + env.JWT_SECRET));
+  return crypto.subtle.importKey("raw", base, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+}
+async function cifrarSecretoTotp(env, texto) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const cifrado = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await claveCifradoTotp(env), new TextEncoder().encode(texto)));
+  const junto = new Uint8Array(iv.length + cifrado.length);
+  junto.set(iv, 0); junto.set(cifrado, iv.length);
+  return "v1:" + btoa(String.fromCharCode(...junto));
+}
+async function descifrarSecretoTotp(env, guardado) {
+  try {
+    if (typeof guardado !== "string" || !guardado.startsWith("v1:")) return null;
+    const junto = Uint8Array.from(atob(guardado.slice(3)), (c) => c.charCodeAt(0));
+    const claro = await crypto.subtle.decrypt({ name: "AES-GCM", iv: junto.slice(0, 12) }, await claveCifradoTotp(env), junto.slice(12));
+    return new TextDecoder().decode(claro);
+  } catch {
+    return null;
+  }
+}
+// Códigos de recuperación (por si se pierde el móvil): 8 códigos de un solo
+// uso. En la base de datos solo se guarda su hash.
+function generarCodigosRecuperacion(cantidad = 8) {
+  const alfabeto = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // 32 símbolos, sin 0/O/1/I
+  const codigos = [];
+  for (let i = 0; i < cantidad; i++) {
+    const r = crypto.getRandomValues(new Uint8Array(10));
+    const c = [...r].map((b) => alfabeto[b % 32]).join("");
+    codigos.push(`${c.slice(0, 5)}-${c.slice(5)}`);
+  }
+  return codigos;
+}
+function normalizarCodigoRecuperacion(texto) {
+  return String(texto || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+async function hashCodigoRecuperacion(codigo) {
+  return sha256Texto("eof-rec:" + normalizarCodigoRecuperacion(codigo));
+}
+// ---------- Auto-reparación del esquema del 2FA ----------
+// El 2FA necesita 4 columnas en "users" (ver worker/migracion_2fa_admins.sql).
+// Si el código se despliega SIN haber ejecutado esa migración en la base de
+// datos, /api/login seguía funcionando (SELECT * no falla por una columna que
+// falta; solo llega totp_activo = undefined, así que el admin es enviado a
+// "configurar 2FA") pero /api/login/2fa/setup reventaba con "no such column:
+// totp_secret" (500). Peor aún: ese 500 activa el failover a Railway, y si
+// Railway tampoco responde bien la respuesta final llegaba sin CORS, así que
+// el navegador solo mostraba un "blocked by CORS policy" que ocultaba la causa.
+// Esto comprueba UNA vez por isolate/proceso que las columnas existen y, si
+// faltan, las crea (idempotente: un "duplicate column" se ignora).
+let _columnas2faListas = null;
+async function asegurarColumnas2fa(env) {
+  if (_columnas2faListas) return _columnas2faListas;
+  _columnas2faListas = (async () => {
+    try {
+      await env.DB.prepare("SELECT totp_secret, totp_activo, totp_ultimo_paso, totp_recovery FROM users LIMIT 1").first();
+      return true;
+    } catch (err) {
+      // D1/SQLite: "no such column: ..." · PostgreSQL: 'column "..." does not exist'
+      if (!/no such column|does not exist|undefined column/i.test(String((err && err.message) || err))) throw err;
+    }
+    console.warn("[2FA] Faltan las columnas totp_* en users: se crean ahora (migración automática).");
+    const tipoPaso = env.PGPOOL ? "BIGINT" : "INTEGER";
+    const sentencias = [
+      "ALTER TABLE users ADD COLUMN totp_secret TEXT",
+      "ALTER TABLE users ADD COLUMN totp_activo INTEGER NOT NULL DEFAULT 0",
+      `ALTER TABLE users ADD COLUMN totp_ultimo_paso ${tipoPaso}`,
+      "ALTER TABLE users ADD COLUMN totp_recovery TEXT",
+    ];
+    for (const sql of sentencias) {
+      try {
+        await env.DB.prepare(sql).run();
+      } catch (err) {
+        // Otra petición (u otro backend) pudo crearla justo antes: no es un fallo.
+        if (!/duplicate column|already exists/i.test(String((err && err.message) || err))) throw err;
+      }
+    }
+    return true;
+  })().catch((err) => {
+    _columnas2faListas = null; // que la próxima petición vuelva a intentarlo
+    throw err;
+  });
+  return _columnas2faListas;
+}
+async function crearDesafio2fa(env, user) {
+  // Sin "uid" ni "sid": requireAuth lo rechaza, no sirve como sesión.
+  return createJWT({ fa2: user.id }, env.JWT_SECRET, 10 * 60);
+}
+async function leerDesafio2fa(env, token) {
+  const p = await verifyJWT(token, env.JWT_SECRET);
+  if (!p || !p.fa2 || p.uid || p.rid) return null;
+  return p;
+}
+// ---------- Dispositivos de confianza: el 2FA solo se pide en dispositivos NUEVOS ----------
+// Tras superar el 2FA (con la casilla "Confiar en este dispositivo" marcada, que es lo
+// habitual) el servidor devuelve un "token de dispositivo" firmado que el navegador guarda.
+// En los siguientes /api/login de esa persona, si la contraseña es correcta Y llega ese
+// token, no se pide el código: se abre sesión directamente (con tfa: true, así que los
+// admins siguen cumpliendo su 2FA obligatorio). Un dispositivo nuevo, o un navegador sin
+// el token (otro equipo, datos borrados, modo incógnito), sigue pasando por el 2FA.
+//
+// Sin tabla ni columnas nuevas: el token es un JWT {td: id_usuario, f: huella} que NO lleva
+// "uid" (no vale como sesión). La huella mezcla la contraseña y el secreto TOTP del usuario,
+// así que TODOS sus dispositivos de confianza dejan de valer a la vez cuando cambia la
+// contraseña, se restablece/desactiva el 2FA o se vuelve a configurar con otro secreto.
+// Como lleva exp (30 días) y se renueva en cada acceso, un dispositivo que se usa a
+// menudo no vuelve a pedir el código; uno abandonado caduca solo. Funciona igual en el
+// worker principal y en el secundario (mismo JWT_SECRET y misma tabla users).
+const DIAS_DISPOSITIVO_CONFIANZA = 30;
+async function huellaDispositivoConfianza(user) {
+  return (await sha256Texto("eof-td-v1:" + user.id + ":" + (user.password_hash || "") + ":" + (user.totp_secret || ""))).slice(0, 32);
+}
+async function crearDispositivoConfianza(env, user) {
+  return createJWT({ td: user.id, f: await huellaDispositivoConfianza(user) }, env.JWT_SECRET, DIAS_DISPOSITIVO_CONFIANZA * 24 * 3600);
+}
+async function dispositivoConfianzaValido(env, user, token) {
+  if (typeof token !== "string" || token.length === 0 || token.length > 2000) return false;
+  const p = await verifyJWT(token, env.JWT_SECRET);
+  if (!p || p.td !== user.id || p.uid || p.rid || p.fa2 || !p.f) return false;
+  return comparacionConstante(p.f, await huellaDispositivoConfianza(user));
+}
+function usuarioParaRespuestaLogin(user) {
+  return { id: user.id, username: user.username, nombre: user.nombre, rol: user.rol, nivel: user.rol === "admin" ? NIVEL_MAXIMO : (user.nivel || 1), email: user.email || null, avatar_url: user.avatar_url || null, avatar_foco: user.avatar_foco || null, categorias_fijas: parsearCategoriasFijas(user.categorias_fijas) };
+}
+
 // Crea la fila de sesión en la BD y el JWT correspondiente (con el "sid"
 // incrustado), en un único paso: se usa tanto al iniciar sesión como en
 // cualquier sitio que hasta ahora emitía un token nuevo (cambio de
@@ -3873,7 +4232,7 @@ function describirDispositivo(userAgent) {
 // nuevo) en vez de insertar otra. Así, cerrar sesión y volver a entrar
 // desde el mismo navegador no duplica la entrada en "Mis sesiones": solo
 // hay una fila por dispositivo, no una por cada inicio de sesión.
-async function crearSesion(env, request, user) {
+async function crearSesion(env, request, user, opciones = {}) {
   const userAgent = request.headers.get("User-Agent") || null;
   const ip = request.headers.get("CF-Connecting-IP") || request.headers.get("X-Forwarded-For") || null;
 
@@ -3896,7 +4255,7 @@ async function crearSesion(env, request, user) {
   }
 
   const token = await createJWT(
-    { uid: user.id, username: user.username, nombre: user.nombre, rol: user.rol, sid: id },
+    { uid: user.id, username: user.username, nombre: user.nombre, rol: user.rol, sid: id, ...(opciones.tfa ? { tfa: true } : {}) },
     env.JWT_SECRET
   );
   return token;
@@ -3933,7 +4292,7 @@ async function requireAuthSubida(request, env) {
   } catch {
     return null;
   }
-  if (!payload || !payload.uid) return null;
+  if (!payload || !payload.uid || sesionSinSegundoFactor(payload)) return null;
 
   try {
     if (payload.sid) {
@@ -3958,6 +4317,85 @@ async function requireAuthSubida(request, env) {
 // payload de JWT (lleva "rid" en vez de "uid") para que un token de
 // lector nunca pueda confundirse con uno de redactor/admin ni colarse
 // en una ruta protegida del panel.
+// ---------- Guardadas para leer luego e historial de lectura (punto 5) ----------
+// Tablas reader_saved_articles / reader_reading_history (ver
+// worker/migracion_lecturas_cuenta.sql). Los visitantes sin cuenta guardan
+// esto en su navegador (public/js/lecturas.js); al iniciar sesión se fusiona
+// con la cuenta en /api/readers/me/lecturas/sincronizar.
+const LECTURAS_MAX_GUARDADAS = 200;
+const LECTURAS_MAX_HISTORIAL = 100;
+
+// Ids de noticia válidos de una lista que llega del cliente: acepta números,
+// cadenas numéricas u objetos {id}; descarta lo demás y los repetidos; respeta
+// el orden de llegada y corta en "tope".
+function idsNoticiaDesdeLista(valor, tope) {
+  const vistos = new Set();
+  const salida = [];
+  if (!Array.isArray(valor)) return salida;
+  for (const v of valor) {
+    const bruto = v && typeof v === "object" ? v.id : v;
+    const n = typeof bruto === "number"
+      ? bruto
+      : (typeof bruto === "string" && /^\d{1,12}$/.test(bruto) ? parseInt(bruto, 10) : NaN);
+    if (!Number.isSafeInteger(n) || n <= 0 || vistos.has(n)) continue;
+    vistos.add(n);
+    salida.push(n);
+    if (salida.length >= tope) break;
+  }
+  return salida;
+}
+
+// De una lista de ids, el conjunto de los que existen y están publicados.
+// En trozos de 50 por el límite de parámetros enlazados de D1 (100).
+async function idsNoticiaPublicados(env, ids) {
+  const validos = new Set();
+  for (let i = 0; i < ids.length; i += 50) {
+    const trozo = ids.slice(i, i + 50);
+    const { results } = await env.DB.prepare(
+      `SELECT id FROM articles WHERE publicado = 1 AND id IN (${trozo.map(() => "?").join(",")})`
+    ).bind(...trozo).all();
+    for (const r of results) validos.add(Number(r.id));
+  }
+  return validos;
+}
+
+// Borra las lecturas más antiguas por encima del máximo del lector.
+// LIMIT 1000 OFFSET n (y no "LIMIT -1"): vale igual en SQLite/D1 y PostgreSQL.
+async function podarHistorialLector(env, readerId) {
+  await env.DB.prepare(
+    `DELETE FROM reader_reading_history WHERE reader_id = ? AND id IN (
+       SELECT id FROM reader_reading_history WHERE reader_id = ?
+       ORDER BY created_at DESC, id DESC LIMIT 1000 OFFSET ${LECTURAS_MAX_HISTORIAL})`
+  ).bind(readerId, readerId).run();
+}
+
+// Guardadas del lector (más reciente primero). Solo noticias publicadas: si una
+// pasa a borrador deja de salir, pero su fila se conserva por si se republica.
+async function listarGuardadasLector(env, readerId) {
+  const { results } = await env.DB.prepare(
+    `SELECT s.article_id, s.created_at FROM reader_saved_articles s
+     JOIN articles a ON a.id = s.article_id
+     WHERE s.reader_id = ? AND a.publicado = 1
+     ORDER BY s.created_at DESC, s.id DESC LIMIT ?`
+  ).bind(readerId, LECTURAS_MAX_GUARDADAS).all();
+  return results.map((r) => ({ article_id: Number(r.article_id), created_at: r.created_at }));
+}
+
+// Inserta filas (lector, noticia) en trozos de 30 (90 parámetros < 100 de D1).
+// "tabla" es siempre una constante de este archivo, nunca entrada del usuario.
+// Los ids van de más antiguo a más reciente: así el más reciente recibe el id
+// mayor y el orden "created_at DESC, id DESC" respeta el orden original.
+async function insertarLecturasLector(env, tabla, readerId, idsAntiguosPrimero) {
+  for (let i = 0; i < idsAntiguosPrimero.length; i += 30) {
+    const trozo = idsAntiguosPrimero.slice(i, i + 30);
+    const valores = trozo.map(() => "(?, ?)").join(", ");
+    const binds = trozo.flatMap((id) => [readerId, id]);
+    await env.DB.prepare(
+      `INSERT INTO ${tabla} (reader_id, article_id) VALUES ${valores} ON CONFLICT(reader_id, article_id) DO NOTHING`
+    ).bind(...binds).run();
+  }
+}
+
 async function requireReaderAuth(request, env) {
   const auth = request.headers.get("Authorization") || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
@@ -5211,6 +5649,50 @@ async function registrarActividad(env, request, payload, { accion, entidad = nul
   } catch (err) {
     console.log("Error al registrar actividad:", err.message);
   }
+}
+
+// ---------- Compartir en redes: aviso de previa/crónica ya subida ----------
+// "Subida a redes" = alguien usó el modal Compartir de esa previa/crónica
+// (copiar texto o abrir X). Se apoya en activity_log (accion
+// 'compartir_redes', entidad 'articulo'): no necesita columnas ni migración y
+// el log no se purga. Solo aplica a previas/crónicas vinculadas a un partido
+// (resultado_id) y compara contra otras del MISMO tipo y partido (una crónica
+// no sustituye a la previa, ni al revés).
+async function buscarArticuloParaCompartir(env, { id, slug }) {
+  const idNum = Number.parseInt(id, 10);
+  if (Number.isInteger(idNum) && idNum > 0) {
+    return await env.DB.prepare("SELECT id, titulo, tipo, resultado_id FROM articles WHERE id = ?").bind(idNum).first();
+  }
+  if (typeof slug === "string" && slug.trim()) {
+    return await env.DB.prepare("SELECT id, titulo, tipo, resultado_id FROM articles WHERE slug = ?").bind(slug.trim()).first();
+  }
+  return null;
+}
+
+async function estadoSubidaARedes(env, art) {
+  if (!art || !FUSION_TIPOS.includes(art.tipo) || !art.resultado_id) return { aplica: false, ya_subida: false };
+  const { results } = await env.DB.prepare("SELECT id, titulo FROM articles WHERE tipo = ? AND resultado_id = ?")
+    .bind(art.tipo, art.resultado_id).all();
+  const delPartido = results || [];
+  if (!delPartido.length) return { aplica: true, ya_subida: false };
+  const marcadores = delPartido.map(() => "?").join(",");
+  const fila = await env.DB.prepare(
+    `SELECT entidad_id, usuario_nombre, created_at FROM activity_log
+     WHERE accion = 'compartir_redes' AND entidad = 'articulo' AND entidad_id IN (${marcadores})
+     ORDER BY created_at DESC LIMIT 1`
+  ).bind(...delPartido.map((r) => String(r.id))).first();
+  if (!fila) return { aplica: true, ya_subida: false };
+  const previo = delPartido.find((r) => String(r.id) === String(fila.entidad_id));
+  return {
+    aplica: true,
+    ya_subida: true,
+    tipo: art.tipo,
+    propia: String(fila.entidad_id) === String(art.id),
+    articulo_id: previo ? previo.id : null,
+    titulo: previo ? previo.titulo : null,
+    subida_at: fila.created_at,
+    por: fila.usuario_nombre,
+  };
 }
 
 function slugify(text) {
@@ -6716,7 +7198,7 @@ async function revisarPartidosDesatendidos(env, ctx, partidosEnJuego) {
 
 async function publicarArticulosProgramados(env) {
   const { results: pendientes } = await env.DB.prepare(
-    `SELECT id, slug, titulo, subtitulo, tipo, categoria, club, autor_nombre, coautor_nombre, imagen_url, resultado_id
+    `SELECT id, slug, titulo, subtitulo, tipo, categoria, club, autor_id, autor_nombre, coautor_nombre, imagen_url, resultado_id
      FROM articles
      WHERE publicado = 0 AND programado_para IS NOT NULL AND programado_para <= datetime('now')`
   ).all();
@@ -6724,12 +7206,13 @@ async function publicarArticulosProgramados(env) {
   for (const articulo of pendientes) {
     const fechaPublicacion = new Date().toISOString();
     await env.DB.prepare(
-      `UPDATE articles SET publicado = 1, programado_para = NULL, slug_congelado = 1, fecha_publicacion = datetime('now'), updated_at = datetime('now') WHERE id = ?`
+      `UPDATE articles SET publicado = 1, programado_para = NULL, redes_destino = NULL, slug_congelado = 1, fecha_publicacion = datetime('now'), updated_at = datetime('now') WHERE id = ?`
     ).bind(articulo.id).run();
     // El horario se evalúa en el momento real de publicación, no cuando se programó.
     await marcarFueraDeCalendario(env, articulo.id, { tipo: articulo.tipo, resultado_id: articulo.resultado_id });
     // Aviso push a quien lo tenga activado (nunca lanza ni bloquea la publicacion).
     await notificarPushArticulo(env, articulo);
+    await notificarStaffArticulo(env, articulo, { excluirUid: articulo.autor_id || null });
     // Aviso a los buscadores (IndexNow); nunca lanza.
     await notificarIndexNow(env, [urlNoticia(articulo.categoria, articulo.slug)]);
 
@@ -7214,8 +7697,8 @@ async function calcularFuentesAnaliticas(env, desde) {
 
 async function calcularAutoresAnaliticas(env, desde) {
   // Rendimiento por autor, comparable entre autores con distinta
-  // producción: se normalizan las vistas por artículo y se expresan
-  // como porcentaje respecto a la media de todos los autores.
+  // producción: se usan las vistas por artículo y se expresan como
+  // posición (percentil) entre los autores comparables del periodo.
   //  - Vistas y tiempo de lectura: TODO lo registrado en el periodo para
   //    los artículos del autor (publicados ahora o antes).
   //  - "noticias": artículos "activos" del autor en el periodo, es decir,
@@ -7260,34 +7743,55 @@ async function calcularAutoresAnaliticas(env, desde) {
   const totalVistas = articulos.reduce((s, r) => s + (vistasPorAutor.get(r.autor_nombre) || 0), 0);
   const mediaGlobal = totalNoticias ? totalVistas / totalNoticias : 0;
 
-  // Rendimiento acotado a 0-100 %: el mejor autor del periodo es el 100 % y
-  // el resto va en proporción. Antes el 100 % era la media global, y con
-  // pocos autores o un artículo viral salían cifras de cientos o miles de %.
-  // Las vistas por artículo se "suavizan" con K artículos ficticios a la
-  // media global para que 1-2 artículos sueltos no copien el primer puesto.
-  const K_SUAVIZADO = 3;
+  // Rendimiento = posición del autor entre los autores comparables (percentil):
+  // el % de autores a los que supera en vistas por artículo (los empates
+  // cuentan por la mitad). Se usa posición y no "% respecto al mejor" porque
+  // cuando todos tienen vistas por artículo parecidas, casi todos quedaban
+  // entre 95 y 100 % (varios autores en 100 %). Así los valores se reparten
+  // de verdad entre 0 y 100 y el 100 % no se regala.
+  // Solo se puntúan autores con al menos MIN_ARTICULOS_REF artículos en el
+  // periodo; con menos no hay datos suficientes: rendimiento_pct = null (la
+  // tarjeta muestra "—") y van al final. Si nadie llega al mínimo (periodo
+  // corto) se puntúan todos.
+  const MIN_ARTICULOS_REF = 3;
   const calculados = articulos.map((r) => {
     const noticias = Number(r.noticias) || 0;
     const v = vistasPorAutor.get(r.autor_nombre) || 0;
     const porNoticia = noticias ? v / noticias : 0;
-    const suavizado = (v + K_SUAVIZADO * mediaGlobal) / (noticias + K_SUAVIZADO);
-    return { r, noticias, v, porNoticia, suavizado };
+    return { r, noticias, v, porNoticia };
   });
-  const maxSuavizado = Math.max(0, ...calculados.map((c) => c.suavizado));
+  const hayFiables = calculados.some((c) => c.noticias >= MIN_ARTICULOS_REF);
+  const puntuable = (c) => (hayFiables ? c.noticias >= MIN_ARTICULOS_REF : true);
+  const comparables = calculados.filter(puntuable);
+  const percentil = (c) => {
+    if (c.v <= 0) return 0;
+    if (comparables.length < 2) return 100; // sin con quién compararse
+    let por_debajo = 0;
+    let iguales = 0;
+    for (const o of comparables) {
+      if (o.porNoticia < c.porNoticia) por_debajo += 1;
+      else if (o.porNoticia === c.porNoticia) iguales += 1; // incluye al propio autor
+    }
+    return Math.round(((por_debajo + iguales / 2) / comparables.length) * 100);
+  };
 
   const autores = calculados
-    .map(({ r, noticias, v, porNoticia, suavizado }) => ({
-      autor: r.autor_nombre,
-      noticias,
-      vistas: v,
-      vistas_por_noticia: Math.round(porNoticia * 10) / 10,
-      // 100 % = el mejor autor del periodo
-      rendimiento_pct: v > 0 && maxSuavizado ? Math.round((suavizado / maxSuavizado) * 100) : 0,
-      // Reparto de vistas sobre el total (para ver el peso de cada autor)
-      cuota_vistas_pct: totalVistas ? Math.round((v / totalVistas) * 1000) / 10 : 0,
-      tiempo_medio_segundos: Math.round(tiempoPorAutor.get(r.autor_nombre) || 0),
-    }))
-    .sort((a, b) => b.rendimiento_pct - a.rendimiento_pct || b.vistas - a.vistas);
+    .map((c) => {
+      const { r, noticias, v, porNoticia } = c;
+      return {
+        autor: r.autor_nombre,
+        noticias,
+        vistas: v,
+        vistas_por_noticia: Math.round(porNoticia * 10) / 10,
+        // % de autores comparables a los que supera; null = pocos artículos
+        rendimiento_pct: puntuable(c) ? percentil(c) : null,
+        pocos_articulos: noticias < MIN_ARTICULOS_REF,
+        // Reparto de vistas sobre el total (para ver el peso de cada autor)
+        cuota_vistas_pct: totalVistas ? Math.round((v / totalVistas) * 1000) / 10 : 0,
+        tiempo_medio_segundos: Math.round(tiempoPorAutor.get(r.autor_nombre) || 0),
+      };
+    })
+    .sort((a, b) => (b.rendimiento_pct ?? -1) - (a.rendimiento_pct ?? -1) || b.vistas_por_noticia - a.vistas_por_noticia || b.vistas - a.vistas);
 
   return { autores, media_vistas_por_noticia: Math.round(mediaGlobal * 10) / 10 };
 }
@@ -8473,6 +8977,10 @@ async function calcularPartidazosSiToca(env) {
 //
 // Tabla push_subscriptions: una fila por navegador/dispositivo suscrito.
 // "noticias" y "partidos" son los dos tipos de aviso que se pueden elegir.
+// Ademas, cada suscripcion puede quedarse "solo con sus equipos"
+// (solo_clubes = 1): entonces recibe noticias, goles y finales unicamente de
+// los clubes guardados en push_subscription_clubs (clave = nombre normalizado,
+// ver pushClaveClub). Con solo_clubes = 0 se comporta como siempre.
 // Si falta VAPID_PRIVATE_JWK el push queda desactivado sin romper nada:
 // /api/push/clave responde 503 y los avisos se omiten en silencio.
 
@@ -8490,6 +8998,33 @@ const PUSH_HOSTS_PERMITIDOS = [
 // salientes por ejecucion (1000 en plan de pago). Se deja margen.
 const PUSH_MAX_DESTINATARIOS = 900;
 const PUSH_LOTE_PARALELO = 25;
+
+const PUSH_MAX_CLUBES = 12;
+
+// Clave comparable de un club: sin tildes, minusculas y con guiones
+// ("CD Castellón" -> "cd-castellon"). Misma regla que slugEquipo() del
+// frontend, para que lo que elige la persona coincida con lo que llega
+// de las noticias y los partidos.
+function pushClaveClub(nombre) {
+  if (typeof nombre !== "string") return "";
+  return nombre
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+}
+
+// Lista unica de claves a partir de nombres (ignora vacios y repetidos).
+function pushClavesClubes(nombres) {
+  const claves = [];
+  for (const n of nombres || []) {
+    const c = pushClaveClub(n);
+    if (c && !claves.includes(c)) claves.push(c);
+  }
+  return claves;
+}
 
 let PUSH_CLAVES_CACHE = null;
 
@@ -8617,14 +9152,26 @@ async function pushEnviarUno(env, claves, sub, mensaje, opciones = {}) {
 // Envia un aviso a todas las suscripciones de un tipo ("noticias" o
 // "partidos"). Nunca lanza: un fallo de push jamas debe romper la
 // publicacion de una noticia ni el registro de un gol.
-async function pushEnviarATopico(env, topico, mensaje, opciones = {}) {
+// "clubes" son los nombres de los clubes a los que afecta el aviso (los dos
+// equipos de un partido, o los clubes de la noticia). Reciben el aviso:
+//  - quienes lo tienen para todo (solo_clubes = 0), y
+//  - quienes solo quieren sus equipos Y tienen alguno de estos clubes.
+// Una noticia sin club (p. ej. general) no llega a quien solo quiere equipos.
+async function pushEnviarATopico(env, topico, mensaje, opciones = {}, clubes = []) {
   try {
     if (topico !== "noticias" && topico !== "partidos") return { enviados: 0 };
     const claves = await pushCargarClaves(env);
     if (!claves) return { enviados: 0, desactivado: true };
+    const clavesClubes = pushClavesClubes(clubes).slice(0, 10);
+    let filtroClubes = "solo_clubes = 0";
+    const binds = [];
+    if (clavesClubes.length) {
+      filtroClubes += ` OR id IN (SELECT subscription_id FROM push_subscription_clubs WHERE club IN (${clavesClubes.map(() => "?").join(",")}))`;
+      binds.push(...clavesClubes);
+    }
     const { results } = await env.DB.prepare(
-      `SELECT id, endpoint, p256dh, auth FROM push_subscriptions WHERE ${topico} = 1 ORDER BY id LIMIT ?`
-    ).bind(PUSH_MAX_DESTINATARIOS).all();
+      `SELECT id, endpoint, p256dh, auth FROM push_subscriptions WHERE ${topico} = 1 AND (${filtroClubes}) ORDER BY id LIMIT ?`
+    ).bind(...binds, PUSH_MAX_DESTINATARIOS).all();
     const subs = results || [];
     let enviados = 0;
     const caducadas = [];
@@ -8639,6 +9186,7 @@ async function pushEnviarATopico(env, topico, mensaje, opciones = {}) {
       });
     }
     for (const id of caducadas) {
+      try { await env.DB.prepare("DELETE FROM push_subscription_clubs WHERE subscription_id = ?").bind(id).run(); } catch {}
       try { await env.DB.prepare("DELETE FROM push_subscriptions WHERE id = ?").bind(id).run(); } catch {}
     }
     return { enviados, caducadas: caducadas.length };
@@ -8714,7 +9262,7 @@ async function notificarPushArticulo(env, articulo) {
       url: urlNoticia(articulo.categoria, articulo.slug),
       tag: `noticia-${articulo.slug}`.slice(0, 120),
       imagen,
-    }, { ttl: 6 * 3600 });
+    }, { ttl: 6 * 3600 }, parsearClubArticulo(articulo.club));
   } catch (err) {
     console.error("notificarPushArticulo:", err.message);
   }
@@ -8747,7 +9295,7 @@ async function notificarPushPartido(env, resultadoId, tipo, evento = {}) {
       // Misma tag por partido: cada gol sustituye a la notificacion anterior
       // de ese partido en vez de apilarse.
       tag: `partido-${resultadoId}`,
-    }, { ttl: 900, urgencia: "high" });
+    }, { ttl: 900, urgencia: "high" }, [r.equipo_local, r.equipo_visitante]);
   } catch (err) {
     console.error("notificarPushPartido:", err.message);
   }
@@ -8796,16 +9344,60 @@ async function manejarRutasPush(request, env, path, method) {
     } catch {
       return json({ error: "Suscripcion no valida" }, 400);
     }
-    const noticias = body.noticias === false ? 0 : 1;
-    const partidos = body.partidos === false ? 0 : 1;
+    let noticias = body.noticias === false ? 0 : 1;
+    let partidos = body.partidos === false ? 0 : 1;
+    // Equipos elegidos ("avisarme de mi equipo"). Se guardan como claves
+    // normalizadas; el nombre original solo lo conserva el navegador.
+    let clavesClubes = Array.isArray(body.clubes) ? pushClavesClubes(body.clubes.slice(0, PUSH_MAX_CLUBES * 2)) : [];
+    if (clavesClubes.length > PUSH_MAX_CLUBES) return json({ error: `Maximo ${PUSH_MAX_CLUBES} equipos` }, 400);
+    let soloClubes = body.solo_clubes === true && clavesClubes.length ? 1 : 0;
+    if (body.solo_clubes === true && !clavesClubes.length) return json({ error: "Elige al menos un equipo" }, 400);
+
+    // Si el navegador renovo la suscripcion por su cuenta (pushsubscriptionchange),
+    // el service worker no conoce las preferencias: se heredan de la anterior.
+    const anterior = typeof body.endpoint_anterior === "string" && body.endpoint_anterior.length <= 700 && body.endpoint_anterior !== endpoint
+      ? body.endpoint_anterior : null;
+    let filaAnterior = null;
+    if (anterior && body.heredar === true) {
+      filaAnterior = await env.DB.prepare("SELECT id, noticias, partidos, solo_clubes FROM push_subscriptions WHERE endpoint = ?").bind(anterior).first();
+      if (filaAnterior) {
+        noticias = filaAnterior.noticias ? 1 : 0;
+        partidos = filaAnterior.partidos ? 1 : 0;
+        soloClubes = filaAnterior.solo_clubes ? 1 : 0;
+        const { results: clubsAnt } = await env.DB.prepare("SELECT club FROM push_subscription_clubs WHERE subscription_id = ?").bind(filaAnterior.id).all();
+        clavesClubes = (clubsAnt || []).map((c) => c.club).slice(0, PUSH_MAX_CLUBES);
+      }
+    }
+
     if (!noticias && !partidos) return json({ error: "Elige al menos un tipo de aviso" }, 400);
     const ua = pushRecortar(request.headers.get("User-Agent") || "", 200);
     await env.DB.prepare(
-      `INSERT INTO push_subscriptions (endpoint, p256dh, auth, noticias, partidos, user_agent)
-       VALUES (?, ?, ?, ?, ?, ?)
+      `INSERT INTO push_subscriptions (endpoint, p256dh, auth, noticias, partidos, solo_clubes, user_agent)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth,
-         noticias = excluded.noticias, partidos = excluded.partidos, updated_at = CURRENT_TIMESTAMP`
-    ).bind(endpoint, p256dh, auth, noticias, partidos, ua).run();
+         noticias = excluded.noticias, partidos = excluded.partidos, solo_clubes = excluded.solo_clubes,
+         updated_at = CURRENT_TIMESTAMP`
+    ).bind(endpoint, p256dh, auth, noticias, partidos, soloClubes, ua).run();
+
+    // La lista de equipos se reemplaza entera (una sola vez por guardado).
+    // Si la peticion no trae "clubes" (cliente antiguo) y no se hereda, se
+    // conserva la lista que hubiera, para no borrar elecciones sin querer.
+    const traeClubes = Array.isArray(body.clubes) || !!filaAnterior;
+    if (traeClubes) {
+      const fila = await env.DB.prepare("SELECT id FROM push_subscriptions WHERE endpoint = ?").bind(endpoint).first();
+      if (fila) {
+        await env.DB.prepare("DELETE FROM push_subscription_clubs WHERE subscription_id = ?").bind(fila.id).run();
+        for (const club of clavesClubes) {
+          await env.DB.prepare(
+            "INSERT INTO push_subscription_clubs (subscription_id, club) VALUES (?, ?) ON CONFLICT(subscription_id, club) DO NOTHING"
+          ).bind(fila.id, club).run();
+        }
+      }
+    }
+    if (filaAnterior) {
+      await env.DB.prepare("DELETE FROM push_subscription_clubs WHERE subscription_id = ?").bind(filaAnterior.id).run();
+      await env.DB.prepare("DELETE FROM push_subscriptions WHERE id = ?").bind(filaAnterior.id).run();
+    }
     return json({ ok: true });
   }
 
@@ -8813,6 +9405,9 @@ async function manejarRutasPush(request, env, path, method) {
     if (await pushLimiteExcedido(request, env)) return json({ error: "Demasiadas peticiones, prueba mas tarde" }, 429);
     const body = await request.json().catch(() => null);
     if (!body || typeof body.endpoint !== "string" || body.endpoint.length > 700) return json({ error: "Falta el endpoint" }, 400);
+    await env.DB.prepare(
+      "DELETE FROM push_subscription_clubs WHERE subscription_id IN (SELECT id FROM push_subscriptions WHERE endpoint = ?)"
+    ).bind(body.endpoint).run();
     await env.DB.prepare("DELETE FROM push_subscriptions WHERE endpoint = ?").bind(body.endpoint).run();
     return json({ ok: true });
   }
@@ -8820,6 +9415,265 @@ async function manejarRutasPush(request, env, path, method) {
   return null;
 }
 
+
+// ---------- Push para el equipo: la campanita del panel de redactores ----------
+// Solo admins y redactores de Nivel 4 pueden activarla. Cada dispositivo se
+// guarda en staff_push_subscriptions (ligado a la cuenta) y las categorias
+// elegidas, por persona, en staff_push_prefs (una fila = categoria activada).
+// Va aparte del push publico (push_subscriptions): son avisos internos y solo
+// llegan a quien tiene la categoria activada Y sigue siendo admin/Nivel 4 en el
+// momento del envio (si le bajan de nivel, deja de recibirlos sin tocar nada).
+const STAFF_PUSH_CATEGORIAS = {
+  contenido: "Contenido",
+  acreditaciones: "Acreditaciones (formulario)",
+  incorporaciones: "Incorporaciones (formulario)",
+  noticias: "Noticias / crónicas",
+  fichas: "Propuestas de fichas de equipos",
+  tienda: "Compras en la tienda",
+  ediciones: "Ediciones pendientes de mi respuesta",
+  comentarios: "Comentarios",
+  anuncios: "Anuncios",
+};
+const STAFF_PUSH_NIVEL_MINIMO = 4;
+const STAFF_PUSH_MAX_DISPOSITIVOS = 10;
+const STAFF_PUSH_SQL_ELEGIBLE = `u.activo = 1 AND (u.rol = 'admin' OR (u.rol = 'redactor' AND u.nivel >= ${STAFF_PUSH_NIVEL_MINIMO}))`;
+
+// Admin o redactor de Nivel 4, mirando siempre la base (no el JWT) para que un
+// ascenso o descenso valga al momento.
+async function staffPushPuede(env, payload) {
+  if (!payload || !payload.uid) return false;
+  const u = await env.DB.prepare("SELECT rol, nivel, activo FROM users WHERE id = ?").bind(payload.uid).first();
+  if (!u || Number(u.activo) !== 1) return false;
+  if (u.rol === "admin") return true;
+  return u.rol === "redactor" && (Number(u.nivel) || 1) >= STAFF_PUSH_NIVEL_MINIMO;
+}
+
+function staffPushCategoriasValidas(lista) {
+  if (!Array.isArray(lista)) return [];
+  return [...new Set(lista.filter((c) => typeof c === "string" && Object.prototype.hasOwnProperty.call(STAFF_PUSH_CATEGORIAS, c)))];
+}
+
+async function staffPushCategoriasActivas(env, uid) {
+  const { results } = await env.DB.prepare("SELECT categoria FROM staff_push_prefs WHERE user_id = ?").bind(uid).all();
+  return staffPushCategoriasValidas((results || []).map((r) => r.categoria));
+}
+
+async function staffPushGuardarCategorias(env, uid, categorias) {
+  await env.DB.prepare("DELETE FROM staff_push_prefs WHERE user_id = ?").bind(uid).run();
+  for (const c of categorias) {
+    await env.DB.prepare(
+      "INSERT INTO staff_push_prefs (user_id, categoria) VALUES (?, ?) ON CONFLICT(user_id, categoria) DO NOTHING"
+    ).bind(uid, c).run();
+  }
+}
+
+// Envia un aviso a quien tenga activada la "categoria". Nunca lanza: un fallo
+// de push jamas debe romper una subida, un pedido o un comentario.
+//  - excluirUid: quien ha provocado el aviso (no se avisa a si mismo).
+//  - soloUids:   restringe a esas personas (p. ej. el autor de una noticia).
+//  - filtro:     funcion extra sobre cada destinatario ({ uid, email, rol, puede_gestionar_tienda }).
+async function staffPushEnviar(env, categoria, mensaje, { excluirUid = null, soloUids = null, filtro = null, ttl = 6 * 3600 } = {}) {
+  try {
+    if (!Object.prototype.hasOwnProperty.call(STAFF_PUSH_CATEGORIAS, categoria)) return { enviados: 0 };
+    if (Array.isArray(soloUids) && !soloUids.length) return { enviados: 0 };
+    const claves = await pushCargarClaves(env);
+    if (!claves) return { enviados: 0, desactivado: true };
+    const binds = [categoria];
+    let extra = "";
+    if (excluirUid) { extra += " AND u.id <> ?"; binds.push(excluirUid); }
+    if (Array.isArray(soloUids)) {
+      extra += ` AND u.id IN (${soloUids.map(() => "?").join(",")})`;
+      binds.push(...soloUids);
+    }
+    const { results } = await env.DB.prepare(
+      `SELECT s.id, s.endpoint, s.p256dh, s.auth, u.id AS uid, u.email, u.rol, u.puede_gestionar_tienda
+         FROM staff_push_subscriptions s
+         JOIN users u ON u.id = s.user_id
+         JOIN staff_push_prefs p ON p.user_id = u.id AND p.categoria = ?
+        WHERE ${STAFF_PUSH_SQL_ELEGIBLE}${extra}
+        ORDER BY s.id LIMIT ?`
+    ).bind(...binds, PUSH_MAX_DESTINATARIOS).all();
+    let subs = results || [];
+    if (typeof filtro === "function") subs = subs.filter((s) => { try { return filtro(s); } catch { return false; } });
+    if (!subs.length) return { enviados: 0 };
+    const carga = {
+      titulo: pushRecortar(mensaje.titulo, 100),
+      cuerpo: pushRecortar(mensaje.cuerpo, 160),
+      url: mensaje.url || `${SITIO_URL}/admin/panel.html${mensaje.ir ? `?ir=${encodeURIComponent(mensaje.ir)}` : ""}`,
+      // Prefijo "staff-": la tag distingue estos avisos de los publicos (si no,
+      // uno sustituiria al otro en el dispositivo).
+      tag: `staff-${mensaje.tag || categoria}`.slice(0, 120),
+    };
+    let enviados = 0;
+    const caducadas = [];
+    for (let i = 0; i < subs.length; i += PUSH_LOTE_PARALELO) {
+      const lote = subs.slice(i, i + PUSH_LOTE_PARALELO);
+      const estados = await Promise.allSettled(lote.map((s) => pushEnviarUno(env, claves, s, carga, { ttl })));
+      estados.forEach((e, idx) => {
+        if (e.status === "fulfilled") {
+          if (e.value >= 200 && e.value < 300) enviados++;
+          else if (e.value === 404 || e.value === 410) caducadas.push(lote[idx].id);
+          else console.error("Push de equipo rechazado:", categoria, e.value);
+        } else {
+          console.error("Push de equipo fallo:", categoria, e.reason && e.reason.message);
+        }
+      });
+    }
+    for (const id of caducadas) {
+      try { await env.DB.prepare("DELETE FROM staff_push_subscriptions WHERE id = ?").bind(id).run(); } catch {}
+    }
+    return { enviados, caducadas: caducadas.length };
+  } catch (err) {
+    console.error("Error enviando push de equipo:", err && err.message);
+    return { enviados: 0, error: true };
+  }
+}
+
+// Noticia/cronica subida por otra persona: publicada, o borrador terminado
+// pendiente de revisar. "art" necesita titulo, slug, categoria y tipo.
+async function notificarStaffArticulo(env, art, { excluirUid = null, borrador = false } = {}) {
+  try {
+    if (!art || !art.titulo) return;
+    const tipoLabel = { noticia: "Noticia", previa: "Previa", cronica: "Crónica", analisis: "Análisis", opinion: "Opinión", entrevista: "Entrevista" }[art.tipo] || "Artículo";
+    const firma = art.coautor_nombre ? `${art.autor_nombre} y ${art.coautor_nombre}` : (art.autor_nombre || "");
+    await staffPushEnviar(env, "noticias", {
+      titulo: borrador ? `${tipoLabel}: borrador terminado` : `${tipoLabel} publicada`,
+      cuerpo: `${art.titulo}${firma ? ` · ${firma}` : ""}`,
+      ir: "noticias",
+      url: !borrador && art.slug ? urlNoticia(art.categoria, art.slug) : undefined,
+      tag: `noticia-${art.slug || pushClaveClub(art.titulo)}`,
+    }, { excluirUid });
+  } catch (err) {
+    console.error("notificarStaffArticulo:", err && err.message);
+  }
+}
+
+// Rutas /api/staff-push/*. Devuelve una Response o null si no es de esta familia.
+async function manejarRutasStaffPush(request, env, path, method, url) {
+  // Renovacion de suscripcion hecha por el service worker (pushsubscriptionchange):
+  // no lleva sesion. Solo sustituye una suscripcion de equipo YA existente cuyo
+  // endpoint anterior conoce quien llama.
+  if (path === "/api/staff-push/renovar" && method === "POST") {
+    if (await pushLimiteExcedido(request, env)) return json({ error: "Demasiadas peticiones, prueba mas tarde" }, 429);
+    const body = await request.json().catch(() => null);
+    const s = body && body.suscripcion;
+    const endpoint = s && s.endpoint, p256dh = s && s.keys && s.keys.p256dh, auth = s && s.keys && s.keys.auth;
+    const anterior = body && body.endpoint_anterior;
+    if (typeof endpoint !== "string" || typeof p256dh !== "string" || typeof auth !== "string" || typeof anterior !== "string" || anterior.length > 700) {
+      return json({ error: "Suscripcion no valida" }, 400);
+    }
+    if (!pushEndpointValido(endpoint) || p256dh.length > 200 || auth.length > 100) return json({ error: "Suscripcion no valida" }, 400);
+    try { if (pushB64uABytes(p256dh).length !== 65) throw new Error("p256dh"); } catch { return json({ error: "Suscripcion no valida" }, 400); }
+    const fila = await env.DB.prepare("SELECT id FROM staff_push_subscriptions WHERE endpoint = ?").bind(anterior).first();
+    if (!fila) return json({ ok: true, encontrada: false });
+    await env.DB.prepare("DELETE FROM staff_push_subscriptions WHERE endpoint = ? AND id <> ?").bind(endpoint, fila.id).run();
+    await env.DB.prepare(
+      "UPDATE staff_push_subscriptions SET endpoint = ?, p256dh = ?, auth = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+    ).bind(endpoint, p256dh, auth, fila.id).run();
+    return json({ ok: true, encontrada: true });
+  }
+
+  const payload = await requireAuth(request, env);
+  if (!payload) return json({ error: "No autorizado" }, 401);
+  if (!(await staffPushPuede(env, payload))) {
+    return json({ error: "Las notificaciones push del equipo son solo para administradores y redactores de Nivel 4" }, 403);
+  }
+
+  if (path === "/api/staff-push/estado" && method === "GET") {
+    const endpoint = url ? url.searchParams.get("endpoint") : null;
+    const categorias = await staffPushCategoriasActivas(env, payload.uid);
+    let dispositivo = false;
+    if (endpoint && endpoint.length <= 700) {
+      const f = await env.DB.prepare("SELECT id FROM staff_push_subscriptions WHERE endpoint = ? AND user_id = ?").bind(endpoint, payload.uid).first();
+      dispositivo = !!f;
+    }
+    const yo = await env.DB.prepare("SELECT puede_gestionar_tienda FROM users WHERE id = ?").bind(payload.uid).first();
+    const { results: n } = await env.DB.prepare("SELECT COUNT(*) AS n FROM staff_push_subscriptions WHERE user_id = ?").bind(payload.uid).all();
+    return json({
+      categorias: Object.entries(STAFF_PUSH_CATEGORIAS).map(([id, etiqueta]) => ({ id, etiqueta })),
+      activas: categorias,
+      dispositivo_suscrito: dispositivo,
+      dispositivos: Number(n && n[0] && n[0].n) || 0,
+      puede_gestionar_tienda: payload.rol === "admin" || Number(yo && yo.puede_gestionar_tienda) === 1,
+    });
+  }
+
+  if (path === "/api/staff-push/prefs" && method === "PUT") {
+    const body = await request.json().catch(() => null);
+    if (!body || !Array.isArray(body.categorias)) return json({ error: "Faltan las categorias" }, 400);
+    const categorias = staffPushCategoriasValidas(body.categorias);
+    await staffPushGuardarCategorias(env, payload.uid, categorias);
+    return json({ ok: true, activas: categorias });
+  }
+
+  if (path === "/api/staff-push/suscribir" && method === "POST") {
+    if (await pushLimiteExcedido(request, env)) return json({ error: "Demasiadas peticiones, prueba mas tarde" }, 429);
+    const body = await request.json().catch(() => null);
+    const s = body && body.suscripcion;
+    const endpoint = s && s.endpoint, p256dh = s && s.keys && s.keys.p256dh, auth = s && s.keys && s.keys.auth;
+    if (typeof endpoint !== "string" || typeof p256dh !== "string" || typeof auth !== "string") return json({ error: "Suscripcion no valida" }, 400);
+    if (!pushEndpointValido(endpoint)) return json({ error: "Servicio de notificaciones no admitido" }, 400);
+    if (p256dh.length > 200 || auth.length > 100) return json({ error: "Suscripcion no valida" }, 400);
+    try { if (pushB64uABytes(p256dh).length !== 65) throw new Error("p256dh"); } catch { return json({ error: "Suscripcion no valida" }, 400); }
+
+    const existente = await env.DB.prepare("SELECT id, user_id FROM staff_push_subscriptions WHERE endpoint = ?").bind(endpoint).first();
+    if (!existente) {
+      const { results: cuenta } = await env.DB.prepare("SELECT COUNT(*) AS n FROM staff_push_subscriptions WHERE user_id = ?").bind(payload.uid).all();
+      if ((Number(cuenta && cuenta[0] && cuenta[0].n) || 0) >= STAFF_PUSH_MAX_DISPOSITIVOS) {
+        return json({ error: `Maximo ${STAFF_PUSH_MAX_DISPOSITIVOS} dispositivos. Desactiva alguno desde otro dispositivo.` }, 400);
+      }
+    }
+    const ua = pushRecortar(request.headers.get("User-Agent") || "", 200);
+    await env.DB.prepare(
+      `INSERT INTO staff_push_subscriptions (user_id, endpoint, p256dh, auth, user_agent)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth,
+         user_agent = excluded.user_agent, updated_at = CURRENT_TIMESTAMP`
+    ).bind(payload.uid, endpoint, p256dh, auth, ua).run();
+
+    // Si se mandan categorias (primera activacion), se guardan; si no, se conservan las que hubiera.
+    if (Array.isArray(body.categorias)) await staffPushGuardarCategorias(env, payload.uid, staffPushCategoriasValidas(body.categorias));
+    return json({ ok: true, activas: await staffPushCategoriasActivas(env, payload.uid) });
+  }
+
+  if (path === "/api/staff-push/baja" && method === "POST") {
+    const body = await request.json().catch(() => null);
+    if (!body || typeof body.endpoint !== "string" || body.endpoint.length > 700) return json({ error: "Falta el endpoint" }, 400);
+    await env.DB.prepare("DELETE FROM staff_push_subscriptions WHERE endpoint = ? AND user_id = ?").bind(body.endpoint, payload.uid).run();
+    return json({ ok: true });
+  }
+
+  if (path === "/api/staff-push/prueba" && method === "POST") {
+    const claves = await pushCargarClaves(env);
+    if (!claves) return json({ error: "Los avisos push no estan disponibles ahora mismo" }, 503);
+    const { results } = await env.DB.prepare("SELECT id, endpoint, p256dh, auth FROM staff_push_subscriptions WHERE user_id = ?").bind(payload.uid).all();
+    const subs = results || [];
+    if (!subs.length) return json({ error: "Este dispositivo no tiene las notificaciones activadas" }, 400);
+    let enviados = 0;
+    const detalle = [];
+    for (const sub of subs) {
+      try {
+        const st = await pushEnviarUno(env, claves, sub, {
+          titulo: "Notificaciones activadas", cuerpo: "Así te llegarán los avisos de la redacción.",
+          url: `${SITIO_URL}/admin/panel.html`, tag: "staff-prueba",
+        }, { ttl: 300 });
+        let host = "";
+        try { host = new URL(sub.endpoint).host; } catch {}
+        detalle.push({ estado: st, servicio: host });
+        if (st >= 200 && st < 300) enviados++;
+        else if (st === 404 || st === 410) { try { await env.DB.prepare("DELETE FROM staff_push_subscriptions WHERE id = ?").bind(sub.id).run(); } catch {} }
+        else console.error("Push de equipo (prueba) rechazado:", st, host);
+      } catch (err) {
+        /* un dispositivo caido no impide probar los demas */
+        detalle.push({ estado: 0, servicio: "", error: String(err && err.message || err).slice(0, 120) });
+        console.error("Push de equipo (prueba) fallo:", err && err.message);
+      }
+    }
+    return json({ ok: true, enviados, detalle });
+  }
+
+  return json({ error: "No encontrado" }, 404);
+}
 
 export default {
   // Expuestas también como propiedades del handler (no solo usadas
@@ -9318,6 +10172,12 @@ export default {
       if (respuestaPush) return respuestaPush;
     }
 
+    // ---------- Notificaciones push del equipo (campanita del panel) ----------
+    if (path.startsWith("/api/staff-push/")) {
+      const respuestaStaffPush = await manejarRutasStaffPush(request, env, path, method, url);
+      if (respuestaStaffPush) return respuestaStaffPush;
+    }
+
     /*
      * ============================================================
      * NEWSLETTER / BOLETÍN SEMANAL
@@ -9343,10 +10203,13 @@ export default {
       } catch {
         return json({ error: "JSON inválido" }, 400);
       }
+      // Campo trampa para bots: un humano nunca lo ve ni lo rellena.
+      if (body && body.web) return json({ ok: true });
       const email = (body && body.email ? String(body.email) : "").trim().toLowerCase();
       if (!emailValido(email)) {
         return json({ error: "Introduce un email válido" }, 400);
       }
+      if (!(await verificarTurnstile(request, env, body && body.turnstileToken))) return json({ error: RESPUESTA_TURNSTILE, motivo: request.__tsMotivo || null }, 400);
       try {
         const existente = await env.DB.prepare(
           "SELECT id, activo FROM newsletter_suscriptores WHERE email = ?"
@@ -9413,6 +10276,7 @@ export default {
       body = body || {};
       // Campo trampa para bots: un humano nunca lo ve ni lo rellena.
       if (body.web) return json({ ok: true });
+      if (!(await verificarTurnstile(request, env, body.turnstileToken))) return json({ error: RESPUESTA_TURNSTILE, motivo: request.__tsMotivo || null }, 400);
 
       // Sin el acceso que exija el modo vigente (PIN, sesión de colaborador o libre)
       // no se acepta ninguna solicitud, aunque se salten la pantalla de acceso.
@@ -9478,6 +10342,11 @@ export default {
       } catch (err) {
         console.error("[acreditaciones/aviso-email]", err);
       }
+      ctx.waitUntil(staffPushEnviar(env, "acreditaciones", {
+        titulo: "Nueva solicitud de acreditación",
+        cuerpo: `${nombre} · ${equipo} · ${jornadaPartido}`,
+        ir: "acreditaciones", tag: "acreditaciones",
+      }));
       return json({ ok: true });
     }
 
@@ -9512,6 +10381,7 @@ export default {
       body = body || {};
       // Campo trampa para bots: un humano nunca lo ve ni lo rellena.
       if (body.web) return json({ ok: true });
+      if (!(await verificarTurnstile(request, env, body.turnstileToken))) return json({ error: RESPUESTA_TURNSTILE, motivo: request.__tsMotivo || null }, 400);
       const f = await obtenerFormularioPublico(env, body.slug);
       if (!f) return json({ error: "Este formulario no está disponible" }, 404);
       const acc = comprobarAccesoFormulario(f, body.pin);
@@ -9551,6 +10421,19 @@ export default {
         console.error("[formularios/responder]", err);
         if (usuarioCreado) { try { await env.DB.prepare("DELETE FROM users WHERE username = ?").bind(usuarioCreado).run(); } catch {} }
         return json({ error: "No se pudo enviar el formulario. Inténtalo de nuevo en unos minutos." }, 500);
+      }
+      if (f.slug === FORMULARIO_INCORPORACION_SLUG) {
+        let quien = "";
+        try {
+          const filasInc = datosFormularioParaTexto(campos, v.datos);
+          const campoNombre = filasInc.find((x) => /nombre/i.test(x.etiqueta)) || filasInc[0];
+          quien = campoNombre ? campoNombre.valor : "";
+        } catch { /* sin nombre: el aviso sale igual */ }
+        ctx.waitUntil(staffPushEnviar(env, "incorporaciones", {
+          titulo: "Nueva solicitud de incorporación",
+          cuerpo: quien || "Alguien ha rellenado el formulario de incorporación",
+          ir: "incorporaciones", tag: "incorporaciones",
+        }));
       }
       let correoCuentaEnviado = false;
       if (cuentaNueva) {
@@ -9592,11 +10475,12 @@ export default {
       } catch {
         return json({ error: "JSON inválido" }, 400);
       }
+      if (body && body.web) return json({ ok: true }); // campo trampa para bots
       const nombre = (body && body.nombre ? String(body.nombre) : "").trim().slice(0, 200);
       const email = (body && body.email ? String(body.email) : "").trim().toLowerCase();
       const medio = (body && body.medio ? String(body.medio) : "").trim().slice(0, 200);
       const mensaje = (body && body.mensaje ? String(body.mensaje) : "").trim().slice(0, 5000);
-      if (!(await verificarTurnstile(request, env, body && body.turnstileToken))) return json({ error: RESPUESTA_TURNSTILE }, 400);
+      if (!(await verificarTurnstile(request, env, body && body.turnstileToken))) return json({ error: RESPUESTA_TURNSTILE, motivo: request.__tsMotivo || null }, 400);
 
       if (!nombre) return json({ error: "Indica tu nombre" }, 400);
       if (!emailValido(email)) return json({ error: "Introduce un email válido" }, 400);
@@ -9624,6 +10508,32 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
       } catch (err) {
         console.error("[contacto-prensa]", err);
         return json({ error: "No se pudo enviar el mensaje. Inténtalo de nuevo o escribe directamente a contacto@elotrofutbol.media." }, 500);
+      }
+    }
+
+    // Baja de los avisos por correo de comentarios: enlace del propio correo,
+    // sin sesión (el token firmado identifica a la lectora).
+    if (path === "/api/comentarios/baja-avisos" && method === "GET") {
+      const cabeceras = { "Content-Type": "text/html; charset=utf-8" };
+      const token = url.searchParams.get("token") || "";
+      const payloadBaja = token ? await verifyJWT(token, env.JWT_SECRET) : null;
+      if (!payloadBaja || payloadBaja.tipo !== "baja-avisos-comentarios" || !payloadBaja.rid) {
+        return new Response("Enlace no válido o caducado. Puedes cambiar estos avisos desde Mi cuenta.", { status: 400, headers: cabeceras });
+      }
+      try {
+        await env.DB.prepare("UPDATE readers SET avisos_comentarios = 0 WHERE id = ?").bind(payloadBaja.rid).run();
+        return new Response(
+          `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Avisos de comentarios</title></head>
+           <body style="font-family:Arial,sans-serif;max-width:480px;margin:60px auto;padding:0 16px;text-align:center;color:#0c1b2e;">
+             <h1 style="font-size:20px;">Listo, no te avisaremos más</h1>
+             <p style="color:#5a6270;">Ya no recibirás correos cuando se publique un comentario tuyo o alguien te responda. Puedes volver a activarlos cuando quieras desde Mi cuenta.</p>
+             <p><a href="${SITIO_URL}/cuenta" style="color:#d1132e;">Ir a Mi cuenta</a></p>
+           </body></html>`,
+          { status: 200, headers: cabeceras }
+        );
+      } catch (err) {
+        console.error("[comentarios/baja-avisos]", err);
+        return new Response("No se pudo procesar la baja.", { status: 500, headers: cabeceras });
       }
     }
 
@@ -9666,6 +10576,48 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
      * con sesión, y este endpoint no debe ser alcanzable por el público.
      * ============================================================
      */
+
+    // ---- Pruebas de alertas (Discord) ----
+    // POST /api/internal/test-alerta?tipo=webhook|5xx|cron  (cabecera X-Internal-Sync-Secret)
+    //   webhook: manda un mensaje directo y devuelve si ALERT_WEBHOOK_URL está configurada
+    //            y qué respondió Discord (confirma que el secret está puesto en ESTE worker).
+    //   5xx:     usa enviarAlerta con el mismo formato que el failover (sin esperar 15 min).
+    //   cron:    simula una tarea del cron que falla (ctxConAlertas) y debe avisar.
+    // POST /api/internal/test-5xx: provoca un 503 REAL del principal para ver el aviso
+    //   de failover de punta a punta (el aviso se antirrepite 15 min por clave).
+    if (path === "/api/internal/test-alerta" && method === "POST") {
+      const esperado = env.INTERNAL_SYNC_SECRET;
+      const recibido = request.headers.get("X-Internal-Sync-Secret");
+      if (!esperado) return json({ error: "Endpoint interno no configurado" }, 503);
+      if (!recibido || !comparacionConstante(recibido, esperado)) return json({ error: "No autorizado" }, 401);
+      const tipo = url.searchParams.get("tipo") || "webhook";
+      const marca = new Date().toISOString();
+      if (!env.ALERT_WEBHOOK_URL) return json({ ok: false, configurado: false, motivo: "ALERT_WEBHOOK_URL no está definida en este worker" }, 200);
+      if (tipo === "webhook") {
+        try {
+          const r = await fetch(env.ALERT_WEBHOOK_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ content: `✅ Prueba de alertas (webhook directo) ${marca}` }),
+          });
+          return json({ ok: r.ok, configurado: true, discordStatus: r.status });
+        } catch (e) {
+          return json({ ok: false, configurado: true, error: String(e && e.message) });
+        }
+      }
+      if (tipo === "5xx") {
+        await enviarAlerta(env, `test:5xx:${marca}`, "PRUEBA: el principal respondió 503 (activando Railway)", `GET /api/results/0\nPrueba manual ${marca}`);
+        return json({ ok: true, enviado: "5xx" });
+      }
+      if (tipo === "cron") {
+        const pend = [];
+        ctxConAlertas({ waitUntil: (p) => pend.push(p) }, env, "cron")
+          .waitUntil(Promise.reject(new Error(`PRUEBA fallo del cron ${marca}`)));
+        await Promise.all(pend);
+        return json({ ok: true, enviado: "cron" });
+      }
+      return json({ error: "tipo debe ser webhook, 5xx o cron" }, 400);
+    }
 
     if (path === "/api/internal/drain-pending-writes" && method === "POST") {
       return await drainPendingWrites(request, env, ctx);
@@ -9873,6 +10825,8 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
         partidosEnJuego = results || [];
       } catch (err) {
         console.log("Error leyendo partidos en_juego para el cron:", err.message);
+        // Este error se tragaba en silencio y el cron seguía "bien": ahora avisa.
+        await enviarAlerta(env, "cron:lectura-en-juego", "El cron no puede leer los partidos en juego (D1)", String(err && err.stack ? err.stack : err.message));
       }
 
       if (partidosEnJuego.length) {
@@ -10889,6 +11843,13 @@ async function fetchRailway(
    * RUNNING_IN_RAILWAY puede llegar como boolean, string o número
    * dependiendo de cómo esté definida la variable de entorno.
    */
+  // Las respuestas de este reenvío (incluidos sus errores 503) se devuelven
+  // directamente al navegador sin pasar por json(): sin cabeceras CORS el
+  // navegador las descarta y solo muestra "blocked by CORS policy", ocultando
+  // el error real. Se usa la cabecera Origin de ESTA petición (no la variable
+  // de módulo ORIGEN_PETICION_ACTUAL, que bajo Node/Railway se comparte entre
+  // peticiones concurrentes).
+  const conCors = (respuesta) => cors(respuesta, request.headers.get("Origin"));
   const runningInRailway =
     env?.RUNNING_IN_RAILWAY === true ||
     env?.RUNNING_IN_RAILWAY === "true" ||
@@ -10899,7 +11860,7 @@ async function fetchRailway(
       `[FAILOVER] Bloqueado: la petición ya está en Railway (${reason}). ` +
       `No se permite reenviar Railway -> Railway.`
     );
-    return new Response(
+    return conCors(new Response(
       JSON.stringify({
         status: "FAILOVER_UNAVAILABLE",
         backend: "RAILWAY",
@@ -10918,7 +11879,7 @@ async function fetchRailway(
           [FAILOVER_REASON_HEADER]: reason
         }
       }
-    );
+    ));
   }
   /*
    * URL del backend secundario.
@@ -10998,20 +11959,20 @@ async function fetchRailway(
     if (reason === "FAILOVER_TEST") {
       responseHeaders.set(FAILOVER_TEST_HEADER, "true");
     }
-    return new Response(
+    return conCors(new Response(
       response.body,
       {
         status: response.status,
         statusText: response.statusText,
         headers: responseHeaders
       }
-    );
+    ));
   } catch (error) {
     console.error(
       `[FAILOVER] Error contactando con Railway (${reason}):`,
       error
     );
-    return new Response(
+    return conCors(new Response(
       JSON.stringify({
         error: "Error del backend secundario",
         detail:
@@ -11030,7 +11991,7 @@ async function fetchRailway(
           [FAILOVER_REASON_HEADER]: reason
         }
       }
-    );
+    ));
   }
 }
 
@@ -11124,6 +12085,17 @@ function guardarTextoCacheBorde(url, texto, ttlMs, ctx) {
 const CACHE_PUBLICA_MAX = 200;
 const CACHE_PUBLICA_MAX_BYTES = 512 * 1024;
 
+// Escrituras de la cuenta del lector que no cambian nada de lo que sirve la caché
+// pública (guardadas, historial): no la vacían. Sin esto, cada noticia abierta por
+// un lector con sesión (POST del historial) tiraría la caché de portada/noticias.
+function escrituraSinEfectoPublico(pathname) {
+  return pathname === "/api/readers/me/historial"
+    || pathname.startsWith("/api/readers/me/historial/")
+    || pathname === "/api/readers/me/guardadas"
+    || pathname.startsWith("/api/readers/me/guardadas/")
+    || pathname.startsWith("/api/readers/me/lecturas/");
+}
+
 function ttlCachePublica(request, url) {
   if (request.method !== "GET") return 0;
   if (request.headers.get("Authorization")) return 0;
@@ -11141,7 +12113,7 @@ async function handlePrimaryConCache(request, env, ctx) {
   const url = new URL(request.url);
   const ttl = ttlCachePublica(request, url);
   if (!ttl) {
-    if (request.method !== "GET" && request.method !== "HEAD" && url.pathname.startsWith("/api/")) {
+    if (request.method !== "GET" && request.method !== "HEAD" && url.pathname.startsWith("/api/") && !escrituraSinEfectoPublico(url.pathname)) {
       CACHE_PUBLICA.clear();
     }
     return handlePrimary(request, env, ctx);
@@ -11221,9 +12193,10 @@ async function handlePrimary(request, env, ctx) {
           return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
         }
         const body = await request.json().catch(() => ({}));
+        if (body.web) return json({ ok: true }); // campo trampa para bots
         const nombre = normalizarTexto(body.nombre);
         const email = normalizarTexto(body.email)?.toLowerCase() || null;
-        if (!(await verificarTurnstile(request, env, body.turnstileToken))) return json({ error: RESPUESTA_TURNSTILE }, 400);
+        if (!(await verificarTurnstile(request, env, body.turnstileToken))) return json({ error: RESPUESTA_TURNSTILE, motivo: request.__tsMotivo || null }, 400);
         const password = typeof body.password === "string" ? body.password : "";
 
         if (!nombre) return json({ error: "Falta tu nombre" }, 400);
@@ -11885,6 +12858,158 @@ async function handlePrimary(request, env, ctx) {
         return json({ ok: true });
       }
 
+      // ---------- GUARDADAS PARA LEER LUEGO (cuenta del lector, punto 5) ----------
+      if (path === "/api/readers/me/guardadas" && method === "GET") {
+        const payload = await requireReaderAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        return json({ guardadas: await listarGuardadasLector(env, payload.rid), max: LECTURAS_MAX_GUARDADAS });
+      }
+
+      if (path === "/api/readers/me/guardadas" && method === "POST") {
+        const payload = await requireReaderAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const body = await request.json().catch(() => ({}));
+        const [articleId] = idsNoticiaDesdeLista([body && body.article_id], 1);
+        if (!articleId) return json({ error: "Noticia no válida" }, 400);
+        const existe = await env.DB.prepare("SELECT id FROM articles WHERE id = ? AND publicado = 1").bind(articleId).first();
+        if (!existe) return json({ error: "Noticia no encontrada" }, 404);
+        const yaGuardada = await env.DB.prepare(
+          "SELECT id FROM reader_saved_articles WHERE reader_id = ? AND article_id = ?"
+        ).bind(payload.rid, articleId).first();
+        if (!yaGuardada) {
+          const cuenta = await env.DB.prepare(
+            "SELECT COUNT(*) AS total FROM reader_saved_articles WHERE reader_id = ?"
+          ).bind(payload.rid).first();
+          if (Number(cuenta && cuenta.total) >= LECTURAS_MAX_GUARDADAS) {
+            return json({ error: `Puedes guardar hasta ${LECTURAS_MAX_GUARDADAS} noticias. Quita alguna para guardar más.` }, 409);
+          }
+          await env.DB.prepare(
+            "INSERT INTO reader_saved_articles (reader_id, article_id) VALUES (?, ?) ON CONFLICT(reader_id, article_id) DO NOTHING"
+          ).bind(payload.rid, articleId).run();
+        }
+        return json({ ok: true, guardada: true });
+      }
+
+      {
+        const mGuardada = path.match(/^\/api\/readers\/me\/guardadas\/(\d{1,12})$/);
+        if (mGuardada && method === "DELETE") {
+          const payload = await requireReaderAuth(request, env);
+          if (!payload) return json({ error: "No autorizado" }, 401);
+          await env.DB.prepare("DELETE FROM reader_saved_articles WHERE reader_id = ? AND article_id = ?")
+            .bind(payload.rid, parseInt(mGuardada[1], 10)).run();
+          return json({ ok: true, guardada: false });
+        }
+      }
+
+      // ---------- HISTORIAL DE LECTURA (cuenta del lector, punto 5) ----------
+      if (path === "/api/readers/me/historial" && method === "GET") {
+        const payload = await requireReaderAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const limitePedido = parseInt(url.searchParams.get("limit") || "30", 10);
+        const limite = Number.isInteger(limitePedido) && limitePedido > 0 ? Math.min(limitePedido, LECTURAS_MAX_HISTORIAL) : 30;
+        const desdePedido = parseInt(url.searchParams.get("offset") || "0", 10);
+        const desde = Number.isInteger(desdePedido) && desdePedido > 0 ? Math.min(desdePedido, LECTURAS_MAX_HISTORIAL) : 0;
+        // Se pide una fila de más para saber si hay otra página sin un COUNT aparte.
+        const { results } = await env.DB.prepare(
+          `SELECT h.article_id, h.created_at FROM reader_reading_history h
+           JOIN articles a ON a.id = h.article_id
+           WHERE h.reader_id = ? AND a.publicado = 1
+           ORDER BY h.created_at DESC, h.id DESC LIMIT ? OFFSET ?`
+        ).bind(payload.rid, limite + 1, desde).all();
+        return json({
+          historial: results.slice(0, limite).map((r) => ({ article_id: Number(r.article_id), created_at: r.created_at })),
+          hay_mas: results.length > limite,
+        });
+      }
+
+      if (path === "/api/readers/me/historial" && method === "POST") {
+        const payload = await requireReaderAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const body = await request.json().catch(() => ({}));
+        const [articleId] = idsNoticiaDesdeLista([body && body.article_id], 1);
+        if (!articleId) return json({ error: "Noticia no válida" }, 400);
+        const existe = await env.DB.prepare("SELECT id FROM articles WHERE id = ? AND publicado = 1").bind(articleId).first();
+        if (!existe) return json({ ok: false });
+        // Volver a leer una noticia la sube arriba: se borra y se reinserta (ver
+        // migracion_lecturas_cuenta.sql: así la tabla es de solo-inserción para el sincronizador).
+        await env.DB.prepare("DELETE FROM reader_reading_history WHERE reader_id = ? AND article_id = ?")
+          .bind(payload.rid, articleId).run();
+        await env.DB.prepare("INSERT INTO reader_reading_history (reader_id, article_id) VALUES (?, ?)")
+          .bind(payload.rid, articleId).run();
+        await podarHistorialLector(env, payload.rid);
+        return json({ ok: true });
+      }
+
+      if (path === "/api/readers/me/historial" && method === "DELETE") {
+        const payload = await requireReaderAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        await env.DB.prepare("DELETE FROM reader_reading_history WHERE reader_id = ?").bind(payload.rid).run();
+        return json({ ok: true });
+      }
+
+      {
+        const mHistorial = path.match(/^\/api\/readers\/me\/historial\/(\d{1,12})$/);
+        if (mHistorial && method === "DELETE") {
+          const payload = await requireReaderAuth(request, env);
+          if (!payload) return json({ error: "No autorizado" }, 401);
+          await env.DB.prepare("DELETE FROM reader_reading_history WHERE reader_id = ? AND article_id = ?")
+            .bind(payload.rid, parseInt(mHistorial[1], 10)).run();
+          return json({ ok: true });
+        }
+      }
+
+      // ---------- FUSIONAR LO GUARDADO EN EL NAVEGADOR CON LA CUENTA (punto 5) ----------
+      // Se llama una vez por inicio de sesión (public/js/lecturas.js). Solo AÑADE:
+      // lo que ya está en la cuenta no se toca. Lo fusionado queda con la fecha de
+      // este momento (el navegador no manda fechas): las lecturas hechas como
+      // visitante son justo las más recientes, y así las filas nuevas siempre
+      // quedan por delante del cursor del sincronizador D1 -> Postgres.
+      if (path === "/api/readers/me/lecturas/sincronizar" && method === "POST") {
+        const payload = await requireReaderAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const body = await request.json().catch(() => ({}));
+        // El navegador manda lo más reciente primero.
+        const idsGuardadas = idsNoticiaDesdeLista(body && body.guardadas, LECTURAS_MAX_GUARDADAS);
+        const idsHistorial = idsNoticiaDesdeLista(body && body.historial, LECTURAS_MAX_HISTORIAL);
+        const publicados = await idsNoticiaPublicados(env, [...new Set([...idsGuardadas, ...idsHistorial])]);
+
+        const { results: guardadasActuales } = await env.DB.prepare(
+          "SELECT article_id FROM reader_saved_articles WHERE reader_id = ?"
+        ).bind(payload.rid).all();
+        const yaGuardadas = new Set(guardadasActuales.map((r) => Number(r.article_id)));
+        let nuevasGuardadas = idsGuardadas.filter((id) => publicados.has(id) && !yaGuardadas.has(id)).reverse();
+        const hueco = Math.max(0, LECTURAS_MAX_GUARDADAS - yaGuardadas.size);
+        if (nuevasGuardadas.length > hueco) nuevasGuardadas = nuevasGuardadas.slice(nuevasGuardadas.length - hueco);
+        await insertarLecturasLector(env, "reader_saved_articles", payload.rid, nuevasGuardadas);
+
+        const { results: historialActual } = await env.DB.prepare(
+          "SELECT article_id FROM reader_reading_history WHERE reader_id = ?"
+        ).bind(payload.rid).all();
+        const yaLeidas = new Set(historialActual.map((r) => Number(r.article_id)));
+        const nuevasLeidas = idsHistorial.filter((id) => publicados.has(id) && !yaLeidas.has(id)).reverse();
+        await insertarLecturasLector(env, "reader_reading_history", payload.rid, nuevasLeidas);
+        if (nuevasLeidas.length) await podarHistorialLector(env, payload.rid);
+
+        return json({
+          ok: true,
+          nuevas_guardadas: nuevasGuardadas.length,
+          nuevas_historial: nuevasLeidas.length,
+          guardadas: await listarGuardadasLector(env, payload.rid),
+        });
+      }
+
+      // ---------- Avisos por correo de comentarios (activar/desactivar) ----------
+      if (path === "/api/readers/me/avisos-comentarios" && method === "PUT") {
+        const payload = await requireReaderAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const body = await request.json().catch(() => ({}));
+        if (typeof body.activo !== "boolean") return json({ error: "Valor no válido" }, 400);
+        const r = await env.DB.prepare("UPDATE readers SET avisos_comentarios = ? WHERE id = ? AND activo = 1")
+          .bind(body.activo ? 1 : 0, payload.rid).run();
+        if (!r.meta || !r.meta.changes) return json({ error: "Cuenta no encontrada" }, 404);
+        return json({ ok: true, avisos_comentarios: body.activo });
+      }
+
       // ---------- Quién soy (recuperar sesión al recargar la página) ----------
       if (path === "/api/readers/me" && method === "GET") {
         const payload = await requireReaderAuth(request, env);
@@ -11904,10 +13029,10 @@ async function handlePrimary(request, env, ctx) {
         const payload = await requireReaderAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         const lector = await env.DB.prepare(
-          "SELECT id, nombre, email, email_verificado, avatar_url FROM readers WHERE id = ? AND activo = 1"
+          "SELECT id, nombre, email, email_verificado, avatar_url, avisos_comentarios FROM readers WHERE id = ? AND activo = 1"
         ).bind(payload.rid).first();
         if (!lector) return json({ error: "No autorizado" }, 401);
-        return json({ reader: { ...lector, email_verificado: !!lector.email_verificado } });
+        return json({ reader: { ...lector, email_verificado: !!lector.email_verificado, avisos_comentarios: !!lector.avisos_comentarios } });
       }
 
       // ---------- MIS SESIONES (dispositivos conectados) ----------
@@ -12121,9 +13246,11 @@ async function handlePrimary(request, env, ctx) {
         if (await limiteExcedido(request, env, "lector-forgot", 6, 3600)) {
           return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
         }
-        const { email } = await request.json().catch(() => ({}));
+        const bodyOlvido = await request.json().catch(() => ({}));
+        const { email } = bodyOlvido;
         const emailNorm = normalizarTexto(email)?.toLowerCase() || null;
         if (!emailNorm) return json({ error: "Falta el correo" }, 400);
+        if (!(await verificarTurnstile(request, env, bodyOlvido.turnstileToken))) return json({ error: RESPUESTA_TURNSTILE, motivo: request.__tsMotivo || null }, 400);
 
         const lector = await env.DB.prepare("SELECT * FROM readers WHERE email = ? AND activo = 1").bind(emailNorm).first();
         if (lector) {
@@ -12193,11 +13320,118 @@ async function handlePrimary(request, env, ctx) {
         }
         const hash = await hashPassword(password, user.salt);
         if (!comparacionConstante(hash, user.password_hash)) return json({ error: "Usuario o contraseña incorrectos" }, 401);
+        // Dispositivo de confianza: contraseña correcta + token de dispositivo válido => sin pedir el código.
+        if (ROLES_CON_2FA_OBLIGATORIO.includes(user.rol) || ROLES_CON_2FA_OPCIONAL.includes(user.rol)) {
+          await asegurarColumnas2fa(env);
+          if (user.totp_activo && await dispositivoConfianzaValido(env, user, cuerpoLogin.dispositivo)) {
+            const tokenConfiable = await crearSesion(env, request, user, { tfa: true });
+            ctx.waitUntil(registrarActividad(env, request, { uid: user.id, nombre: user.nombre, rol: user.rol }, {
+              accion: "login", entidad: "sesion", descripcion: `${user.nombre} ha iniciado sesión (dispositivo de confianza, sin pedir el código)`,
+            }));
+            // Se renueva el token: mientras se use, el dispositivo sigue siendo de confianza.
+            return json({ token: tokenConfiable, user: usuarioParaRespuestaLogin(user), dispositivo: await crearDispositivoConfianza(env, user) });
+          }
+        }
+        // 2FA obligatorio (admins): contraseña correcta NO basta para tener sesión.
+        if (ROLES_CON_2FA_OBLIGATORIO.includes(user.rol)) {
+          await asegurarColumnas2fa(env);
+          const desafioLogin = await crearDesafio2fa(env, user);
+          return json(user.totp_activo
+            ? { requiere_2fa: true, desafio: desafioLogin }
+            : { requiere_configurar_2fa: true, desafio: desafioLogin });
+        }
+        // 2FA opcional (colaboradores): solo si lo han activado ellos. Sin 2FA activo
+        // el login sigue igual (contraseña -> sesión).
+        if (ROLES_CON_2FA_OPCIONAL.includes(user.rol)) {
+          await asegurarColumnas2fa(env);
+          if (user.totp_activo) {
+            return json({ requiere_2fa: true, desafio: await crearDesafio2fa(env, user) });
+          }
+        }
         const token = await crearSesion(env, request, user);
         ctx.waitUntil(registrarActividad(env, request, { uid: user.id, nombre: user.nombre, rol: user.rol }, {
           accion: "login", entidad: "sesion", descripcion: `${user.nombre} ha iniciado sesión`,
         }));
         return json({ token, user: { id: user.id, username: user.username, nombre: user.nombre, rol: user.rol, nivel: user.rol === "admin" ? NIVEL_MAXIMO : (user.nivel || 1), email: user.email || null, avatar_url: user.avatar_url || null, avatar_foco: user.avatar_foco || null, categorias_fijas: parsearCategoriasFijas(user.categorias_fijas) } });
+      }
+
+      // ---------- 2FA OBLIGATORIO (admins): configurar, activar y verificar ----------
+      if ((path === "/api/login/2fa/setup" || path === "/api/login/2fa/activar" || path === "/api/login/2fa") && method === "POST") {
+        const cuerpo2fa = await request.json().catch(() => ({}));
+        await asegurarColumnas2fa(env);
+        if (await limiteExcedido(request, env, "login-2fa", 40, 900)) return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+        const desafio2fa = await leerDesafio2fa(env, cuerpo2fa.desafio);
+        if (!desafio2fa) return json({ error: "La verificación ha caducado. Vuelve a escribir tu usuario y contraseña.", caducado: true }, 401);
+        const user2fa = await env.DB.prepare("SELECT * FROM users WHERE id = ? AND activo = 1").bind(desafio2fa.fa2).first();
+        const permitido2fa = Boolean(user2fa) && (
+          ROLES_CON_2FA_OBLIGATORIO.includes(user2fa.rol) ||
+          (ROLES_CON_2FA_OPCIONAL.includes(user2fa.rol) && Boolean(user2fa.totp_activo) && path === "/api/login/2fa")
+        );
+        if (!permitido2fa) {
+          return json({ error: "Vuelve a iniciar sesión.", caducado: true }, 401);
+        }
+        if (await limiteExcedido(request, env, "login-2fa-user", 8, 900, String(user2fa.id))) {
+          return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+        }
+        const abrirSesion2fa = async (extra = {}) => {
+          const tokenSesion = await crearSesion(env, request, user2fa, { tfa: true });
+          ctx.waitUntil(registrarActividad(env, request, { uid: user2fa.id, nombre: user2fa.nombre, rol: user2fa.rol }, {
+            accion: "login", entidad: "sesion", descripcion: `${user2fa.nombre} ha iniciado sesión (verificación en dos pasos)`,
+          }));
+          // "Confiar en este dispositivo": la casilla del login manda recordar = true.
+          const confianza = cuerpo2fa.recordar === true ? { dispositivo: await crearDispositivoConfianza(env, user2fa) } : {};
+          return json({ token: tokenSesion, user: usuarioParaRespuestaLogin(user2fa), ...confianza, ...extra });
+        };
+
+        if (path === "/api/login/2fa/setup") {
+          if (user2fa.totp_activo) return json({ error: "Esta cuenta ya tiene la verificación en dos pasos configurada." }, 400);
+          const secreto = generarSecretoTotp();
+          await env.DB.prepare("UPDATE users SET totp_secret = ?, totp_activo = 0, totp_ultimo_paso = NULL, totp_recovery = NULL WHERE id = ?")
+            .bind(await cifrarSecretoTotp(env, secreto), user2fa.id).run();
+          return json({ secreto, otpauth: construirOtpauth(user2fa.username, secreto) });
+        }
+
+        if (path === "/api/login/2fa/activar") {
+          if (user2fa.totp_activo) return json({ error: "Esta cuenta ya tiene la verificación en dos pasos configurada." }, 400);
+          const secreto = await descifrarSecretoTotp(env, user2fa.totp_secret);
+          if (!secreto) return json({ error: "Primero escanea el código QR." }, 400);
+          const paso = await totpVerificar(secreto, cuerpo2fa.codigo, null);
+          if (paso === null) {
+            return json({ error: "El código no es correcto. Comprueba que la hora de tu móvil esté en automático e inténtalo con el código nuevo." }, 401);
+          }
+          const codigos = generarCodigosRecuperacion();
+          const hashes = await Promise.all(codigos.map(hashCodigoRecuperacion));
+          await env.DB.prepare("UPDATE users SET totp_activo = 1, totp_ultimo_paso = ?, totp_recovery = ? WHERE id = ?")
+            .bind(paso, JSON.stringify(hashes), user2fa.id).run();
+          ctx.waitUntil(registrarActividad(env, request, { uid: user2fa.id, nombre: user2fa.nombre, rol: user2fa.rol }, {
+            accion: "activar_2fa", entidad: "usuario", entidad_id: user2fa.id, descripcion: `${user2fa.nombre} ha activado la verificación en dos pasos`,
+          }));
+          return abrirSesion2fa({ codigos_recuperacion: codigos });
+        }
+
+        // /api/login/2fa: código de la app o código de recuperación
+        if (!user2fa.totp_activo) return json({ error: "Esta cuenta todavía no tiene la verificación en dos pasos configurada.", configurar: true }, 400);
+        const entrada = String(cuerpo2fa.codigo || "").trim();
+        if (!entrada || entrada.length > 40) return json({ error: "Escribe el código." }, 400);
+        if (/^[\d\s]{6,8}$/.test(entrada)) {
+          const secreto = await descifrarSecretoTotp(env, user2fa.totp_secret);
+          const paso = secreto ? await totpVerificar(secreto, entrada, user2fa.totp_ultimo_paso) : null;
+          if (paso === null) return json({ error: "Código incorrecto o ya utilizado. Espera al siguiente código de tu app e inténtalo de nuevo." }, 401);
+          await env.DB.prepare("UPDATE users SET totp_ultimo_paso = ? WHERE id = ?").bind(paso, user2fa.id).run();
+          return abrirSesion2fa();
+        }
+        let hashesGuardados = [];
+        try { hashesGuardados = JSON.parse(user2fa.totp_recovery || "[]"); } catch { hashesGuardados = []; }
+        const hashIntento = await hashCodigoRecuperacion(entrada);
+        const indice = hashesGuardados.findIndex((h) => comparacionConstante(h, hashIntento));
+        if (indice < 0) return json({ error: "Código incorrecto." }, 401);
+        hashesGuardados.splice(indice, 1);
+        await env.DB.prepare("UPDATE users SET totp_recovery = ? WHERE id = ?").bind(JSON.stringify(hashesGuardados), user2fa.id).run();
+        ctx.waitUntil(registrarActividad(env, request, { uid: user2fa.id, nombre: user2fa.nombre, rol: user2fa.rol }, {
+          accion: "usar_codigo_recuperacion_2fa", entidad: "usuario", entidad_id: user2fa.id,
+          descripcion: `${user2fa.nombre} ha entrado con un código de recuperación (quedan ${hashesGuardados.length})`,
+        }));
+        return abrirSesion2fa({ codigos_recuperacion_restantes: hashesGuardados.length });
       }
 
       // ---------- GUARDAR EMAIL (primer inicio de sesión) ----------
@@ -12233,8 +13467,10 @@ async function handlePrimary(request, env, ctx) {
         if (await limiteExcedido(request, env, "staff-forgot", 6, 3600)) {
           return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
         }
-        const { username, email } = await request.json().catch(() => ({}));
+        const bodyOlvidoStaff = await request.json().catch(() => ({}));
+        const { username, email } = bodyOlvidoStaff;
         if (typeof username !== "string" || typeof email !== "string" || !username || !email) return json({ error: "Faltan campos" }, 400);
+        if (!(await verificarTurnstile(request, env, bodyOlvidoStaff.turnstileToken))) return json({ error: RESPUESTA_TURNSTILE, motivo: request.__tsMotivo || null }, 400);
 
         const user = await env.DB.prepare(
           "SELECT * FROM users WHERE username = ? AND email = ? AND activo = 1"
@@ -12479,6 +13715,107 @@ async function handlePrimary(request, env, ctx) {
           descripcion: `${payload.nombre} ha cambiado su contraseña`,
         }));
 
+        return json({ ok: true });
+      }
+
+      // ---------- 2FA OPCIONAL (colaboradores): estado, activar y desactivar desde el panel ----------
+      // Los admins lo tienen obligatorio y lo configuran en el login (más arriba);
+      // aquí un colaborador (redactor, fotógrafo…) lo activa o lo quita por su cuenta. Siempre exige sesión
+      // y, para empezar o quitarlo, la contraseña: un token de sesión robado no basta.
+      // Los errores de contraseña/código van con 400/403 (nunca 401) para que el
+      // panel no los confunda con una sesión caducada.
+      if ((path === "/api/me/2fa" && method === "GET") ||
+          (method === "POST" && (path === "/api/me/2fa/setup" || path === "/api/me/2fa/activar" || path === "/api/me/2fa/desactivar"))) {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        await asegurarColumnas2fa(env);
+        const yo = await env.DB.prepare("SELECT * FROM users WHERE id = ? AND activo = 1").bind(payload.uid).first();
+        if (!yo) return json({ error: "Usuario no encontrado" }, 404);
+        const esObligatorio = ROLES_CON_2FA_OBLIGATORIO.includes(yo.rol);
+        const esOpcional = ROLES_CON_2FA_OPCIONAL.includes(yo.rol);
+
+        if (path === "/api/me/2fa") {
+          let restantes = 0;
+          try { restantes = JSON.parse(yo.totp_recovery || "[]").length; } catch { restantes = 0; }
+          return json({
+            disponible: esObligatorio || esOpcional,
+            obligatorio: esObligatorio,
+            activo: Boolean(yo.totp_activo),
+            codigos_restantes: yo.totp_activo ? restantes : 0,
+          });
+        }
+
+        if (!esOpcional) {
+          return json({
+            error: esObligatorio
+              ? "En tu rol la verificación en dos pasos es obligatoria y se configura al iniciar sesión."
+              : "La verificación en dos pasos no está disponible para tu rol.",
+          }, 403);
+        }
+        if (await limiteExcedido(request, env, "me-2fa", 10, 900, String(yo.id))) {
+          return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+        }
+        const cuerpoMe2fa = await request.json().catch(() => ({}));
+        const passwordCorrecta = async () =>
+          typeof cuerpoMe2fa.password === "string" && cuerpoMe2fa.password.length > 0 && cuerpoMe2fa.password.length <= 1024 &&
+          comparacionConstante(await hashPassword(cuerpoMe2fa.password, yo.salt), yo.password_hash);
+
+        if (path === "/api/me/2fa/setup") {
+          if (yo.totp_activo) return json({ error: "Ya tienes la verificación en dos pasos activada." }, 400);
+          if (!(await passwordCorrecta())) return json({ error: "La contraseña no es correcta." }, 403);
+          const secreto = generarSecretoTotp();
+          await env.DB.prepare("UPDATE users SET totp_secret = ?, totp_activo = 0, totp_ultimo_paso = NULL, totp_recovery = NULL WHERE id = ?")
+            .bind(await cifrarSecretoTotp(env, secreto), yo.id).run();
+          return json({ secreto, otpauth: construirOtpauth(yo.username, secreto) });
+        }
+
+        if (path === "/api/me/2fa/activar") {
+          if (yo.totp_activo) return json({ error: "Ya tienes la verificación en dos pasos activada." }, 400);
+          const secreto = await descifrarSecretoTotp(env, yo.totp_secret);
+          if (!secreto) return json({ error: "Primero escanea el código QR." }, 400);
+          const paso = await totpVerificar(secreto, cuerpoMe2fa.codigo, null);
+          if (paso === null) {
+            return json({ error: "El código no es correcto. Comprueba que la hora de tu móvil esté en automático e inténtalo con el código nuevo." }, 400);
+          }
+          const codigos = generarCodigosRecuperacion();
+          const hashes = await Promise.all(codigos.map(hashCodigoRecuperacion));
+          await env.DB.prepare("UPDATE users SET totp_activo = 1, totp_ultimo_paso = ?, totp_recovery = ? WHERE id = ?")
+            .bind(paso, JSON.stringify(hashes), yo.id).run();
+          // Las demás sesiones abiertas se crearon sin pasar por el 2FA: se cierran.
+          // La actual (donde se acaba de activar) se mantiene.
+          await env.DB.prepare("UPDATE sessions SET revoked_at = datetime('now') WHERE user_id = ? AND id != ? AND revoked_at IS NULL")
+            .bind(yo.id, payload.sid || "").run();
+          invalidarCacheCorta("sesion:");
+          ctx.waitUntil(registrarActividad(env, request, payload, {
+            accion: "activar_2fa", entidad: "usuario", entidad_id: yo.id,
+            descripcion: `${yo.nombre} ha activado la verificación en dos pasos`,
+          }));
+          return json({ ok: true, codigos_recuperacion: codigos, dispositivo: await crearDispositivoConfianza(env, yo) });
+        }
+
+        // /api/me/2fa/desactivar: contraseña + un código de la app o de recuperación
+        if (!yo.totp_activo) return json({ error: "No tienes la verificación en dos pasos activada." }, 400);
+        if (!(await passwordCorrecta())) return json({ error: "La contraseña no es correcta." }, 403);
+        const entradaDesactivar = String(cuerpoMe2fa.codigo || "").trim();
+        if (!entradaDesactivar || entradaDesactivar.length > 40) {
+          return json({ error: "Escribe un código de tu app o uno de recuperación." }, 400);
+        }
+        let codigoValido = false;
+        if (/^[\d\s]{6,8}$/.test(entradaDesactivar)) {
+          const secreto = await descifrarSecretoTotp(env, yo.totp_secret);
+          codigoValido = Boolean(secreto) && (await totpVerificar(secreto, entradaDesactivar, yo.totp_ultimo_paso)) !== null;
+        } else {
+          let guardados = [];
+          try { guardados = JSON.parse(yo.totp_recovery || "[]"); } catch { guardados = []; }
+          const hashIntento = await hashCodigoRecuperacion(entradaDesactivar);
+          codigoValido = guardados.some((h) => comparacionConstante(h, hashIntento));
+        }
+        if (!codigoValido) return json({ error: "Código incorrecto." }, 403);
+        await env.DB.prepare("UPDATE users SET totp_secret = NULL, totp_activo = 0, totp_ultimo_paso = NULL, totp_recovery = NULL WHERE id = ?").bind(yo.id).run();
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "desactivar_2fa", entidad: "usuario", entidad_id: yo.id,
+          descripcion: `${yo.nombre} ha desactivado la verificación en dos pasos`,
+        }));
         return json({ ok: true });
       }
 
@@ -12780,6 +14117,35 @@ async function handlePrimary(request, env, ctx) {
         const [evaluada] = await aplicarFueraCalendarioEnLectura(env, [art]);
         const fuera = !!(evaluada && evaluada.fuera_calendario);
         return json({ permitido: !fuera, fuera_calendario: fuera });
+      }
+
+      // ---------- COMPARTIR EN REDES: ¿ya se subió una previa/crónica de este partido? ----------
+      // Estado: la usa el modal Compartir para avisar de que ya no hace falta.
+      // Acepta ?id= o ?slug= (al publicar, la API solo devuelve el slug).
+      if (path === "/api/compartir-redes/estado" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const art = await buscarArticuloParaCompartir(env, { id: url.searchParams.get("id"), slug: url.searchParams.get("slug") });
+        return json(await estadoSubidaARedes(env, art));
+      }
+
+      // Registro: el modal lo llama al copiar el texto o abrir X. Solo se anota
+      // la primera vez por artículo (sin repetir filas en el Historial).
+      if (path === "/api/compartir-redes/registrar" && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const body = await request.json().catch(() => ({}));
+        const art = await buscarArticuloParaCompartir(env, { id: body.id, slug: body.slug });
+        if (!art || !FUSION_TIPOS.includes(art.tipo) || !art.resultado_id) return json({ ok: true, registrado: false });
+        const yaRegistrado = await env.DB.prepare(
+          "SELECT id FROM activity_log WHERE accion = 'compartir_redes' AND entidad = 'articulo' AND entidad_id = ? LIMIT 1"
+        ).bind(String(art.id)).first();
+        if (yaRegistrado) return json({ ok: true, registrado: false });
+        await registrarActividad(env, request, payload, {
+          accion: "compartir_redes", entidad: "articulo", entidad_id: art.id,
+          descripcion: `Ha subido a redes la ${art.tipo === "previa" ? "previa" : "crónica"} "${art.titulo}"`,
+        });
+        return json({ ok: true, registrado: true });
       }
 
       if (path === "/api/horario-publicacion" && method === "GET") {
@@ -13522,6 +14888,15 @@ async function handlePrimary(request, env, ctx) {
               accion: "anuncio_email_envio", entidad: "anuncio", entidad_id: id,
               descripcion: `Ha enviado el anuncio por correo "${v.datos.asunto}" a ${total} persona(s) (${describirSeleccionAnuncio(v.datos.audiencias)})`,
             }));
+            ctx.waitUntil((async () => {
+              const dest = await resolverDestinatariosAnuncio(env, v.datos.audiencias);
+              const correos = new Set(dest.map((d) => String(d.email).trim().toLowerCase()));
+              await staffPushEnviar(env, "anuncios", {
+                titulo: "Nuevo anuncio",
+                cuerpo: v.datos.asunto,
+                ir: "anuncios", tag: `anuncio-${id}`,
+              }, { excluirUid: payload.uid, filtro: (d) => !!d.email && correos.has(String(d.email).trim().toLowerCase()) });
+            })().catch((e) => console.error("push equipo (anuncio):", e && e.message)));
           }
 
           const tanda = Math.max(0, parseInt(body.tanda, 10) || 0);
@@ -13568,8 +14943,9 @@ async function handlePrimary(request, env, ctx) {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver los usuarios" }, 403);
+        await asegurarColumnas2fa(env);
         const { results } = await env.DB.prepare(
-          "SELECT id, username, nombre, rol, activo, email, equipo, categorias_fijas, avatar_url, nivel, nivel_nota, created_at FROM users ORDER BY nombre"
+          "SELECT id, username, nombre, rol, activo, email, equipo, categorias_fijas, avatar_url, nivel, nivel_nota, created_at, totp_activo FROM users ORDER BY nombre"
         ).all();
         // El progreso de nivel de TODOS los usuarios se calcula con una
         // sola consulta agregada (antes: una consulta por usuario,
@@ -13639,6 +15015,28 @@ async function handlePrimary(request, env, ctx) {
       }
 
       // ---------- USUARIOS: restablecer contraseña ----------
+      // ---------- USUARIOS: restablecer el 2FA de otra persona (solo admin) ----------
+      // Para cuando alguien pierde el móvil Y sus códigos de recuperación. La
+      // persona tendrá que volver a configurar la app en su próximo acceso.
+      const reset2faMatch = path.match(/^\/api\/users\/(\d+)\/reset-2fa$/);
+      if (reset2faMatch && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede restablecer la verificación en dos pasos" }, 403);
+        const id = parseInt(reset2faMatch[1]);
+        if (id === payload.uid) return json({ error: "No puedes restablecer tu propio 2FA. Usa un código de recuperación o pídeselo a otro administrador." }, 400);
+        const user = await env.DB.prepare("SELECT id, username FROM users WHERE id = ?").bind(id).first();
+        if (!user) return json({ error: "Usuario no encontrado" }, 404);
+        await asegurarColumnas2fa(env);
+        await env.DB.prepare("UPDATE users SET totp_secret = NULL, totp_activo = 0, totp_ultimo_paso = NULL, totp_recovery = NULL WHERE id = ?").bind(id).run();
+        await env.DB.prepare("UPDATE sessions SET revoked_at = datetime('now') WHERE user_id = ? AND revoked_at IS NULL").bind(id).run();
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "restablecer_2fa", entidad: "usuario", entidad_id: id,
+          descripcion: `Ha restablecido la verificación en dos pasos de "${user.username}"`,
+        }));
+        return json({ ok: true });
+      }
+
       const resetPassMatch = path.match(/^\/api\/users\/(\d+)\/reset-password$/);
       if (resetPassMatch && method === "PUT") {
         const payload = await requireAuth(request, env);
@@ -13846,6 +15244,8 @@ async function handlePrimary(request, env, ctx) {
         // abajo), así que se borran las solicitudes que hizo esta persona.
         await env.DB.prepare("DELETE FROM club_info_solicitudes WHERE solicitante_id = ?").bind(id).run();
         await env.DB.prepare("UPDATE club_info_solicitudes SET resuelta_por_id = NULL WHERE resuelta_por_id = ?").bind(id).run();
+        await env.DB.prepare("DELETE FROM staff_push_subscriptions WHERE user_id = ?").bind(id).run();
+        await env.DB.prepare("DELETE FROM staff_push_prefs WHERE user_id = ?").bind(id).run();
         await env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(id).run();
         // usuario_id es NOT NULL en nivel_historial: no se puede poner a
         // NULL, así que se borra su historial de cambios de nivel.
@@ -13949,6 +15349,13 @@ async function handlePrimary(request, env, ctx) {
                 ],
               }),
             }));
+          }
+          if (!avisoEnLoteEnlace) {
+            ctx.waitUntil(staffPushEnviar(env, "contenido", {
+              titulo: `Nuevo ${esFotoEnlace ? "foto" : "vídeo"} (enlace)`,
+              cuerpo: `${payload.nombre}: ${tituloEnlace}`,
+              ir: "contenido", tag: "contenido",
+            }, { excluirUid: payload.uid }));
           }
           return json({ ok: true, enlaceExterno: true });
         }
@@ -14225,6 +15632,14 @@ async function handlePrimary(request, env, ctx) {
           descripcion: `Ha subido ${esFoto ? "una foto" : "un vídeo"}: "${titulo}"`,
         }));
 
+        if (!avisoEnLote) {
+          ctx.waitUntil(staffPushEnviar(env, "contenido", {
+            titulo: `Nuevo ${esFoto ? "foto" : "vídeo"} subido`,
+            cuerpo: `${payload.nombre}: ${titulo}`,
+            ir: "contenido", tag: "contenido",
+          }, { excluirUid: payload.uid }));
+        }
+
         return json({ ok: true, galeriaPartidoSlug });
       }
 
@@ -14294,6 +15709,11 @@ async function handlePrimary(request, env, ctx) {
         if (fotos) partes.push(`${fotos} ${fotos === 1 ? "foto" : "fotos"}`);
         if (videos) partes.push(`${videos} ${videos === 1 ? "vídeo" : "vídeos"}`);
         const resumen = partes.join(" y ");
+        ctx.waitUntil(staffPushEnviar(env, "contenido", {
+          titulo: "Nuevas subidas de contenido",
+          cuerpo: `${payload.nombre} ha subido ${resumen}${tituloLote ? ` (${tituloLote})` : ""}`,
+          ir: "contenido", tag: "contenido",
+        }, { excluirUid: payload.uid }));
 
         ctx.waitUntil(enviarEmailNotificacion(env, {
           asunto: `Nuevas subidas: ${resumen}${tituloLote ? ` (${tituloLote})` : ""}`,
@@ -14947,6 +16367,74 @@ async function handlePrimary(request, env, ctx) {
       }
 
       // ---------- ARTICLES: lista pública / creación ----------
+      // ---------- Organización para redes: etiqueta de carrusel / individual ----------
+      // Las noticias y crónicas menos importantes se suben a X sin portada y a
+      // Instagram juntas en un carrusel (dos al día: mañana y tarde). Aquí se
+      // marca a qué carrusel va cada noticia (carousel_1, carousel_2), o si se
+      // sube suelta (individual); null quita la etiqueta.
+      //  - Solo se puede ETIQUETAR una noticia que ya está programada (publicado = 0
+      //    y programado_para con fecha). Quitar la etiqueta se puede siempre.
+      //  - La etiqueta desaparece sola cuando la noticia se publica (ver
+      //    publicarArticulosProgramados) o deja de estar programada (PUT).
+      //  - Permiso: admin o redactor Nivel 2+ (como el banner de última hora). No
+      //    hace falta ser autor: es organización de redes de toda la redacción.
+      // Acepta varias a la vez: { ids: [1, 2, 3], destino: "carousel_1" | "carousel_2" | "individual" | null }
+      if (path === "/api/articles/redes-destino" && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede organizar las noticias para redes." }, 403);
+        }
+        const nivelUsuario = payload.rol === "admin" ? NIVEL_MAXIMO : await obtenerNivelUsuario(env, payload.uid);
+        if (payload.rol !== "admin" && nivelUsuario < 2) {
+          return json({ error: "No tienes permiso para organizar las noticias para redes." }, 403);
+        }
+        let body;
+        try { body = await request.json(); } catch { return json({ error: "Cuerpo no válido" }, 400); }
+        const DESTINOS_REDES = ["carousel_1", "carousel_2", "individual"];
+        const destino = body && body.destino !== undefined && body.destino !== null && body.destino !== "" ? body.destino : null;
+        if (destino !== null && !DESTINOS_REDES.includes(destino)) {
+          return json({ error: "Destino no válido (carousel_1, carousel_2, individual o null)." }, 400);
+        }
+        const ids = Array.isArray(body && body.ids)
+          ? [...new Set(body.ids.map((n) => parseInt(n, 10)).filter((n) => Number.isInteger(n) && n > 0))]
+          : [];
+        if (!ids.length) return json({ error: "Falta indicar qué noticias." }, 400);
+        if (ids.length > 50) return json({ error: "Máximo 50 noticias a la vez." }, 400);
+
+        const marcas = ids.map(() => "?").join(",");
+        const { results: filas } = await env.DB.prepare(
+          `SELECT id, publicado, programado_para FROM articles WHERE id IN (${marcas})`
+        ).bind(...ids).all();
+        const porId = new Map((filas || []).map((f) => [Number(f.id), f]));
+        const validas = [];
+        const omitidas = [];
+        for (const id of ids) {
+          const fila = porId.get(id);
+          if (!fila) { omitidas.push({ id, motivo: "No existe." }); continue; }
+          if (destino !== null && (fila.publicado || !fila.programado_para)) {
+            omitidas.push({ id, motivo: "Solo se pueden etiquetar noticias ya programadas." });
+            continue;
+          }
+          validas.push(id);
+        }
+        if (validas.length) {
+          const marcasValidas = validas.map(() => "?").join(",");
+          await env.DB.prepare(
+            `UPDATE articles SET redes_destino = ? WHERE id IN (${marcasValidas})`
+          ).bind(destino, ...validas).run();
+          const nombreDestino = { carousel_1: "Carrusel 1", carousel_2: "Carrusel 2", individual: "noticia individual" }[destino];
+          ctx.waitUntil(registrarActividad(env, request, payload, {
+            accion: destino ? "etiquetar_redes_articulo" : "quitar_etiqueta_redes_articulo",
+            entidad: "articulo", entidad_id: validas.length === 1 ? validas[0] : null,
+            descripcion: destino
+              ? `Ha marcado ${validas.length} noticia(s) como ${nombreDestino} para redes (#${validas.join(", #")}).`
+              : `Ha quitado la etiqueta de redes de ${validas.length} noticia(s) (#${validas.join(", #")}).`,
+          }));
+        }
+        return json({ ok: true, destino, actualizadas: validas, omitidas });
+      }
+
       // ---------- Banner flotante de "última hora" (público) ----------
       // Lo consulta layout.js desde CUALQUIER página del sitio (es la
       // única llamada que hace falta para saber si hay que pintar el
@@ -15085,6 +16573,11 @@ async function handlePrimary(request, env, ctx) {
         // siempre.
         const offsetPedido = parseInt(url.searchParams.get("offset") || "0", 10);
         const offsetArticulos = Number.isInteger(offsetPedido) && offsetPedido > 0 ? Math.min(offsetPedido, 5000) : 0;
+        // "ids=1,2,3": solo esas noticias. Lo usan "Guardadas" e "Historial" (cuenta y
+        // navegador) para pintar las tarjetas con los mismos campos que cualquier listado.
+        // Máximo 60 ids (más el limit/offset caben en los 100 parámetros de D1).
+        const soloIds = (url.searchParams.get("ids") || "")
+          .split(",").map((v) => parseInt(v, 10)).filter((v) => Number.isInteger(v) && v > 0).slice(0, 60);
         let admin = url.searchParams.get("admin") === "1";
         if (admin) {
           // La vista "admin" incluye borradores no publicados, así que
@@ -15121,6 +16614,7 @@ async function handlePrimary(request, env, ctx) {
             titulo_gl, LENGTH(contenido_gl) AS contenido_gl_len,
             titulo_en, LENGTH(contenido_en) AS contenido_en_len,
             ficha_tecnica, fuera_calendario, banner_urgente, banner_urgente_hasta,
+            ${admin ? "redes_destino" : "NULL"} AS redes_destino,
             ${admin
               ? `CASE WHEN publicado = 1 AND tipo IN ('previa', 'cronica') AND resultado_id IS NOT NULL
                    THEN (SELECT COUNT(*) FROM articles b WHERE b.resultado_id = articles.resultado_id AND b.tipo = articles.tipo AND b.publicado = 1)
@@ -15140,7 +16634,7 @@ async function handlePrimary(request, env, ctx) {
         const binds = [];
         if (!admin) {
           query += " AND publicado = 1";
-          if (!slugExacto) query += SQL_OCULTAR_SEGUNDO_DE_FUSION;
+          if (!slugExacto && !soloIds.length) query += SQL_OCULTAR_SEGUNDO_DE_FUSION;
         }
         if (slugExacto) { query += " AND slug = ?"; binds.push(slugExacto); }
         if (categoria) {
@@ -15177,6 +16671,11 @@ async function handlePrimary(request, env, ctx) {
         if (excluirIds.length) {
           query += ` AND id NOT IN (${excluirIds.map(() => "?").join(",")})`;
           binds.push(...excluirIds);
+        }
+
+        if (soloIds.length) {
+          query += ` AND id IN (${soloIds.map(() => "?").join(",")})`;
+          binds.push(...soloIds);
         }
         // Solo se busca en el título, no en "contenido" (el cuerpo entero
         // del artículo): un LIKE '%x%' sobre una columna de texto largo no
@@ -15552,8 +17051,15 @@ async function handlePrimary(request, env, ctx) {
           }));
         }
 
+        if (!programadoPara && (publicado || estadoBorrador === "terminado")) {
+          ctx.waitUntil(notificarStaffArticulo(env, {
+            titulo: body.titulo, slug, categoria: categoriaFinal, tipo: body.tipo,
+            autor_nombre: autorNombre, coautor_nombre: coautorNombre,
+          }, { excluirUid: payload.uid, borrador: !publicado }));
+        }
+
         if (publicado && !programadoPara) {
-          ctx.waitUntil(notificarPushArticulo(env, { titulo: body.titulo, subtitulo: body.subtitulo, slug, categoria: categoriaFinal, imagen_url: body.imagen_url }));
+          ctx.waitUntil(notificarPushArticulo(env, { titulo: body.titulo, subtitulo: body.subtitulo, slug, categoria: categoriaFinal, imagen_url: body.imagen_url, club: typeof clubFinal !== "undefined" ? clubFinal : null }));
           // Aviso a los buscadores (IndexNow) en el mismo momento de publicar.
           ctx.waitUntil(notificarIndexNow(env, [urlNoticia(categoriaFinal, slug)]));
         }
@@ -15615,11 +17121,35 @@ async function handlePrimary(request, env, ctx) {
             return json({ redirect: redirect.slug });
           }
 
+          // Datos mínimos de una noticia programada (los usa el contador de
+          // noticia.html y, sobre todo, el worker del sitio para servir a
+          // X/Facebook/WhatsApp... una vista previa con titular, subtítulo e
+          // imagen ANTES de que se publique; sin esto el rastreador recibía un
+          // 404 y la tarjeta se quedaba cacheada sin título ni foto). NUNCA se
+          // devuelve el contenido del cuerpo.
+          //
+          // Ya no se exige "programado_para > ahora": el disparador publica
+          // cada minuto, así que entre la hora programada y la publicación real
+          // pasan hasta ~60 s en los que antes esta consulta no devolvía nada y
+          // salía un 404 justo cuando el tuit programado a esa misma hora
+          // pedía la tarjeta. Mientras siga con publicado = 0 y
+          // programado_para informado, sigue siendo "programada".
           const programada = await env.DB.prepare(
-            `SELECT slug, titulo, tipo, categoria, imagen_url, programado_para
-             FROM articles WHERE slug = ?1 AND publicado = 0 AND programado_para IS NOT NULL AND programado_para > datetime('now')`
+            `SELECT slug, titulo, subtitulo, tipo, categoria, imagen_url, imagenes, programado_para
+             FROM articles WHERE slug = ?1 AND publicado = 0 AND programado_para IS NOT NULL`
           ).bind(key).first();
           if (programada) {
+            // Sin portada propia, la primera foto adicional (igual que hace el
+            // worker del sitio con las noticias ya publicadas).
+            if (!programada.imagen_url && programada.imagenes) {
+              try {
+                const lista = normalizarImagenes(JSON.parse(programada.imagenes));
+                // Los tuits/posts incrustados también viven en "imagenes": no son foto.
+                const primera = Array.isArray(lista) && lista.find((x) => x && x.tipo !== "tweet" && x.url);
+                if (primera) programada.imagen_url = primera.url;
+              } catch { /* imagenes mal formadas: se queda sin imagen */ }
+            }
+            delete programada.imagenes;
             return json({ programado: programada });
           }
 
@@ -16327,13 +17857,25 @@ async function handlePrimary(request, env, ctx) {
           accion: "editar_articulo", entidad: "articulo", entidad_id: id,
           descripcion: `Ha editado la noticia/crónica "${body.titulo}"${estadoBorrador ? ` (${estadoBorrador === "terminado" ? "borrador terminado" : "borrador en proceso"})` : ""}${esEdicionAjenaPorNivel4 ? " (revisión de contenido ajeno, Nivel 4)" : ""}`,
         }));
+        try {
+          const staffArt = { titulo: body.titulo, slug, categoria: categoriaFinal, tipo: body.tipo, autor_nombre: autorNombre, coautor_nombre: coautorNombre };
+          if (body.publicado === false && estadoBorrador === "terminado" && !yaEstabaTerminado) {
+            ctx.waitUntil(notificarStaffArticulo(env, staffArt, { excluirUid: payload.uid, borrador: true }));
+          } else if (body.publicado !== false && !programadoPara && articuloParaPermiso && !articuloParaPermiso.publicado) {
+            ctx.waitUntil(notificarStaffArticulo(env, staffArt, { excluirUid: payload.uid }));
+          }
+        } catch (errStaff) { console.error("push equipo (editar articulo):", errStaff && errStaff.message); }
         // Si el articulo estaba en borrador y se publica ahora, aviso push.
         // (typeof: por si esta variable no estuviera a la vista en este punto.)
         if (body.publicado !== false && !programadoPara && typeof articuloParaPermiso !== "undefined" && articuloParaPermiso && !articuloParaPermiso.publicado) {
-          ctx.waitUntil(notificarPushArticulo(env, { titulo: body.titulo, subtitulo: body.subtitulo, slug, categoria: categoriaFinal, imagen_url: body.imagen_url }));
+          ctx.waitUntil(notificarPushArticulo(env, { titulo: body.titulo, subtitulo: body.subtitulo, slug, categoria: categoriaFinal, imagen_url: body.imagen_url, club: typeof clubFinal !== "undefined" ? clubFinal : null }));
           // Aviso a los buscadores (IndexNow) en el mismo momento de publicar.
           ctx.waitUntil(notificarIndexNow(env, [urlNoticia(categoriaFinal, slug)]));
         }
+        // Etiqueta de redes (carrusel / individual): solo tiene sentido mientras
+        // la noticia sigue programada. Si al guardar ya no lo está (se publica
+        // ahora, vuelve a borrador...), se quita para no dejar etiquetas huérfanas.
+        await env.DB.prepare("UPDATE articles SET redes_destino = NULL WHERE id = ? AND programado_para IS NULL AND redes_destino IS NOT NULL").bind(id).run();
         ctx.waitUntil(indexarArticuloBusqueda(env, id));
         return json({ ok: true, slug, publicado: body.publicado === false ? 0 : 1, fuera_calendario: fueraCalendario, estado_borrador: estadoBorrador, programado_para: programadoPara, fecha_preferencia_desde: preferenciaFechas.desde, fecha_preferencia_hasta: preferenciaFechas.hasta, avisos_traduccion: avisosTraduccion });
       }
@@ -16520,6 +18062,17 @@ async function handlePrimary(request, env, ctx) {
           `INSERT INTO edit_requests (tipo_entidad, entidad_id, solicitante_id, autor_id, motivo, estado)
            VALUES (?, ?, ?, ?, ?, 'pendiente')`
         ).bind(tipoEntidad, entidadId, payload.uid, entidad.autor_id || null, body.motivo ? String(body.motivo).slice(0, 500) : null).run();
+
+        {
+          const destinosEdicion = [...new Set([entidad.autor_id, entidad.coautor_id].filter((x) => x && x !== payload.uid))];
+          ctx.waitUntil(staffPushEnviar(env, "ediciones", {
+            titulo: "Petición de edición pendiente",
+            cuerpo: `${payload.nombre} pide permiso para editar ${tipoEntidad === "resultado" ? "un resultado" : "una noticia/crónica"}${destinosEdicion.length ? " tuya" : ""}`,
+            ir: "ediciones", tag: `edicion-${tipoEntidad}-${entidadId}`,
+          }, destinosEdicion.length
+            ? { soloUids: destinosEdicion }
+            : { excluirUid: payload.uid, filtro: (d) => d.rol === "admin" }));
+        }
 
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "solicitar_edicion", entidad: tipoEntidad, entidad_id: entidadId,
@@ -17289,6 +18842,12 @@ async function handlePrimary(request, env, ctx) {
           descripcion: `${payload.nombre} ha pedido ${cantidad > 1 ? cantidad + " x " : ""}"${producto.nombre}"${variante ? " (" + variante + ")" : ""} en la tienda (${codigo}, ${metodoPago}, ${entrega === "envio" ? "envío" : "en mano"})`,
         }));
 
+        ctx.waitUntil(staffPushEnviar(env, "tienda", {
+          titulo: "Nueva compra en la tienda",
+          cuerpo: `${payload.nombre} ha pedido ${cantidad > 1 ? cantidad + " x " : ""}${producto.nombre}${variante ? " (" + variante + ")" : ""} · ${codigo}`,
+          ir: "tienda", tag: `tienda-${codigo}`,
+        }, { excluirUid: payload.uid, filtro: (d) => d.rol === "admin" || Number(d.puede_gestionar_tienda) === 1 }));
+
         return json({
           ok: true, pedido_id: pedidosIds[0], pedidos_ids: pedidosIds, cantidad,
           codigo, metodo_pago: metodoPago, entrega,
@@ -17317,7 +18876,7 @@ async function handlePrimary(request, env, ctx) {
       if (path.match(/^\/api\/tienda\/mis-pedidos\/\d+\/cancelar$/) && method === "PUT") {
         const payload = await requireAuthTienda(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        const pedidoId = parseInt(path.split("/")[3], 10);
+        const pedidoId = parseInt(path.split("/")[4], 10); // /api/tienda/mis-pedidos/<id>/cancelar
         const pedido = await env.DB.prepare(
           "SELECT id, usuario_id, estado, producto_nombre FROM tienda_pedidos WHERE id = ?"
         ).bind(pedidoId).first();
@@ -17472,12 +19031,20 @@ async function handlePrimary(request, env, ctx) {
         // Si es una previa/crónica fusionada con otras del mismo partido,
         // se leen los comentarios de todas juntas.
         const idsComentarios = await idsGrupoFusion(env, articleId);
-        const { results: comentarios } = await env.DB.prepare(
-          `SELECT id, nombre, texto, created_at, likes, dislikes, reader_id
-           FROM comments
-           WHERE article_id IN (${idsComentarios.map(() => "?").join(",")}) AND estado = 'aprobado' AND oculto_por_denuncia = 0
-           ORDER BY created_at ASC`
+        // Respuestas: parent_id = comentario raíz del hilo, responde_a_id =
+        // comentario concreto contestado (de ahí sale "en respuesta a ...").
+        // El nombre solo se devuelve si el contestado sigue visible.
+        const { results: todos } = await env.DB.prepare(
+          `SELECT c.id, c.nombre, c.texto, c.created_at, c.likes, c.dislikes, c.reader_id, c.parent_id, c.responde_a_id,
+                  CASE WHEN p.estado = 'aprobado' AND p.oculto_por_denuncia = 0 THEN p.nombre END AS responde_a_nombre
+           FROM comments c LEFT JOIN comments p ON p.id = c.responde_a_id
+           WHERE c.article_id IN (${idsComentarios.map(() => "?").join(",")}) AND c.estado = 'aprobado' AND c.oculto_por_denuncia = 0
+           ORDER BY c.created_at ASC, c.id ASC`
         ).bind(...idsComentarios).all();
+        // Una respuesta solo se ve si su comentario raíz también se ve: si la
+        // redacción rechaza/oculta el raíz, el hilo entero desaparece.
+        const visibles = new Set(todos.map((c) => Number(c.id)));
+        const comentarios = todos.filter((c) => !c.parent_id || visibles.has(Number(c.parent_id)));
         return json({ comentarios });
       }
 
@@ -17509,9 +19076,10 @@ async function handlePrimary(request, env, ctx) {
           }
         }
         if (!readerId) {
+          if (body.web) return json({ ok: true }); // campo trampa para bots
           nombre = normalizarTexto(body.nombre);
           email = normalizarTexto(body.email);
-          if (!(await verificarTurnstile(request, env, body.turnstileToken))) return json({ error: RESPUESTA_TURNSTILE }, 400);
+          if (!(await verificarTurnstile(request, env, body.turnstileToken))) return json({ error: RESPUESTA_TURNSTILE, motivo: request.__tsMotivo || null }, 400);
         }
 
         const texto = normalizarTexto(body.texto);
@@ -17521,12 +19089,36 @@ async function handlePrimary(request, env, ctx) {
         if (!texto) return json({ error: "El comentario no puede estar vacío" }, 400);
         if (texto.length > 2000) return json({ error: "El comentario es demasiado largo (máximo 2000 caracteres)" }, 400);
 
+        // Respuesta a otro comentario (hilos de un solo nivel): solo se puede
+        // contestar a un comentario visible de esta misma noticia (o de su grupo
+        // de previas/crónicas fusionadas). Si se contesta a una respuesta, el
+        // hilo sigue colgando del comentario raíz y responde_a_id guarda a quién.
+        let parentId = null, respondeAId = null;
+        if (body.parent_id !== undefined && body.parent_id !== null && body.parent_id !== "") {
+          const objetivoId = Number(body.parent_id);
+          if (!Number.isInteger(objetivoId) || objetivoId <= 0) return json({ error: "El comentario al que respondes no es válido" }, 400);
+          const idsGrupo = (await idsGrupoFusion(env, articleId)).map(Number);
+          const objetivo = await env.DB.prepare(
+            "SELECT id, article_id, parent_id FROM comments WHERE id = ? AND estado = 'aprobado' AND oculto_por_denuncia = 0"
+          ).bind(objetivoId).first();
+          if (!objetivo || !idsGrupo.includes(Number(objetivo.article_id))) {
+            return json({ error: "El comentario al que quieres responder ya no está disponible" }, 404);
+          }
+          parentId = objetivo.parent_id ? Number(objetivo.parent_id) : Number(objetivo.id);
+          respondeAId = Number(objetivo.id);
+        }
+
         const ip = request.headers.get("CF-Connecting-IP") || request.headers.get("X-Forwarded-For") || null;
         await env.DB.prepare(
-          `INSERT INTO comments (article_id, nombre, email, texto, ip, reader_id) VALUES (?, ?, ?, ?, ?, ?)`
-        ).bind(articleId, nombre, email, texto, ip, readerId).run();
+          `INSERT INTO comments (article_id, nombre, email, texto, ip, reader_id, parent_id, responde_a_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(articleId, nombre, email, texto, ip, readerId, parentId, respondeAId).run();
 
-        return json({ ok: true, mensaje: "Comentario enviado. Se publicará en cuanto lo revise la redacción." });
+        ctx.waitUntil(staffPushEnviar(env, "comentarios", {
+          titulo: parentId ? "Nueva respuesta pendiente" : "Nuevo comentario pendiente",
+          cuerpo: `${nombre}: ${texto}`,
+          ir: "comentarios", tag: "comentarios",
+        }));
+        return json({ ok: true, mensaje: parentId ? "Respuesta enviada. Se publicará en cuanto la revise la redacción." : "Comentario enviado. Se publicará en cuanto lo revise la redacción." });
       }
 
       // ---------- Encuestas ----------
@@ -18227,7 +19819,8 @@ async function handlePrimary(request, env, ctx) {
 
         // ---------- Rendimiento por autor ----------
         if (path === "/api/admin/analiticas/autores") {
-          const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
+          // v3: cambió el cálculo (percentil); clave propia para no servir resultados antiguos de la caché.
+          const { datos } = await conCacheKV(env, cacheKey.replace("analiticas-cache:", "analiticas-cache:v3:"), CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
             calcularAutoresAnaliticas(env, desde),
             { cortacircuitos: OPC_CORTACIRCUITOS_ANALITICAS }
           );
@@ -18403,8 +19996,10 @@ async function handlePrimary(request, env, ctx) {
 
         const estado = url.searchParams.get("estado") || "pendiente";
         const { results: comentarios } = await env.DB.prepare(
-          `SELECT c.*, a.titulo AS articulo_titulo, a.slug AS articulo_slug, a.categoria AS articulo_categoria
+          `SELECT c.*, a.titulo AS articulo_titulo, a.slug AS articulo_slug, a.categoria AS articulo_categoria,
+                  pn.nombre AS responde_a_nombre
            FROM comments c JOIN articles a ON a.id = c.article_id
+           LEFT JOIN comments pn ON pn.id = c.responde_a_id
            WHERE c.estado = ? ORDER BY c.created_at DESC`
         ).bind(estado).all();
         return json({ comentarios });
@@ -18420,8 +20015,10 @@ async function handlePrimary(request, env, ctx) {
         if (payload.rol !== "admin") return json({ error: "Solo un administrador puede moderar comentarios" }, 403);
 
         const { results: comentarios } = await env.DB.prepare(
-          `SELECT c.*, a.titulo AS articulo_titulo, a.slug AS articulo_slug, a.categoria AS articulo_categoria
+          `SELECT c.*, a.titulo AS articulo_titulo, a.slug AS articulo_slug, a.categoria AS articulo_categoria,
+                  pn.nombre AS responde_a_nombre
            FROM comments c JOIN articles a ON a.id = c.article_id
+           LEFT JOIN comments pn ON pn.id = c.responde_a_id
            WHERE c.denuncias > 0 ORDER BY c.oculto_por_denuncia DESC, c.denuncias DESC, c.created_at DESC`
         ).all();
         return json({ comentarios });
@@ -18469,6 +20066,9 @@ async function handlePrimary(request, env, ctx) {
           accion: "moderar_comentario", entidad: "comentario", entidad_id: id,
           descripcion: `Ha marcado un comentario como "${body.estado}"`,
         }));
+        // Avisa por correo a quien corresponda (autora del comentario y/o de
+        // aquel al que contesta). Idempotente: ver avisarComentarioAprobado.
+        if (body.estado === "aprobado") ctx.waitUntil(avisarComentarioAprobado(env, id));
         return json({ ok: true });
       }
 
@@ -18552,6 +20152,11 @@ async function handlePrimary(request, env, ctx) {
             accion: "proponer_club_info", entidad: "club",
             descripcion: `Ha propuesto una ficha para el ${club}, pendiente de aprobación`,
           }));
+          ctx.waitUntil(staffPushEnviar(env, "fichas", {
+            titulo: "Propuesta de ficha de equipo",
+            cuerpo: `${payload.nombre} propone cambios en la ficha del ${club}`,
+            ir: "fichas", tag: `ficha-${pushClaveClub(club)}`,
+          }, { excluirUid: payload.uid }));
           return json({ ok: true, pendiente: true });
         }
 
@@ -20460,6 +22065,14 @@ async function handlePrimary(request, env, ctx) {
       // carga la URL como cualquier navegación normal) ni autenticación (todo
       // lo que muestran estos widgets ya es público en el propio sitio). Todas
       // comparten estilos base y el script de auto-resize (widgetBaseHtml).
+      // Prueba real del aviso de failover: devuelve un 503 desde el principal.
+      if (path === "/api/internal/test-5xx" && method === "POST") {
+        const esperado = env.INTERNAL_SYNC_SECRET;
+        const recibido = request.headers.get("X-Internal-Sync-Secret");
+        if (!esperado || !recibido || !comparacionConstante(recibido, esperado)) return json({ error: "No autorizado" }, 401);
+        return json({ error: "Prueba de 503 del principal" }, 503);
+      }
+
       if (path.startsWith("/widgets/")) {
         return widgetsRouter(path, url, env);
       }

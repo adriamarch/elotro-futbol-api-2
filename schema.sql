@@ -47,6 +47,11 @@ CREATE TABLE users (
   -- categoría). Solo lo asigna un admin desde "Usuarios", igual que
   -- el equipo.
   categorias_fijas TEXT,
+  -- Verificación en dos pasos (TOTP) obligatoria para admins (ver migracion_2fa_admins.sql).
+  totp_secret TEXT,
+  totp_activo INTEGER NOT NULL DEFAULT 0,
+  totp_ultimo_paso INTEGER,
+  totp_recovery TEXT,
   -- Última vez que la persona ha visto las novedades (campana de
   -- notificaciones) del panel, guardado en el servidor para que no se
   -- pierda si se borran las cookies/datos del navegador.
@@ -844,3 +849,25 @@ CREATE TABLE IF NOT EXISTS formularios_respuestas (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_formularios_respuestas_form ON formularios_respuestas(formulario_id, created_at DESC);
+
+-- Punto 5: guardadas para leer luego + historial de lectura del lector.
+-- Ver worker/migracion_lecturas_cuenta.sql.
+CREATE TABLE IF NOT EXISTS reader_saved_articles (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  reader_id INTEGER NOT NULL REFERENCES readers(id) ON DELETE CASCADE,
+  article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (reader_id, article_id)
+);
+CREATE INDEX IF NOT EXISTS idx_reader_saved_reader_fecha ON reader_saved_articles(reader_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_reader_saved_article ON reader_saved_articles(article_id);
+
+CREATE TABLE IF NOT EXISTS reader_reading_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  reader_id INTEGER NOT NULL REFERENCES readers(id) ON DELETE CASCADE,
+  article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (reader_id, article_id)
+);
+CREATE INDEX IF NOT EXISTS idx_reader_history_reader_fecha ON reader_reading_history(reader_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_reader_history_article ON reader_reading_history(article_id);

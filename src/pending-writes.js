@@ -63,9 +63,20 @@ const RUTAS_EXCLUIDAS = new Set([
   "/api/media/aviso-lote",
 ]);
 
+// Historial de lectura de lectores (punto 5): se escribe en cada noticia que
+// abre un lector con sesión (POST) y es solo una comodidad, no un dato de
+// negocio. Encolarlo llenaría pending_writes de entradas y al volver D1 las
+// reproduciría una a una; el sincronizador D1→PG ya cubre la tabla. Incluye
+// /historial (POST/DELETE) y /historial/:id (DELETE). Las guardadas SÍ se
+// encolan: son una acción explícita del lector que no debe perderse.
+function esRutaHistorialLector(path) {
+  return path === "/api/readers/me/historial" || path.startsWith("/api/readers/me/historial/");
+}
+
 export function debeEncolarse(method, path) {
   if (!METODOS_ESCRITURA.has(method)) return false;
   if (RUTAS_EXCLUIDAS.has(path)) return false;
+  if (esRutaHistorialLector(path)) return false;
   return true;
 }
 

@@ -167,6 +167,30 @@ export const TABLES = [
     syncMode: "authoritative",
   },
   {
+    // Noticias guardadas por lectores (punto 5). Solo-inserción en D1: guardar
+    // inserta y quitar borra; nunca se actualiza una fila in place.
+    // Necesita readers (9.5) y articles (9) ya sincronizados.
+    name: "reader_saved_articles",
+    pk: ["id"],
+    order: 9.7,
+    changeStrategy: "immutable",
+    cursorColumn: "created_at",
+    deleteDetection: true,
+  },
+  {
+    // Historial de lectura. Releer una noticia hace DELETE + INSERT (la fila
+    // nueva trae otro id y un created_at más reciente), así que sigue siendo
+    // solo-inserción para el sincronizador; el UNIQUE (reader_id, article_id)
+    // que choca con la fila vieja se resuelve en UNICOS_RESOLUBLES
+    // (incremental.mjs).
+    name: "reader_reading_history",
+    pk: ["id"],
+    order: 9.8,
+    changeStrategy: "immutable",
+    cursorColumn: "created_at",
+    deleteDetection: true,
+  },
+  {
     // Votos (like/dislike) de comentarios. Solo-inserción en D1 (un voto
     // se borra y reinserta, nunca se actualiza in place, según
     // worker/src/index.js), así que "immutable" con created_at basta.
@@ -537,6 +561,8 @@ export const DEPENDENCIAS_FK = {
   article_slug_redirects: ["articles"],
   comments: ["articles", "users", "readers"],
   reader_sessions: ["readers"],
+  reader_saved_articles: ["readers", "articles"],
+  reader_reading_history: ["readers", "articles"],
   comment_votes: ["comments"],
   comment_reports: ["comments"],
   polls: ["articles", "users"],

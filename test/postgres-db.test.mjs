@@ -21,3 +21,13 @@ assert.equal(f.sql,"INSERT INTO x (a) VALUES ($1) ON CONFLICT DO NOTHING RETURNI
 const g=translateSql("INSERT INTO a (b) VALUES (?) ON CONFLICT(b) DO NOTHING");
 assert.equal(g.sql,"INSERT INTO a (b) VALUES ($1) ON CONFLICT(b) DO NOTHING"); // no se duplica
 console.log("insert-or-ignore translation tests: OK");
+
+// Punto 5 (guardadas + historial): las sentencias de los endpoints /api/readers/me/guardadas,
+// /historial y /lecturas/sincronizar deben traducirse a PostgreSQL válido.
+const h1 = translateSql("INSERT INTO reader_saved_articles (reader_id, article_id) VALUES (?, ?), (?, ?) ON CONFLICT(reader_id, article_id) DO NOTHING");
+assert.equal(h1.sql, "INSERT INTO reader_saved_articles (reader_id, article_id) VALUES ($1, $2), ($3, $4) ON CONFLICT(reader_id, article_id) DO NOTHING");
+const h2 = translateSql("DELETE FROM reader_reading_history WHERE reader_id = ? AND id IN (SELECT id FROM reader_reading_history WHERE reader_id = ? ORDER BY created_at DESC, id DESC LIMIT 1000 OFFSET 100)");
+assert.equal(h2.sql, "DELETE FROM reader_reading_history WHERE reader_id = $1 AND id IN (SELECT id FROM reader_reading_history WHERE reader_id = $2 ORDER BY created_at DESC, id DESC LIMIT 1000 OFFSET 100)");
+const h3 = translateSql("SELECT h.article_id, h.created_at FROM reader_reading_history h JOIN articles a ON a.id = h.article_id WHERE h.reader_id = ? AND a.publicado = 1 ORDER BY h.created_at DESC, h.id DESC LIMIT ? OFFSET ?");
+assert.equal(h3.sql, "SELECT h.article_id, h.created_at FROM reader_reading_history h JOIN articles a ON a.id = h.article_id WHERE h.reader_id = $1 AND a.publicado = 1 ORDER BY h.created_at DESC, h.id DESC LIMIT $2 OFFSET $3");
+console.log("lecturas-cuenta translation tests: OK");

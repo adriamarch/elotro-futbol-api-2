@@ -37,6 +37,8 @@ test("todas las tablas sincronizadas están configuradas (17 de Fase 4 + las añ
     "porras",
     "reader_sessions",
     "readers",
+    "reader_saved_articles",
+    "reader_reading_history",
     "tienda_pedidos",
     "tienda_productos",
     // Fase 2 de la sincronización completa (paridad de datos del failover)

@@ -105,6 +105,10 @@ const UNICOS_RESOLUBLES = {
   users: ["username"],
   push_subscriptions: ["endpoint"],
   votaciones_internas_votos: [["opcion_id", "usuario_id"]],
+  // Releer una noticia = DELETE + INSERT en D1 (otro id); en PG la fila vieja
+  // sigue ocupando UNIQUE (reader_id, article_id). Guardar tras quitar igual.
+  reader_saved_articles: [["reader_id", "article_id"]],
+  reader_reading_history: [["reader_id", "article_id"]],
 };
 
 // Devuelve la columna (o array de columnas) UNIQUE implicada si el error es

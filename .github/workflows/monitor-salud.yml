@@ -1,0 +1,36 @@
+# Vigilante EXTERNO de la API: avisa a Discord si el principal o Railway no
+# responden bien. Cubre lo que un worker no puede avisar de sí mismo (caída
+# total, error 1101/1102, cuota agotada, dominio de Railway sin servicio).
+# Requiere el secret de repositorio DISCORD_WEBHOOK_URL (el mismo webhook de ALERT_WEBHOOK_URL).
+name: Monitor de salud
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+jobs:
+  comprobar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comprobar API principal y Railway
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          fallos=""
+          comprobar() {
+            nombre="$1"; url="$2"
+            codigo=$(curl -s -o /tmp/r.txt -w "%{http_code}" --max-time 20 "$url" || echo "000")
+            if [ "$codigo" != "200" ]; then
+              fallos="$fallos\n- $nombre respondió $codigo ($url)"
+            fi
+          }
+          comprobar "Principal (Cloudflare)" "https://api.elotrofutbol.media/api/health"
+          comprobar "Railway (respaldo)" "https://elotro-futbol-api-production.up.railway.app/api/health"
+          if [ -n "$fallos" ]; then
+            echo -e "Fallos:$fallos"
+            if [ -n "$WEBHOOK" ]; then
+              msg=$(printf '🚨 **Monitor de salud ElOtroFútbol**%b' "\n$fallos")
+              curl -s -H "Content-Type: application/json" -d "$(jq -n --arg c "$msg" '{content:$c}')" "$WEBHOOK"
+            fi
+            exit 1
+          fi
+          echo "Todo OK"
