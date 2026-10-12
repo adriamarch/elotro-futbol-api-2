@@ -16376,8 +16376,10 @@ async function handlePrimary(request, env, ctx) {
       //    y programado_para con fecha). Quitar la etiqueta se puede siempre.
       //  - La etiqueta desaparece sola cuando la noticia se publica (ver
       //    publicarArticulosProgramados) o deja de estar programada (PUT).
-      //  - Permiso: admin o redactor Nivel 2+ (como el banner de última hora). No
+      //  - Permiso: admin o redactor Nivel 4+ (NIVEL_REDES_MINIMO). No
       //    hace falta ser autor: es organización de redes de toda la redacción.
+      // Nivel mínimo para organizar noticias en carruseles (el panel lo oculta por debajo).
+      const NIVEL_REDES_MINIMO = 4;
       // Acepta varias a la vez: { ids: [1, 2, 3], destino: "carousel_1" | "carousel_2" | "individual" | null }
       if (path === "/api/articles/redes-destino" && method === "PUT") {
         const payload = await requireAuth(request, env);
@@ -16386,7 +16388,7 @@ async function handlePrimary(request, env, ctx) {
           return json({ error: "Un fotógrafo no puede organizar las noticias para redes." }, 403);
         }
         const nivelUsuario = payload.rol === "admin" ? NIVEL_MAXIMO : await obtenerNivelUsuario(env, payload.uid);
-        if (payload.rol !== "admin" && nivelUsuario < 2) {
+        if (payload.rol !== "admin" && nivelUsuario < NIVEL_REDES_MINIMO) {
           return json({ error: "No tienes permiso para organizar las noticias para redes." }, 403);
         }
         let body;
