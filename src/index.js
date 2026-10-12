@@ -5641,6 +5641,55 @@ function normalizarJugadoresAlineacion(raw) {
 // actividad del equipo desde el panel ("Historial"). No debe romper
 // nunca la operación principal: si falla el registro, solo se anota en
 // los logs del Worker.
+// ---------- ORGANIGRAMA (Funcionalidades > Información) ----------
+// Se guarda entero como JSON en settings bajo la clave 'organigrama'.
+// Forma: { orientacion: "vertical"|"horizontal", nodos: [{ id, nombre, cargo,
+// nota, color, padre, colapsado }] }. El orden del array es el orden entre
+// hermanos. Varias raíces permitidas. Devuelve { datos } o { error }.
+const ORGANIGRAMA_MAX_NODOS = 120;
+const ORGANIGRAMA_COLORES = ["azul", "rojo", "verde", "amarillo", "morado", "rosa", "gris", "naranja"];
+function limpiarOrganigrama(entrada) {
+  if (!entrada || typeof entrada !== "object" || Array.isArray(entrada)) return { error: "Organigrama no válido" };
+  const lista = Array.isArray(entrada.nodos) ? entrada.nodos : null;
+  if (!lista) return { error: "Faltan los nodos del organigrama" };
+  if (lista.length > ORGANIGRAMA_MAX_NODOS) return { error: `El organigrama admite como máximo ${ORGANIGRAMA_MAX_NODOS} casillas` };
+  const texto = (v, max) => (typeof v === "string" ? v.replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, max) : "");
+  const ids = new Set();
+  const nodos = [];
+  for (const n of lista) {
+    if (!n || typeof n !== "object") return { error: "Casilla no válida" };
+    const id = typeof n.id === "string" ? n.id.trim() : "";
+    if (!/^[a-z0-9_-]{1,24}$/i.test(id)) return { error: "Identificador de casilla no válido" };
+    if (ids.has(id)) return { error: "Hay casillas con el mismo identificador" };
+    ids.add(id);
+    const nombre = texto(n.nombre, 80);
+    if (!nombre) return { error: "Todas las casillas necesitan un nombre" };
+    const nota = typeof n.nota === "string" ? n.nota.replace(/\r/g, "").replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]+/g, " ").trim().slice(0, 400) : "";
+    nodos.push({
+      id, nombre,
+      cargo: texto(n.cargo, 80),
+      nota,
+      color: ORGANIGRAMA_COLORES.includes(n.color) ? n.color : "azul",
+      padre: typeof n.padre === "string" && n.padre.trim() ? n.padre.trim() : null,
+      colapsado: n.colapsado === true,
+    });
+  }
+  const porId = new Map(nodos.map((n) => [n.id, n]));
+  for (const n of nodos) {
+    if (n.padre !== null && !porId.has(n.padre)) return { error: "Una casilla depende de otra que no existe" };
+    if (n.padre === n.id) return { error: "Una casilla no puede depender de sí misma" };
+  }
+  // Sin ciclos: desde cada nodo hay que llegar a una raíz en menos pasos que nodos.
+  for (const n of nodos) {
+    let actual = n, pasos = 0;
+    while (actual.padre !== null) {
+      actual = porId.get(actual.padre);
+      if (++pasos > nodos.length) return { error: "El organigrama tiene un bucle: una casilla depende de una de sus subordinadas" };
+    }
+  }
+  return { datos: { orientacion: entrada.orientacion === "horizontal" ? "horizontal" : "vertical", nodos } };
+}
+
 async function registrarActividad(env, request, payload, { accion, entidad = null, entidad_id = null, descripcion, detalle = null }) {
   try {
     // "request" puede venir vacío cuando la actividad la registra el propio
@@ -6105,8 +6154,98 @@ const HORARIO_FIJO = {
   },
 };
 
+// ---------- CALENDARIO DE CONTENIDO EDITABLE (Funcionalidades > Información > Horario) ----------
+// Lo editan los admins desde el panel y se guarda entero como JSON en settings
+// bajo la clave 'calendario_contenido'. Forma:
+//   { dias: { lunes: [ [bloque, ...] x5 franjas ], ... },
+//     todo: { sabado: [bloque, ...], ... } }
+//   bloque = { id, tipo, texto, nota, personas: [nombre, ...] }
+// Si nunca se ha guardado, se usa HORARIO_FIJO (el de siempre). Cuando sí hay
+// calendario guardado, las reglas de "fuera de calendario" se derivan de él:
+// noticias -> noticia, previas -> previa, crónicas -> crónica de la jornada en
+// curso y de la anterior. Los demás tipos no son artículos y no se evalúan.
+const CALENDARIO_FRANJAS = 5;
+const CALENDARIO_TIPOS = ["clasificacion", "noticias", "matchday", "resultados", "previas", "cronicas", "data", "reel", "disc"];
+const CALENDARIO_MAX_POR_CELDA = 6;
+const CALENDARIO_MAX_BLOQUES = 150;
+const CALENDARIO_MAX_PERSONAS = 12;
+function limpiarCalendarioContenido(entrada) {
+  if (!entrada || typeof entrada !== "object" || Array.isArray(entrada)) return { error: "Calendario no válido" };
+  const texto = (v, max) => (typeof v === "string" ? v.replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, max) : "");
+  const ids = new Set();
+  let total = 0;
+  const limpiarBloques = (lista) => {
+    if (lista === undefined || lista === null) return { bloques: [] };
+    if (!Array.isArray(lista)) return { error: "Celda del calendario no válida" };
+    if (lista.length > CALENDARIO_MAX_POR_CELDA) return { error: `Una franja admite como máximo ${CALENDARIO_MAX_POR_CELDA} tareas` };
+    const bloques = [];
+    for (const b of lista) {
+      if (!b || typeof b !== "object") return { error: "Tarea no válida" };
+      if (!CALENDARIO_TIPOS.includes(b.tipo)) return { error: "Tipo de contenido no válido" };
+      const t = texto(b.texto, 60);
+      if (!t) return { error: "Todas las tareas necesitan un nombre" };
+      let id = typeof b.id === "string" ? b.id.trim() : "";
+      if (!/^[a-z0-9_-]{1,24}$/i.test(id) || ids.has(id)) id = "b" + Math.random().toString(36).slice(2, 9) + ids.size.toString(36);
+      ids.add(id);
+      const personas = [];
+      for (const p of Array.isArray(b.personas) ? b.personas : []) {
+        const n = texto(p, 60);
+        if (n && !personas.some((x) => x.toLowerCase() === n.toLowerCase())) personas.push(n);
+      }
+      if (personas.length > CALENDARIO_MAX_PERSONAS) return { error: `Una tarea admite como máximo ${CALENDARIO_MAX_PERSONAS} personas` };
+      if (++total > CALENDARIO_MAX_BLOQUES) return { error: `El calendario admite como máximo ${CALENDARIO_MAX_BLOQUES} tareas` };
+      bloques.push({ id, tipo: b.tipo, texto: t, nota: texto(b.nota, 80), personas });
+    }
+    return { bloques };
+  };
+  const dias = {};
+  const todo = {};
+  for (const d of DIAS_HORARIO) {
+    const franjas = entrada.dias && Array.isArray(entrada.dias[d]) ? entrada.dias[d] : [];
+    dias[d] = [];
+    for (let f = 0; f < CALENDARIO_FRANJAS; f++) {
+      const r = limpiarBloques(franjas[f]);
+      if (r.error) return { error: r.error };
+      dias[d].push(r.bloques);
+    }
+    const rt = limpiarBloques(entrada.todo ? entrada.todo[d] : []);
+    if (rt.error) return { error: rt.error };
+    todo[d] = rt.bloques;
+  }
+  return { datos: { dias, todo } };
+}
+
+// Reglas de "fuera de calendario" derivadas de un calendario guardado.
+function horarioDesdeCalendario(cal) {
+  const dias = {};
+  for (const d of DIAS_HORARIO) {
+    const set = new Set();
+    for (const franja of cal.dias[d] || []) {
+      for (const b of franja) {
+        if (b.tipo === "noticias") set.add("noticia");
+        else if (b.tipo === "previas") set.add("previa");
+        else if (b.tipo === "cronicas") { set.add("cronica_actual"); set.add("cronica_anterior"); }
+      }
+    }
+    dias[d] = IDS_TIPOS_HORARIO.filter((t) => set.has(t));
+  }
+  return { activo: true, dias };
+}
+
+let cacheHorarioPublicacion = { t: 0, valor: null };
 async function obtenerHorarioPublicacion(env) {
-  return HORARIO_FIJO;
+  const ahora = Date.now();
+  if (cacheHorarioPublicacion.valor && ahora - cacheHorarioPublicacion.t < 60000) return cacheHorarioPublicacion.valor;
+  let valor = HORARIO_FIJO;
+  try {
+    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'calendario_contenido'").first();
+    if (row && row.value) {
+      const r = limpiarCalendarioContenido(JSON.parse(row.value));
+      if (r.datos) valor = horarioDesdeCalendario(r.datos);
+    }
+  } catch (err) { console.error("calendario_contenido:", err); }
+  cacheHorarioPublicacion = { t: ahora, valor };
+  return valor;
 }
 
 // ¿La crónica es de una jornada que ya terminó? Se mira el rango de
@@ -14116,6 +14255,41 @@ async function handlePrimary(request, env, ctx) {
         return json({ ok: true, redes: redesLimpias });
       }
 
+      // ---------- ORGANIGRAMA (Funcionalidades > Información) ----------
+      // Lo puede consultar cualquier usuario con sesión; solo un admin lo modifica.
+      if (path === "/api/organigrama" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const row = await env.DB.prepare("SELECT value, updated_at FROM settings WHERE key = 'organigrama'").first();
+        let datos = { orientacion: "vertical", nodos: [] };
+        if (row) {
+          try {
+            const r = limpiarOrganigrama(JSON.parse(row.value));
+            if (r.datos) datos = r.datos;
+          } catch { /* valor corrupto: se devuelve vacío */ }
+        }
+        return json({ ...datos, updated_at: row ? row.updated_at : null });
+      }
+
+      if (path === "/api/organigrama" && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede modificar el organigrama" }, 403);
+        let body;
+        try { body = await request.json(); } catch { return json({ error: "Cuerpo no válido" }, 400); }
+        const r = limpiarOrganigrama(body);
+        if (r.error) return json({ error: r.error }, 400);
+        await env.DB.prepare(
+          `INSERT INTO settings (key, value, updated_at) VALUES ('organigrama', ?, datetime('now'))
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+        ).bind(JSON.stringify(r.datos)).run();
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "editar_settings", entidad: "settings",
+          descripcion: `Ha modificado el organigrama (${r.datos.nodos.length} casillas)`,
+        }));
+        return json({ ok: true, ...r.datos });
+      }
+
       // ---------- HORARIO DE PUBLICACIÓN ----------
       // Lo puede consultar cualquier usuario con sesión (los redactores lo
       // ven en Funcionalidades > Horario); solo un admin lo modifica.
@@ -14161,6 +14335,42 @@ async function handlePrimary(request, env, ctx) {
           descripcion: `Ha subido a redes la ${art.tipo === "previa" ? "previa" : "crónica"} "${art.titulo}"`,
         });
         return json({ ok: true, registrado: true });
+      }
+
+      // ---------- CALENDARIO DE CONTENIDO (Funcionalidades > Información > Horario) ----------
+      // Lo puede consultar cualquier usuario con sesión; solo un admin lo modifica.
+      if (path === "/api/calendario-contenido" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const row = await env.DB.prepare("SELECT value, updated_at FROM settings WHERE key = 'calendario_contenido'").first();
+        if (row) {
+          try {
+            const r = limpiarCalendarioContenido(JSON.parse(row.value));
+            if (r.datos) return json({ personalizado: true, ...r.datos, updated_at: row.updated_at });
+          } catch { /* valor corrupto: se usa el calendario por defecto del panel */ }
+        }
+        return json({ personalizado: false, dias: null, todo: null, updated_at: null });
+      }
+
+      if (path === "/api/calendario-contenido" && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede modificar el calendario" }, 403);
+        let body;
+        try { body = await request.json(); } catch { return json({ error: "Cuerpo no válido" }, 400); }
+        const r = limpiarCalendarioContenido(body);
+        if (r.error) return json({ error: r.error }, 400);
+        await env.DB.prepare(
+          `INSERT INTO settings (key, value, updated_at) VALUES ('calendario_contenido', ?, datetime('now'))
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+        ).bind(JSON.stringify(r.datos)).run();
+        cacheHorarioPublicacion = { t: 0, valor: null };
+        const nTareas = Object.values(r.datos.dias).reduce((s, fr) => s + fr.reduce((a, c) => a + c.length, 0), 0) + Object.values(r.datos.todo).reduce((s, c) => s + c.length, 0);
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "editar_settings", entidad: "settings",
+          descripcion: `Ha modificado el calendario de contenido (${nTareas} tareas)`,
+        }));
+        return json({ ok: true, personalizado: true, ...r.datos });
       }
 
       if (path === "/api/horario-publicacion" && method === "GET") {
