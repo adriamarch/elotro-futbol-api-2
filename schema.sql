@@ -850,6 +850,21 @@ CREATE TABLE IF NOT EXISTS formularios_respuestas (
 );
 CREATE INDEX IF NOT EXISTS idx_formularios_respuestas_form ON formularios_respuestas(formulario_id, created_at DESC);
 
+-- Invitaciones de formulario (personas con caducidad). Ver worker/migracion_formularios_invitados.sql.
+CREATE TABLE IF NOT EXISTS formularios_invitados (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  formulario_id INTEGER NOT NULL,
+  campo_id TEXT NOT NULL,
+  opcion TEXT NOT NULL,
+  opcion_norm TEXT NOT NULL,
+  expira_at TEXT,
+  creado_por TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_formularios_invitados_unica ON formularios_invitados(formulario_id, campo_id, opcion_norm);
+CREATE INDEX IF NOT EXISTS idx_formularios_invitados_form ON formularios_invitados(formulario_id, expira_at);
+
 -- Punto 5: guardadas para leer luego + historial de lectura del lector.
 -- Ver worker/migracion_lecturas_cuenta.sql.
 CREATE TABLE IF NOT EXISTS reader_saved_articles (
@@ -871,3 +886,27 @@ CREATE TABLE IF NOT EXISTS reader_reading_history (
 );
 CREATE INDEX IF NOT EXISTS idx_reader_history_reader_fecha ON reader_reading_history(reader_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reader_history_article ON reader_reading_history(article_id);
+
+-- Corrección manual de jugadores (estadísticas, Fase 1). Ver worker/migracion_jugadores.sql.
+CREATE TABLE IF NOT EXISTS jugadores (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  slug TEXT NOT NULL UNIQUE,
+  club TEXT NOT NULL,
+  nombre TEXT NOT NULL,
+  dorsal INTEGER,
+  oculto INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS jugador_alias (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  jugador_id INTEGER NOT NULL REFERENCES jugadores(id) ON DELETE CASCADE,
+  club TEXT NOT NULL,
+  clave TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (club, clave)
+);
+
+CREATE INDEX IF NOT EXISTS idx_jugador_alias_jugador ON jugador_alias(jugador_id);
+CREATE INDEX IF NOT EXISTS idx_jugadores_club ON jugadores(club);

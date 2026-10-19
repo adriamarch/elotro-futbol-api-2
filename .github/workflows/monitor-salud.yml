@@ -1,6 +1,7 @@
-# Vigilante EXTERNO de la API: avisa a Discord si el principal o Railway no
-# responden bien. Cubre lo que un worker no puede avisar de sí mismo (caída
-# total, error 1101/1102, cuota agotada, dominio de Railway sin servicio).
+# Vigilante EXTERNO de la API: avisa a Discord si el principal no responde
+# bien (la comprobación de Railway se quitó en oct-2026: API secundaria
+# desactivada). Cubre lo que un worker no puede avisar de sí mismo (caída
+# total, error 1101/1102, cuota agotada).
 # Requiere el secret de repositorio DISCORD_WEBHOOK_URL (el mismo webhook de ALERT_WEBHOOK_URL).
 name: Monitor de salud
 on:
@@ -11,7 +12,7 @@ jobs:
   comprobar:
     runs-on: ubuntu-latest
     steps:
-      - name: Comprobar API principal y Railway
+      - name: Comprobar API principal
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
@@ -24,7 +25,6 @@ jobs:
             fi
           }
           comprobar "Principal (Cloudflare)" "https://api.elotrofutbol.media/api/health"
-          comprobar "Railway (respaldo)" "https://elotro-futbol-api-production.up.railway.app/api/health"
           if [ -n "$fallos" ]; then
             echo -e "Fallos:$fallos"
             if [ -n "$WEBHOOK" ]; then

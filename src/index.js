@@ -1645,6 +1645,31 @@ function urlNoticia(categoria, slug) {
   return `${SITIO_URL}/futbol/${categoriaUrlSlug(categoria)}/${encodeURIComponent(slug)}`;
 }
 
+// Pide a Facebook que vuelva a leer las etiquetas og: de una URL (la misma
+// caché la usan WhatsApp e Instagram). Sin esto, si una tarjeta se cacheó rota
+// o desactualizada, se queda así hasta que alguien pulsa "Scrape Again" a mano.
+// Necesita los secretos FB_APP_ID y FB_APP_SECRET (de una app de Facebook
+// Developers; no hace falta revisión de la app). Sin ellos no hace nada. Nunca
+// lanza error: si falla, la publicación sigue igual.
+async function refrescarTarjetaSocial(env, url) {
+  try {
+    if (!env || !env.FB_APP_ID || !env.FB_APP_SECRET || !url) return;
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 5000);
+    try {
+      const r = await fetch("https://graph.facebook.com/", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ id: url, scrape: "true", access_token: `${env.FB_APP_ID}|${env.FB_APP_SECRET}` }),
+        signal: ctl.signal,
+      });
+      if (!r.ok) console.warn(`refrescarTarjetaSocial: Facebook respondió ${r.status} para ${url}`);
+    } finally { clearTimeout(t); }
+  } catch (e) {
+    console.warn(`refrescarTarjetaSocial: no se pudo refrescar ${url}: ${e && e.message}`);
+  }
+}
+
 // ---------- Cuentas de Resend: principal + secundaria (respaldo) ----------
 // El plan gratis de Resend tiene un tope diario/mensual de correos. Cuando
 // la cuenta principal se queda sin cupo (o falla), los envíos pasan solos a
@@ -2234,8 +2259,8 @@ async function resolverClubArticulo(env, tipo, resultadoId, clubBody) {
   return { club, categoria: resultado.competicion };
 }
 
-// ---------- Redactores "sin equipo, con categoría(s) fija(s)" ----------
-// Categorías que un admin puede fijar para este tipo de redactor:
+// ---------- Categoría(s) complementaria(s) de un redactor (columna "categorias_fijas") ----------
+// Se suman a sus equipos y no limitan lo que puede escribir. Las que un admin puede asignar:
 // "Arbitraje" y "Jurisdicción deportiva"; si en el futuro se añaden
 // más, basta con añadirlas aquí.
 const CATEGORIAS_FIJAS_VALIDAS = ["arbitraje", "jurisdiccion"];
@@ -2273,27 +2298,13 @@ function validarCategoriasFijas(valorRecibido) {
   return { categoriasFijas: limpios };
 }
 
-// Si el autor final de una noticia (el que la firma, no necesariamente
-// quien la sube: ver "autor_id" en POST/PUT /api/articles) tiene alguna
-// "categoría fija" asignada, la categoría de la noticia tiene que ser
-// una de esas. Se aplica igual cuando es el propio redactor quien sube
-// su noticia que cuando un admin la sube en su nombre eligiéndolo como
-// autor: lo que importa es de quién queda firmada, no quién la sube.
-// Devuelve { error } si no cumple, o { categoria } con la categoría ya
-// validada (o forzada a la única fija disponible, si aplica).
-function validarCategoriaSegunAutor(categoriasFijasAutor, categoriaRecibida) {
-  if (!categoriasFijasAutor || !categoriasFijasAutor.length) {
-    return { categoria: categoriaRecibida || "hypermotion" };
-  }
-  if (categoriasFijasAutor.length === 1) {
-    // Con una sola categoría fija, queda fija de facto: no hace falta
-    // que el formulario la mande bien, se fuerza siempre.
-    return { categoria: categoriasFijasAutor[0] };
-  }
-  if (!categoriaRecibida || !categoriasFijasAutor.includes(categoriaRecibida)) {
-    return { error: `La categoría de esta noticia debe ser una de las categorías fijas del autor: ${categoriasFijasAutor.join(", ")}.` };
-  }
-  return { categoria: categoriaRecibida };
+// Las "categorías complementarias" de un redactor (columna "categorias_fijas",
+// p. ej. Arbitraje) ya NO limitan sobre qué puede escribir: son un añadido a
+// sus equipos y cualquier redactor puede firmar noticias de cualquier
+// categoría. Se mantiene la función (y su firma) para no tocar las rutas
+// de crear/editar noticias. Devuelve siempre { categoria }.
+function validarCategoriaSegunAutor(_categoriasComplementariasAutor, categoriaRecibida) {
+  return { categoria: categoriaRecibida || "hypermotion" };
 }
 
 // ---------- Categoría(s) adicional(es) de una noticia ----------
@@ -2343,15 +2354,6 @@ function validarCategoriasAdicionales(valorRecibido, categoriaPrincipal, categor
   if (noValidos.length) return { error: `Categoría adicional no válida: ${noValidos.join(", ")}.` };
   if (limpios.length > MAX_CATEGORIAS_ADICIONALES) {
     return { error: `Puedes seleccionar como máximo ${MAX_CATEGORIAS_ADICIONALES} categorías adicionales.` };
-  }
-  // Un redactor con categoría(s) fija(s) también queda restringido a
-  // esas mismas categorías para las adicionales (no puede etiquetar una
-  // noticia con una categoría fuera de las suyas).
-  if (categoriasFijasAutor && categoriasFijasAutor.length) {
-    const fueraDeFijas = limpios.filter((c) => !categoriasFijasAutor.includes(c));
-    if (fueraDeFijas.length) {
-      return { error: `Las categorías adicionales de esta noticia deben estar entre las categorías fijas del autor: ${categoriasFijasAutor.join(", ")}.` };
-    }
   }
   return { categoriasAdicionales: limpios };
 }
@@ -2982,13 +2984,17 @@ function normalizarCamposFormulario(raw) {
         const t = formularioLimpiarTexto(o, 200);
         if (t && !vistas.has(t)) { vistas.add(t); opciones.push(t); }
       }
-      if (!opciones.length) return { error: `El campo "${etiqueta}" necesita al menos una opción` };
+      // Un campo con invitaciones (o con alta de usuario) puede no tener opciones fijas: sus opciones salen de las personas invitadas.
+      const admiteInvitaciones = tipo !== "casillas" && (c.invitaciones === true || c.invitaciones === 1 || FORMULARIO_ALTA_ROLES.includes(String(c.alta_usuario || "")));
+      if (!opciones.length && !admiteInvitaciones) return { error: `El campo "${etiqueta}" necesita al menos una opción` };
       if (opciones.length > FORMULARIO_MAX_OPCIONES) return { error: `El campo "${etiqueta}" admite como máximo ${FORMULARIO_MAX_OPCIONES} opciones` };
       campo.opciones = opciones;
       if (tipo !== "casillas") {
         campo.permitir_otro = c.permitir_otro === true || c.permitir_otro === 1;
         // "unica": cada opción solo se puede elegir una vez; al usarla desaparece para los demás (p. ej. nombres).
         if (c.unica === true || c.unica === 1) campo.unica = true;
+        // "invitaciones": las personas se añaden desde el panel (Personas invitadas) y caducan solas; cada invitación se usa una vez.
+        if (c.invitaciones === true || c.invitaciones === 1) { campo.invitaciones = true; campo.unica = true; }
         // "alta_usuario": al enviar esta opción se crea el usuario (ver crearUsuarioDesdeFormulario).
         if ((tipo === "desplegable" || tipo === "opcion") && FORMULARIO_ALTA_ROLES.includes(String(c.alta_usuario || ""))) {
           campo.alta_usuario = String(c.alta_usuario);
@@ -3086,12 +3092,88 @@ function opcionesEquivalentesFormulario(a, b) {
 async function formularioPublicoDisponible(env, f, conContenido) {
   const pub = formularioPublico(f, conContenido);
   if (!pub.campos.length) return pub;
+  // Personas invitadas desde el panel (vigentes): se suman a las opciones fijas del campo.
+  pub.campos = await aplicarInvitadosFormulario(env, f, camposConAltaPorDefecto(f.slug, pub.campos));
   const usadas = await opcionesUsadasFormulario(env, f, pub.campos);
   pub.campos = pub.campos.map((c) => {
     const u = usadas.get(c.id);
-    return u && u.size ? { ...c, opciones: c.opciones.filter((o) => !u.has(normalizarOpcionUnica(o))) } : c;
+    // alias_usuarios (opción -> nombre de usuario) es interno del panel: no se entrega a los visitantes.
+    const { alias_usuarios: _alias, ...publico } = c;
+    return u && u.size ? { ...publico, opciones: c.opciones.filter((o) => !u.has(normalizarOpcionUnica(o))) } : publico;
   });
   return pub;
+}
+
+// ---------- Invitaciones: personas añadidas a un formulario SIN editarlo ----------
+// En vez de abrir el editor del formulario y escribir el nombre en su lista de opciones, el admin invita a
+// la persona desde Solicitudes > Formularios > (formulario) > "Personas invitadas". Su nombre sale en la
+// lista desplegable del formulario público durante N días (7 por defecto) y desaparece solo: al caducar
+// o cuando esa persona responde (cada invitación se usa una sola vez). Se aplica a los campos
+// desplegable/opción con "invitaciones" o "alta_usuario" (p. ej. los nombres del formulario de incorporación).
+// Las fechas se guardan como 'YYYY-MM-DD HH:MM:SS' (UTC) y se comparan como texto, igual en D1 y PostgreSQL.
+const FORMULARIO_INVITACION_DIAS_DEFECTO = 7;
+const FORMULARIO_INVITACION_DIAS_MAX = 365;
+const FORMULARIO_INVITACION_MAX_POR_VEZ = 100;
+function fechaSqlFormulario(ms) { return new Date(ms).toISOString().slice(0, 19).replace("T", " "); }
+function ahoraSqlFormulario() { return fechaSqlFormulario(Date.now()); }
+// Devuelve { dias } (0 = no caduca) o { error }. Sin valor, 7 días.
+function normalizarDiasInvitacionFormulario(v) {
+  if (v === undefined || v === null || v === "") return { dias: FORMULARIO_INVITACION_DIAS_DEFECTO };
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 0 || n > FORMULARIO_INVITACION_DIAS_MAX) {
+    return { error: `La caducidad debe estar entre 0 (no caduca) y ${FORMULARIO_INVITACION_DIAS_MAX} días` };
+  }
+  return { dias: n };
+}
+function expiraInvitacionFormulario(dias) { return dias > 0 ? fechaSqlFormulario(Date.now() + dias * 86400000) : null; }
+function campoAdmiteInvitaciones(c) {
+  return !!c && (c.tipo === "desplegable" || c.tipo === "opcion")
+    && (c.invitaciones === true || FORMULARIO_ALTA_ROLES.includes(String(c.alta_usuario || "")));
+}
+async function invitadosActivosFormulario(env, formularioId) {
+  const { results } = await env.DB.prepare(
+    "SELECT campo_id, opcion FROM formularios_invitados WHERE formulario_id = ? AND (expira_at IS NULL OR expira_at > ?) ORDER BY id"
+  ).bind(formularioId, ahoraSqlFormulario()).all();
+  return results || [];
+}
+// Suma a los campos que admiten invitaciones las personas invitadas vigentes. Cada invitación se usa una sola
+// vez (el campo pasa a "unica") y "invitaciones" avisa al formulario público de que puede mostrar el aviso de caducidad.
+async function aplicarInvitadosFormulario(env, f, campos) {
+  if (!campos.some(campoAdmiteInvitaciones)) return campos;
+  let activos = [];
+  try { activos = await invitadosActivosFormulario(env, f.id); }
+  catch (err) { console.error("[formularios/invitados]", err); } // sin la tabla (migración sin aplicar) el formulario sigue con sus opciones fijas
+  return campos.map((c) => {
+    if (!campoAdmiteInvitaciones(c)) return c;
+    const opciones = [...(c.opciones || [])];
+    const vistas = new Set(opciones.map(normalizarOpcionUnica));
+    for (const i of activos) {
+      if (i.campo_id !== c.id) continue;
+      const k = normalizarOpcionUnica(i.opcion);
+      if (!vistas.has(k)) { vistas.add(k); opciones.push(i.opcion); }
+    }
+    return { ...c, opciones, unica: true, invitaciones: true };
+  });
+}
+// Para el panel: todas las invitaciones del formulario con su estado (activa | caducada | usada).
+async function listarInvitadosFormulario(env, f, campos) {
+  const camposInv = campos.filter(campoAdmiteInvitaciones);
+  if (!camposInv.length) return [];
+  const { results } = await env.DB.prepare(
+    "SELECT id, campo_id, opcion, expira_at, creado_por, created_at FROM formularios_invitados WHERE formulario_id = ? ORDER BY id DESC LIMIT 1000"
+  ).bind(f.id).all();
+  const filas = (results || []).filter((i) => camposInv.some((c) => c.id === i.campo_id));
+  if (!filas.length) return [];
+  const usadas = await opcionesUsadasFormulario(env, f, camposInv.map((c) => ({
+    ...c, unica: true, opciones: filas.filter((i) => i.campo_id === c.id).map((i) => i.opcion),
+  })));
+  const ahora = ahoraSqlFormulario();
+  return filas.map((i) => {
+    const u = usadas.get(i.campo_id);
+    const usada = !!(u && u.has(normalizarOpcionUnica(i.opcion)));
+    const caducada = !usada && !!i.expira_at && i.expira_at <= ahora;
+    return { ...i, estado: usada ? "usada" : caducada ? "caducada" : "activa" };
+  });
 }
 // ---------- Alta automática de usuarios desde un formulario ----------
 // Un campo desplegable/opción con "alta_usuario" (redactor | fotografo) es una plantilla de
@@ -3109,7 +3191,7 @@ function etiquetaUsuarioFormulario(u) {
   const nombre = String((u && u.nombre) || "").trim();
   const equipos = parsearEquipos(u && u.equipo);
   const cats = parsearCategoriasFijas(u && u.categorias_fijas).map((c) => FORMULARIO_CATEGORIA_FIJA_ETIQUETA[c] || c);
-  const detalle = (equipos.length ? equipos : cats).join(" & ");
+  const detalle = [...equipos, ...cats].join(" & ");
   return detalle ? `${nombre} — ${detalle}` : nombre;
 }
 // "Jose Morales — Arbitraje" -> { nombre, equipos: [], categorias_fijas: ["arbitraje"] }
@@ -3126,7 +3208,7 @@ function datosUsuarioDesdeOpcionFormulario(valor) {
     else if (k === "jurisprudencia" || k.startsWith("jurisdiccion")) categorias.push("jurisdiccion");
     else equipos.push(p);
   }
-  return { nombre, equipos: categorias.length ? [] : equipos.slice(0, 3), categorias_fijas: [...new Set(categorias)] };
+  return { nombre, equipos: equipos.slice(0, 3), categorias_fijas: [...new Set(categorias)] };
 }
 function usernameBaseFormulario(nombre) {
   const s = normalizarOpcionUnica(nombre).replace(/[^a-z0-9]+/g, ".").replace(/^\.+|\.+$/g, "").slice(0, 24);
@@ -3185,7 +3267,7 @@ async function crearUsuarioDesdeFormulario(env, { opcion, rol, email, alias }) {
 async function enviarCuentaPorCorreoFormulario(env, cuenta, correo) {
   if (!correo) return false;
   const enlace = `${SITIO_URL}/admin/login.html`;
-  const equipo = cuenta.equipos.length ? cuenta.equipos.join(" & ") : (cuenta.categorias_fijas.map((c) => FORMULARIO_CATEGORIA_FIJA_ETIQUETA[c] || c).join(" & "));
+  const equipo = [...cuenta.equipos, ...cuenta.categorias_fijas.map((c) => FORMULARIO_CATEGORIA_FIJA_ETIQUETA[c] || c)].join(" & ");
   const rolTxt = cuenta.rol === "fotografo" ? "fotógrafo" : "redactor";
   return enviarEmailNotificacion(env, {
     asunto: "Tu cuenta de ElOtroFútbol",
@@ -3306,6 +3388,7 @@ function validarRespuestasFormulario(campos, recibidas, opts = {}) {
         const t = formularioLimpiarTexto(v, 300);
         if (c.opciones.includes(t)) { datos[c.id] = t; break; }
         if (c.permitir_otro && t.startsWith("Otro: ") && t.length > 6) { datos[c.id] = t; break; }
+        if (c.invitaciones) return { error: `«${t}» ya no está disponible en: ${c.etiqueta}. Puede que tu invitación haya caducado: recarga la página o pide que te la renueven.` };
         return { error: `Opción no válida en: ${c.etiqueta}` };
       }
       case "casillas": {
@@ -3441,6 +3524,45 @@ async function enviarCorreoResolucionAcreditacion(env, a, estado, { recogida, me
     etiqueta: "Acreditaciones",
     titulo: aprobada ? "Acreditación aprobada" : "Solicitud no aprobada",
     tono: aprobada ? "exito" : "error",
+    preheader: intro,
+    parrafo: intro,
+    filas: filas.map(([k, v]) => ({ etiqueta: k, valor: v })),
+    bloqueHtml: bloques.join(""),
+    pieHtml: "Equipo de ElOtroFútbol. Puedes responder a este correo si tienes cualquier duda.",
+  });
+  return enviarEmailNotificacion(env, { asunto, texto, html }, { destinatario: a.email, replyTo: EMAIL_NOTIFICACIONES });
+}
+
+// Correo con indicaciones (dónde/cuándo recoger, instrucciones) SIN cambiar el
+// estado de la solicitud: sigue como estaba (pendiente, aprobada o rechazada).
+async function enviarCorreoIndicacionesAcreditacion(env, a, { recogida, mensaje } = {}) {
+  if (!a || !a.email) return false;
+  const nl2br = (t) => escapeHtmlEmail(t).replace(/\n/g, "<br>");
+  const filas = [
+    ["Nombre", a.nombre], ["Equipo", a.equipo], ["Evento", a.tipo_evento],
+    ["Acreditación", a.tipo_acreditacion], ["Jornada y partido", a.jornada_partido],
+  ].filter(([, v]) => v);
+  const asunto = `Indicaciones sobre tu acreditación: ${a.equipo || "ElOtroFútbol"}${a.jornada_partido ? " · " + a.jornada_partido : ""}`;
+  const intro = `Hola ${a.nombre || ""}, te enviamos indicaciones sobre tu solicitud de acreditación.`;
+  const cierre = "Este correo no cambia el estado de tu solicitud. Recuerda que la concesión final de la acreditación corresponde siempre al club organizador.";
+  const texto = [
+    intro, "",
+    ...filas.map(([k, v]) => `${k}: ${v}`),
+    ...(recogida ? ["", "Dónde y cuándo recogerla:", recogida] : []),
+    ...(mensaje ? ["", "Indicaciones:", mensaje] : []),
+    "", cierre, "", "Equipo de ElOtroFútbol",
+  ].join("\n");
+  const bloques = [];
+  if (recogida) {
+    bloques.push(`<div style="margin:0 0 14px;padding:14px 16px;background:#f5f7fa;border-left:4px solid #8a93a3;border-radius:8px;color:#2b3445;"><strong style="display:block;margin-bottom:4px;">Dónde y cuándo recogerla</strong>${nl2br(recogida)}</div>`);
+  }
+  if (mensaje) {
+    bloques.push(`<div style="margin:0 0 14px;padding:14px 16px;background:#f5f7fa;border-left:4px solid #8a93a3;border-radius:8px;color:#2b3445;"><strong style="display:block;margin-bottom:4px;">Indicaciones</strong>${nl2br(mensaje)}</div>`);
+  }
+  bloques.push(`<p style="margin:4px 0 0;font-size:14px;line-height:1.6;color:#5a6270;">${escapeHtmlEmail(cierre)}</p>`);
+  const html = plantillaEmail({
+    etiqueta: "Acreditaciones",
+    titulo: "Indicaciones sobre tu acreditación",
     preheader: intro,
     parrafo: intro,
     filas: filas.map(([k, v]) => ({ etiqueta: k, valor: v })),
@@ -3891,8 +4013,8 @@ function puedeGestionarContenidoEditorial(payload) {
 // ---------- Noticias rápidas: validación del body ----------
 // Una noticia rápida lleva SOLO tres campos, todos obligatorios: foto
 // (URL ya subida con /api/subir-imagen), titular y subtitular.
-const NOTICIA_RAPIDA_TITULO_MAX = 120;
-const NOTICIA_RAPIDA_SUBTITULO_MAX = 220;
+const NOTICIA_RAPIDA_TITULO_MAX = 150;
+const NOTICIA_RAPIDA_SUBTITULO_MAX = 250;
 
 function validarNoticiaRapida(body) {
   const titulo = normalizarTexto(body && body.titulo);
@@ -4935,6 +5057,58 @@ async function sha256Hex(arrayBuffer) {
 // puede reproducir en la web pública. Ver LEEME-ENLACE-EXTERNO.md.
 const CONTENT_TYPE_ENLACE_EXTERNO = "enlace/externo";
 
+// ---------- Carpetas del contenido PRIVADO (Subir contenido) ----------
+// Una carpeta es solo una etiqueta de organización compartida por todo el
+// equipo (tabla media_carpetas, columna media.carpeta_id; ver
+// migracion_media_carpetas.sql). Solo tiene sentido en contenido privado:
+// si se sube como público, la carpeta se ignora.
+const CARPETA_MEDIA_NOMBRE_MAX = 60;
+
+function normalizarNombreCarpetaMedia(raw) {
+  // Espacios repetidos o saltos de línea -> un solo espacio; sin extremos.
+  return (raw === undefined || raw === null ? "" : String(raw)).replace(/\s+/g, " ").trim();
+}
+
+async function buscarCarpetaMediaPorNombre(env, nombre) {
+  return await env.DB.prepare(
+    "SELECT id, nombre, created_at FROM media_carpetas WHERE LOWER(nombre) = LOWER(?)"
+  ).bind(nombre).first();
+}
+
+// Valida la carpeta elegida al subir ANTES de subir nada a Cloudinary.
+// Devuelve { id } (id = null si no aplica) o { error, status }.
+async function resolverCarpetaMediaDeSubida(env, valorRaw, esPrivado) {
+  const texto = (valorRaw === undefined || valorRaw === null ? "" : String(valorRaw)).trim();
+  if (!esPrivado || !texto) return { id: null };
+  const id = Number(texto);
+  if (!Number.isInteger(id) || id <= 0) return { error: "La carpeta elegida no es válida", status: 400 };
+  let fila;
+  try {
+    fila = await env.DB.prepare("SELECT id FROM media_carpetas WHERE id = ?").bind(id).first();
+  } catch (err) {
+    // Migración sin ejecutar -> 409 (no 5xx: un 5xx cuenta como fallo del
+    // principal y dispara el failover a Railway por algo que no es una caída).
+    const faltaMigracion = /no such table|does not exist/i.test(err.message || "");
+    return { error: "No se pudo comprobar la carpeta (si persiste, falta ejecutar migracion_media_carpetas.sql).", status: faltaMigracion ? 409 : 500 };
+  }
+  if (!fila) return { error: "La carpeta elegida ya no existe. Recarga la página y elige otra.", status: 400 };
+  return { id };
+}
+
+// Guarda la carpeta en la fila de media ya insertada. Va aparte del INSERT
+// (que tiene varios reintentos por columnas que pueden faltar) para no
+// tocar esa cadena; si falla, el archivo queda subido sin carpeta.
+async function asignarCarpetaMedia(env, mediaId, carpetaId) {
+  if (!mediaId || !carpetaId) return true;
+  try {
+    await env.DB.prepare("UPDATE media SET carpeta_id = ? WHERE id = ?").bind(carpetaId, mediaId).run();
+    return true;
+  } catch (err) {
+    console.error("No se pudo asignar la carpeta al contenido subido (se deja sin carpeta):", err.message);
+    return false;
+  }
+}
+
 function normalizarEnlaceExterno(valor) {
   const texto = String(valor || "").trim();
   if (!texto || texto.length > 2000) return null;
@@ -5057,6 +5231,40 @@ function plataformaEmbedDesdeUrlServidor(url) {
   return null;
 }
 
+// Marcas que añade fusionarGrupoDePartido a cada foto/tweet de una página fusionada
+// (sección a la que pertenece y dónde va DENTRO de ella). Sin esto, esta función
+// -que se vuelve a aplicar DESPUÉS de fusionar- las borraba y el navegador solo
+// podía usar un número de párrafo global que se descuadra si el HTML cambia.
+function copiarMarcasSeccionFusion(origen, destino) {
+  const entero = (v) => Number.isInteger(v) && v >= 0 && v <= 100;
+  if (entero(origen.seccion)) destino.seccion = origen.seccion;
+  if (entero(origen.trasRel)) destino.trasRel = origen.trasRel;
+  if (origen.alFinalSeccion === true) destino.alFinalSeccion = true;
+  if (origen.alInicioSeccion === true) destino.alInicioSeccion = true;
+}
+
+// Vista previa de noticias programadas: al programar (o editar una programada)
+// se pide en segundo plano la imagen social 1200x630 para que Cloudinary ya
+// tenga generado el recorte (g_auto es lento la primera vez) cuando X/Facebook/
+// WhatsApp pidan el enlace. La transformación DEBE coincidir con
+// seoImagenSocialWorker() de public/src-worker.js (misma URL = misma caché).
+const IMG_SOCIAL_TRANSFORM_PROGRAMADA = "f_jpg,q_auto:good,c_fill,g_auto,w_1200,h_630";
+function precalentarVistaPreviaProgramada(ctx, programadoPara, imagenPortada, imagenes) {
+  if (!programadoPara || !ctx || typeof ctx.waitUntil !== "function") return;
+  const primera = Array.isArray(imagenes) ? imagenes.find((x) => x && x.tipo !== "tweet" && x.url) : null;
+  const url = imagenPortada || (primera && primera.url);
+  if (!url || typeof url !== "string") return;
+  const marca = "/upload/";
+  const i = url.indexOf(marca);
+  if (i === -1 || !/res\.cloudinary\.com/.test(url)) return;
+  const destino = url.slice(0, i + marca.length) + IMG_SOCIAL_TRANSFORM_PROGRAMADA + "/" + url.slice(i + marca.length);
+  ctx.waitUntil(
+    fetch(destino, { headers: { "Accept": "image/jpeg,image/*;q=0.8" } })
+      .then((r) => r.arrayBuffer())
+      .catch(() => {})
+  );
+}
+
 function normalizarImagenes(raw) {
   if (!Array.isArray(raw)) return [];
   return raw
@@ -5075,6 +5283,7 @@ function normalizarImagenes(raw) {
           const n = parseInt(item.trasParrafo, 10);
           resultado.trasParrafo = Number.isFinite(n) && n > 0 ? n : 1;
         }
+        copiarMarcasSeccionFusion(item, resultado);
         return resultado;
       }
       if (item && typeof item === "object" && typeof item.url === "string") {
@@ -5099,6 +5308,7 @@ function normalizarImagenes(raw) {
         if (typeof item.credito === "string" && item.credito.trim()) {
           resultado.credito = item.credito.trim();
         }
+        copiarMarcasSeccionFusion(item, resultado);
         return resultado;
       }
       return null;
@@ -5169,7 +5379,12 @@ function claveImagenFusion(url) {
   const m = limpia.match(/^https?:\/\/res\.cloudinary\.com\/([^/]+)\/(?:image|video)\/upload\/(.+)$/i);
   if (!m) return limpia.replace(/^http:/i, "https:");
   const partes = m[2].split("/");
-  while (partes.length > 1 && (/^v\d+$/.test(partes[0]) || /^[a-z]{1,3}_[^/]+$/i.test(partes[0]) || partes[0].includes(","))) partes.shift();
+  // Solo se quitan transformaciones (w_900, f_auto,q_auto...) y versión (v123);
+  // NUNCA carpetas como "eof_cronicas/": antes dos fotos distintas con el mismo
+  // nombre de archivo en carpetas distintas contaban como la misma y se perdía una.
+  const iVer = partes.findIndex((x) => /^v\d+$/.test(x));
+  if (iVer > -1 && iVer < partes.length - 1) partes.splice(0, iVer + 1);
+  else while (partes.length > 1 && (partes[0].includes(",") || /^(?:w|h|c|f|q|g|ar|dpr|e|a|b|bo|co|o|r|x|y|z|fl|l|t|u|pg)_[^/]+$/i.test(partes[0]))) partes.shift();
   return `${m[1]}/${partes.join("/").replace(/\.[a-z0-9]{2,4}$/i, "")}`;
 }
 
@@ -5424,11 +5639,30 @@ async function remapearSlugsFusion(env, articulos) {
   return salida;
 }
 
+// Ficha técnica de una página fusionada: la de la ÚLTIMA crónica que tenga ficha
+// SUSTITUYE por completo a las anteriores (no se mezclan). Encaja con el panel, que al
+// escribir una crónica nueva del mismo partido precarga la ficha de la anterior para que
+// la editen: la última es siempre la versión completa y corregida.
+// "articulos" va en orden de id (la primera crónica, luego las demás). Cada ficha puede
+// llegar como texto JSON (así se guarda en la columna) o como objeto. Devuelve texto
+// JSON o null si ninguna crónica tenía ficha.
+function fichaTecnicaDeFusion(articulos) {
+  for (const a of [...(articulos || [])].reverse()) {
+    let f = a && a.ficha_tecnica;
+    if (typeof f === "string") { try { f = JSON.parse(f); } catch { f = null; } }
+    if (f && typeof f === "object" && !Array.isArray(f) && Object.keys(f).length) return JSON.stringify(f);
+  }
+  return null;
+}
+
 // Mezcla "base" (la primera) con "otros" y deja el resultado en base.
 // nombres = { local, visitante }.
 function fusionarGrupoDePartido(base, otros, nombres) {
   const secciones = ordenarSeccionesFusion([base, ...otros], nombres);
-  const h2 = (nombre) => `<h2>${escaparHtmlFusion(nombre)}</h2>`;
+  // Cada <h2> de sección lleva class="fusion-seccion fusion-s<N>": el navegador los
+  // localiza contando los bloques REALES del HTML (ya saneado) y coloca las fotos
+  // de cada sección dentro de ella, sin depender de que los contadores coincidan.
+  const h2 = (nombre, k) => `<h2 class="fusion-seccion fusion-s${k}">${escaparHtmlFusion(nombre)}</h2>`;
 
   // Texto: una sección por artículo. Todo se calcula ANTES de tocar base.
   const offsets = [];
@@ -5436,7 +5670,7 @@ function fusionarGrupoDePartido(base, otros, nombres) {
   let contenido = "";
   for (const s of secciones) {
     offsets.push(offset);
-    contenido += h2(tituloSeccionFusion(s, secciones, nombres, null)) + (s.art.contenido || "");
+    contenido += h2(tituloSeccionFusion(s, secciones, nombres, null), offsets.length - 1) + (s.art.contenido || "");
     offset += 1 + contarBloquesHtmlFusion(s.art.contenido);
   }
   // En cada idioma solo se ofrece la traducción si TODAS están traducidas
@@ -5445,7 +5679,7 @@ function fusionarGrupoDePartido(base, otros, nombres) {
   for (const idioma of IDIOMAS_TRADUCCION) {
     const campo = `contenido_${idioma}`;
     traducciones[campo] = secciones.every((s) => s.art[campo])
-      ? secciones.map((s) => h2(tituloSeccionFusion(s, secciones, nombres, idioma)) + s.art[campo]).join("")
+      ? secciones.map((s, k) => h2(tituloSeccionFusion(s, secciones, nombres, idioma), k) + s.art[campo]).join("")
       : null;
   }
 
@@ -5469,21 +5703,31 @@ function fusionarGrupoDePartido(base, otros, nombres) {
     const imgs = parseImagenesFusion(s.art.imagenes).map((f) => {
       const g = { ...f };
       const pos = g.posicion;
+      // Párrafo dentro de SU sección (1..nb). Es lo que usa el navegador cuando
+      // encuentra los encabezados de sección; trasParrafo (global) queda como respaldo.
+      const rel = (t) => (nb > 0 ? Math.min(Math.max(Number(t) || 1, 1), nb) : 0);
+      g.seccion = k;
       if (pos === "inicio") {
         if (k > 0) {
           g.posicion = g.grupo ? "collage" : "personalizada";
           g.trasParrafo = off + 1;
+          g.alInicioSeccion = true;
         }
       } else if (pos === "personalizada" || pos === "collage") {
+        g.trasRel = rel(g.trasParrafo);
         g.trasParrafo = tras(g.trasParrafo);
       } else if (pos === "medio") {
+        const t = g.trasParrafo || Math.ceil(nb / 2);
         g.posicion = "personalizada";
-        g.trasParrafo = tras(g.trasParrafo || Math.ceil(nb / 2));
+        g.trasRel = rel(t);
+        g.trasParrafo = tras(t);
       } else if (pos === "final") {
         g.posicion = "personalizada";
+        g.alFinalSeccion = true;
         g.trasParrafo = alFinal;
       } else if (pos === "galeria" && k < ultima) {
         g.posicion = g.grupo ? "collage" : "personalizada";
+        g.alFinalSeccion = true;
         g.trasParrafo = alFinal;
       }
       if (g.posicion === "collage" && g.grupo && k > 0) g.grupo = `fusion${k}-${g.grupo}`;
@@ -5498,7 +5742,7 @@ function fusionarGrupoDePartido(base, otros, nombres) {
     if (s.art !== base && s.art.imagen_url && !vistas.has(claveImagenFusion(s.art.imagen_url))) {
       vistas.add(claveImagenFusion(s.art.imagen_url));
       if (!portada) portada = s.art.imagen_url;
-      else todas.push({ url: s.art.imagen_url, posicion: "personalizada", trasParrafo: off + 1, foco: "50% 50%" });
+      else todas.push({ url: s.art.imagen_url, posicion: "personalizada", trasParrafo: off + 1, foco: "50% 50%", seccion: k, alInicioSeccion: true });
     }
   });
 
@@ -5514,7 +5758,7 @@ function fusionarGrupoDePartido(base, otros, nombres) {
     firmantes.push({ id: id || null, nombre });
   };
   for (const a of [base, ...otros]) { anadirFirma(a.autor_id, a.autor_nombre); anadirFirma(a.coautor_id, a.coautor_nombre); }
-  const fichaTecnica = [base, ...otros].map((a) => a.ficha_tecnica).find(Boolean) || null;
+  const fichaTecnica = fichaTecnicaDeFusion([base, ...otros]);
 
   base.contenido = contenido;
   Object.assign(base, traducciones);
@@ -5525,7 +5769,7 @@ function fusionarGrupoDePartido(base, otros, nombres) {
     base.coautor_nombre = firmantes[1].nombre;
   }
   base.firmantes = firmantes;
-  if (!base.ficha_tecnica && fichaTecnica) base.ficha_tecnica = fichaTecnica;
+  base.ficha_tecnica = fichaTecnica;
   base.fusionado_con_slug = otros[0] ? otros[0].slug : null;
   base.fusion = {
     total: secciones.length,
@@ -5644,9 +5888,13 @@ function normalizarJugadoresAlineacion(raw) {
 // ---------- ORGANIGRAMA (Funcionalidades > Información) ----------
 // Se guarda entero como JSON en settings bajo la clave 'organigrama'.
 // Forma: { orientacion: "vertical"|"horizontal", nodos: [{ id, nombre, cargo,
-// nota, color, padre, colapsado }] }. El orden del array es el orden entre
-// hermanos. Varias raíces permitidas. Devuelve { datos } o { error }.
-const ORGANIGRAMA_MAX_NODOS = 120;
+// nota, color, padre, padres, colapsado }] }. `padres` es la lista de jefes de la
+// casilla (puede tener varios; el primero es el principal, bajo el que se dibuja
+// su equipo) y `padre` = padres[0] (se mantiene por compatibilidad: un dato
+// antiguo con solo `padre` sigue siendo válido). El orden del array es el orden
+// entre hermanos. Varias raíces permitidas. Devuelve { datos } o { error }.
+const ORGANIGRAMA_MAX_NODOS = 300;
+const ORGANIGRAMA_MAX_JEFES = 10;
 const ORGANIGRAMA_COLORES = ["azul", "rojo", "verde", "amarillo", "morado", "rosa", "gris", "naranja"];
 function limpiarOrganigrama(entrada) {
   if (!entrada || typeof entrada !== "object" || Array.isArray(entrada)) return { error: "Organigrama no válido" };
@@ -5663,29 +5911,46 @@ function limpiarOrganigrama(entrada) {
     if (ids.has(id)) return { error: "Hay casillas con el mismo identificador" };
     ids.add(id);
     const nombre = texto(n.nombre, 80);
-    if (!nombre) return { error: "Todas las casillas necesitan un nombre" };
+    // El nombre puede quedar vacío: es un puesto vacante ("Buscamos persona" en el panel).
+    const crudos = Array.isArray(n.padres) ? n.padres : (typeof n.padre === "string" && n.padre.trim() ? [n.padre] : []);
+    const padres = [];
+    for (const p of crudos) {
+      if (typeof p !== "string") return { error: "Casilla no válida" };
+      const t = p.trim();
+      if (t && !padres.includes(t)) padres.push(t);
+    }
+    if (padres.length > ORGANIGRAMA_MAX_JEFES) return { error: `Una casilla puede depender como máximo de ${ORGANIGRAMA_MAX_JEFES} casillas` };
     const nota = typeof n.nota === "string" ? n.nota.replace(/\r/g, "").replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]+/g, " ").trim().slice(0, 400) : "";
     nodos.push({
       id, nombre,
       cargo: texto(n.cargo, 80),
       nota,
       color: ORGANIGRAMA_COLORES.includes(n.color) ? n.color : "azul",
-      padre: typeof n.padre === "string" && n.padre.trim() ? n.padre.trim() : null,
+      padre: padres[0] || null,
+      padres,
       colapsado: n.colapsado === true,
     });
   }
   const porId = new Map(nodos.map((n) => [n.id, n]));
   for (const n of nodos) {
-    if (n.padre !== null && !porId.has(n.padre)) return { error: "Una casilla depende de otra que no existe" };
-    if (n.padre === n.id) return { error: "Una casilla no puede depender de sí misma" };
-  }
-  // Sin ciclos: desde cada nodo hay que llegar a una raíz en menos pasos que nodos.
-  for (const n of nodos) {
-    let actual = n, pasos = 0;
-    while (actual.padre !== null) {
-      actual = porId.get(actual.padre);
-      if (++pasos > nodos.length) return { error: "El organigrama tiene un bucle: una casilla depende de una de sus subordinadas" };
+    for (const p of n.padres) {
+      if (!porId.has(p)) return { error: "Una casilla depende de otra que no existe" };
+      if (p === n.id) return { error: "Una casilla no puede depender de sí misma" };
     }
+  }
+  // Sin ciclos (el organigrama es un grafo dirigido sin bucles): búsqueda en profundidad.
+  const marca = new Map(); // 1 = en curso, 2 = terminado
+  const visitar = (n) => {
+    const m = marca.get(n.id);
+    if (m === 2) return true;
+    if (m === 1) return false;
+    marca.set(n.id, 1);
+    for (const p of n.padres) if (!visitar(porId.get(p))) return false;
+    marca.set(n.id, 2);
+    return true;
+  };
+  for (const n of nodos) {
+    if (!visitar(n)) return { error: "El organigrama tiene un bucle: una casilla depende de una de sus subordinadas" };
   }
   return { datos: { orientacion: entrada.orientacion === "horizontal" ? "horizontal" : "vertical", nodos } };
 }
@@ -5989,7 +6254,7 @@ async function contarPublicacionesPorTipo(env, autorId) {
      WHERE coautor_id = ? AND publicado = 1
      GROUP BY tipo`
   ).bind(autorId, autorId).all();
-  const conteo = { noticia: 0, previa: 0, cronica: 0, analisis: 0, opinion: 0, entrevista: 0 };
+  const conteo = { noticia: 0, previa: 0, cronica: 0, analisis: 0, opinion: 0, entrevista: 0, uno_por_uno: 0 };
   for (const fila of results) {
     if (conteo[fila.tipo] !== undefined) conteo[fila.tipo] += fila.total;
   }
@@ -6009,7 +6274,7 @@ async function contarPublicacionesPorTipo(env, autorId) {
 // por culpa del OR.
 async function contarPublicacionesPorTipoDeVarios(env, autorIds) {
   const idsUnicos = [...new Set(autorIds.filter((id) => id != null))];
-  const conteos = new Map(idsUnicos.map((id) => [id, { noticia: 0, previa: 0, cronica: 0, analisis: 0, opinion: 0, entrevista: 0 }]));
+  const conteos = new Map(idsUnicos.map((id) => [id, { noticia: 0, previa: 0, cronica: 0, analisis: 0, opinion: 0, entrevista: 0, uno_por_uno: 0 }]));
   if (idsUnicos.length === 0) return conteos;
   // Se trocea en lotes de 90 ids: D1/SQLite tiene un límite de 100
   // parámetros bind por consulta, y esta plantilla ya reutiliza la
@@ -6444,7 +6709,7 @@ async function puedeEditar(env, payload, tipoEntidad, entidadId, autorId, coauto
 //
 //   minutoInicial: minuto en el que debe arrancar a contar el reloj (0
 //   normalmente; >0 cuando se arranca tarde, ver más abajo).
-async function iniciarCronometroPartido(env, resultadoId, minutoInicial = 0) {
+async function iniciarCronometroPartido(env, resultadoId, minutoInicial = 0, opciones = {}) {
   const minutos = Number.isFinite(minutoInicial) && minutoInicial > 0 ? Math.floor(minutoInicial) : 0;
   // Margen de seguridad al retomar/arrancar con minuto inicial > 0 (p. ej.
   // la 2ª parte tras el descanso, que debe mostrar 45' desde el primer
@@ -6485,6 +6750,25 @@ async function iniciarCronometroPartido(env, resultadoId, minutoInicial = 0) {
        goles_local = COALESCE(goles_local, 0), goles_visitante = COALESCE(goles_visitante, 0)
        WHERE id = ?`
   ).bind(`-${minutos * 60 + segundosMargen} seconds`, resultadoId).run();
+  // El añadido anunciado es de UNA parte y de UNA "vida" del partido:
+  // se borra al (re)arrancar desde 0 y al empezar la 2ª parte (cuando se
+  // retoma justo en 45+N o más). Un try/catch por si la migración
+  // migracion_anadido_anunciado.sql aún no está aplicada: nunca debe
+  // impedir arrancar un partido.
+  try {
+    // opciones.segundaParte: reanudación tras el descanso. El reloj retoma SIEMPRE
+    // en el 45 (aunque la 1ª parte tuviera añadido) y el añadido de la 1ª parte
+    // se da por terminado.
+    await env.DB.prepare(
+      minutos === 0
+        ? "UPDATE results SET anadido_minutos = NULL, anadido_parte = NULL WHERE id = ?"
+        : opciones.segundaParte
+          ? "UPDATE results SET anadido_minutos = NULL, anadido_parte = NULL WHERE id = ? AND anadido_parte = 1"
+          : "UPDATE results SET anadido_minutos = NULL, anadido_parte = NULL WHERE id = ? AND anadido_parte = 1 AND ? >= 45 + COALESCE(anadido_minutos, 0)"
+    ).bind(...(minutos === 0 || opciones.segundaParte ? [resultadoId] : [resultadoId, minutos])).run();
+  } catch (err) {
+    console.log("[añadido] no se pudo limpiar el añadido anunciado:", err.message);
+  }
 }
 
 // Revisa cada minuto (mismo cron que ya revisaba artículos programados)
@@ -6603,31 +6887,27 @@ const MINUTO_DESCANSO_AUTOMATICO = 45;
 
 // Revisa cada minuto (mismo cron que ya revisa partidos programados y
 // partidos desatendidos) los partidos "en_juego" cuyo cronómetro sigue
-// corriendo y ya ha alcanzado MINUTO_DESCANSO_AUTOMATICO, y les inserta
-// el evento "descanso" solo si todavía no existe uno para ese partido.
-// Así el descanso queda registrado igual si el redactor está delante
-// del panel y pulsa el botón a tiempo, que si se despista: el aviso de
-// "desatendido" (ver revisarPartidosDesatendidos) seguía disparándose
-// más tarde en ese segundo caso, pero el propio evento no aparecía en
-// el timeline hasta que alguien entraba a pulsarlo a mano. Se limita a
-// partidos con el cronómetro corriendo (no pausado): si ya está
-// pausado es que alguien ya ha pitado algo (descanso, hidratación...)
-// y no hay que tocarlo.
+// corriendo y ya ha alcanzado el final de la 1ª parte (45, o 45+N si el
+// redactor ha anunciado N minutos de añadido), y les pone el descanso solo
+// si todavía no existe uno. Se limita a partidos con el cronómetro
+// corriendo: si ya está pausado es que alguien ya ha pitado algo
+// (descanso, hidratación...) y no hay que tocarlo.
 async function crearDescansoAutomaticoAlMinuto45(env, partidosEnJuego) {
   // partidosEnJuego (opcional): lista ya cargada por el cron (ver
   // "scheduled" -- se pide UNA sola vez por minuto en vez de que cada
-  // una de las 4 funciones que miran 'en_juego' repita la misma
-  // consulta a D1). Si no se pasa (llamada suelta, no desde el cron),
-  // se sigue consultando aquí como antes.
+  // una de las funciones que miran 'en_juego' repita la misma consulta).
   const partidos = (partidosEnJuego ?? (await env.DB.prepare(
-    `SELECT id, inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos
+    `SELECT id, inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos, anadido_minutos, anadido_parte
      FROM results WHERE estado = 'en_juego' AND cronometro_pausado_en IS NULL`
   ).all()).results).filter((p) => p.cronometro_pausado_en === null || p.cronometro_pausado_en === undefined);
   if (!partidos.length) return;
 
   for (const partido of partidos) {
     const minuto = minutoEnVivoServidor(partido);
-    if (minuto < MINUTO_DESCANSO_AUTOMATICO) continue;
+    // Con añadido anunciado el reloj NO se para en el 45 sino en 45+N.
+    const anadido = anadidoAnunciado(partido, 1);
+    const minutoDescanso = MINUTO_DESCANSO_AUTOMATICO + anadido;
+    if (minuto < minutoDescanso) continue;
 
     const yaHuboDescanso = await env.DB.prepare(
       "SELECT id FROM match_events WHERE resultado_id = ? AND tipo = 'descanso' LIMIT 1"
@@ -6635,17 +6915,17 @@ async function crearDescansoAutomaticoAlMinuto45(env, partidosEnJuego) {
     if (yaHuboDescanso) continue;
 
     // Igual que el descanso manual del panel (mamPitarDescanso): se PARA
-    // el cronómetro en el 45 y se registra el evento. var_motivo =
-    // 'automatico' es la marca que usa reanudarSegundaParteAutomatica para
-    // saber que este descanso lo puso el cron y que, por tanto, también
-    // debe reanudarlo solo (un descanso pitado a mano nunca se reanuda
-    // solo). No se pinta en ningún sitio: solo se muestra para tipo 'var'.
+    // el cronómetro (en 45+añadido) y se registra el evento, que se
+    // etiqueta SIEMPRE como 45' (+ el añadido, "45+3'"). var_motivo =
+    // 'automatico' es la marca que usan reanudarSegundaParteAutomatica y
+    // el endpoint de añadido para saber que este descanso lo puso el cron.
+    // No se pinta en ningún sitio: solo se muestra para tipo 'var'.
     await env.DB.prepare(
       "UPDATE results SET cronometro_pausado_en = ? WHERE id = ? AND cronometro_pausado_en IS NULL"
-    ).bind(MINUTO_DESCANSO_AUTOMATICO, partido.id).run();
+    ).bind(minutoDescanso, partido.id).run();
     await env.DB.prepare(
-      `INSERT INTO match_events (resultado_id, tipo, equipo, minuto, orden, var_motivo) VALUES (?, 'descanso', 'ninguno', ?, 0, 'automatico')`
-    ).bind(partido.id, MINUTO_DESCANSO_AUTOMATICO).run();
+      `INSERT INTO match_events (resultado_id, tipo, equipo, minuto, minuto_extra, orden, var_motivo) VALUES (?, 'descanso', 'ninguno', ?, ?, 0, 'automatico')`
+    ).bind(partido.id, MINUTO_DESCANSO_AUTOMATICO, anadido > 0 ? anadido : null).run();
   }
 }
 
@@ -6656,10 +6936,11 @@ const MINUTOS_DESCANSO_AUTOMATICO = 15;
 // Reanuda solo la 2ª parte de los partidos cuyo descanso lo puso el cron
 // (crearDescansoAutomaticoAlMinuto45) y llevan ya MINUTOS_DESCANSO_AUTOMATICO
 // minutos parados: retoma el cronómetro desde el minuto en el que se
-// pausó (45) y registra el evento "fin_descanso" (con orden 1 para que
-// quede detrás de "descanso", como hace mamComenzarSegundaParte). Si el
-// redactor ya ha reanudado a mano (lo último es "fin_descanso") o el
-// descanso lo pitó él (sin marca 'automatico'), no se toca nada.
+// pausó (45 o 45+añadido) y registra el evento "fin_descanso", que se
+// etiqueta SIEMPRE como 45' (sin añadido) y con orden 1; el ORDER BY de los
+// eventos lo coloca siempre DESPUÉS de "descanso" (45+N). Si el redactor ya
+// ha reanudado a mano (lo último es "fin_descanso") o el descanso lo pitó
+// él (sin marca 'automatico'), no se toca nada.
 async function reanudarSegundaParteAutomatica(env, partidosEnJuego) {
   const pausados = (partidosEnJuego ?? (await env.DB.prepare(
     `SELECT id, cronometro_pausado_en FROM results WHERE estado = 'en_juego' AND cronometro_pausado_en IS NOT NULL`
@@ -6674,19 +6955,16 @@ async function reanudarSegundaParteAutomatica(env, partidosEnJuego) {
     const desdeMs = fechaBdAMs(ultima.created_at);
     if (!Number.isFinite(desdeMs) || Date.now() - desdeMs < MINUTOS_DESCANSO_AUTOMATICO * 60000) continue;
 
-    const minutoReanudar = Number.isInteger(partido.cronometro_pausado_en) && partido.cronometro_pausado_en > 0
-      ? partido.cronometro_pausado_en : MINUTO_DESCANSO_AUTOMATICO;
+    // La 2ª parte arranca SIEMPRE en el 45, aunque el descanso se pusiera en 45+N.
+    const minutoReanudar = MINUTO_DESCANSO_AUTOMATICO;
     // El evento "fin_descanso" se registra ANTES de arrancar el cronometro:
-    // el panel de Minuto a Minuto decide si va la 2a parte (y por tanto si
-    // muestra 46' y no 45+1') mirando ese evento, y si recargaba justo entre
-    // las dos escrituras se quedaba sin verlo y pintaba 45+x hasta la
-    // siguiente recarga. Si el arranque falla se retira el evento para que
-    // el siguiente minuto del cron lo reintente.
+    // el panel de Minuto a Minuto decide si va la 2a parte mirando ese
+    // evento. Si el arranque falla se retira para que el cron lo reintente.
     await env.DB.prepare(
       `INSERT INTO match_events (resultado_id, tipo, equipo, minuto, orden, var_motivo) VALUES (?, 'fin_descanso', 'ninguno', ?, 1, 'automatico')`
     ).bind(partido.id, 45).run();
     try {
-      await iniciarCronometroPartido(env, partido.id, minutoReanudar);
+      await iniciarCronometroPartido(env, partido.id, minutoReanudar, { segundaParte: true });
     } catch (err) {
       console.error("[descanso-automatico] no se pudo reanudar el cronometro:", err.message);
       await env.DB.prepare(
@@ -6758,6 +7036,37 @@ async function crearFinPartidoAutomaticoAlMinuto90(env, partidosEnJuego) {
     await env.DB.prepare(
       "UPDATE results SET estado = 'finalizado', aviso_desatendido_mitad = NULL, finalizado_no_cubierto = 1 WHERE id = ?"
     ).bind(partido.id).run();
+    await invalidarCacheArticuloPartido(env, partido.id);
+  }
+}
+
+// Cierra solo el partido cuando el reloj llega al final del añadido de la
+// 2ª parte que el redactor ha ANUNCIADO (90+N). Sin añadido anunciado no
+// hace nada: el final sigue siendo manual (o el cierre de red de seguridad
+// de crearFinPartidoAutomaticoAlMinuto90). Es un cierre deliberado, no un
+// partido sin cubrir: finalizado_no_cubierto = 0.
+async function cerrarPartidoAlTerminarAnadido(env, ctx, partidosEnJuego) {
+  const partidos = (partidosEnJuego ?? (await env.DB.prepare(
+    `SELECT id, inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos, anadido_minutos, anadido_parte
+     FROM results WHERE estado = 'en_juego' AND cronometro_pausado_en IS NULL`
+  ).all()).results).filter((p) => p.cronometro_pausado_en === null || p.cronometro_pausado_en === undefined);
+  for (const partido of partidos) {
+    const anadido = anadidoAnunciado(partido, 2);
+    if (!anadido) continue;
+    const limite = 90 + anadido;
+    if (minutoEnVivoServidor(partido) < limite) continue;
+
+    const yaHuboFin = await env.DB.prepare(
+      "SELECT id FROM match_events WHERE resultado_id = ? AND tipo = 'fin_partido' LIMIT 1"
+    ).bind(partido.id).first();
+    if (yaHuboFin) continue;
+
+    await env.DB.prepare(
+      `INSERT INTO match_events (resultado_id, tipo, equipo, minuto, minuto_extra, orden) VALUES (?, 'fin_partido', 'ninguno', 90, ?, 0)`
+    ).bind(partido.id, anadido).run();
+    await env.DB.prepare(
+      "UPDATE results SET cronometro_pausado_en = ?, estado = 'finalizado', aviso_desatendido_mitad = NULL, finalizado_no_cubierto = 0 WHERE id = ?"
+    ).bind(limite, partido.id).run();
     await invalidarCacheArticuloPartido(env, partido.id);
   }
 }
@@ -6910,6 +7219,15 @@ function minutoEnVivoServidor(resultado) {
   if (isNaN(inicioMs)) return 0;
   const ajuste = Number.isInteger(resultado.ajuste_cronometro_minutos) ? resultado.ajuste_cronometro_minutos : 0;
   return Math.max(0, Math.floor((Date.now() - inicioMs) / 60000) + ajuste);
+}
+
+// Minutos de añadido ANUNCIADOS por el redactor para la parte indicada
+// (1 o 2), o 0 si no hay ninguno que aplique a esa parte. Solo hay un
+// añadido activo a la vez (results.anadido_minutos / anadido_parte).
+function anadidoAnunciado(resultado, parte) {
+  const n = Number(resultado?.anadido_minutos);
+  if (!Number.isInteger(n) || n <= 0 || n > 15) return 0;
+  return Number(resultado.anadido_parte) === parte ? n : 0;
 }
 
 // ---------- Avisos de partidos sin cubrir: evaluación, validación y agrupación ----------
@@ -7360,7 +7678,7 @@ async function publicarArticulosProgramados(env) {
   for (const articulo of pendientes) {
     const fechaPublicacion = new Date().toISOString();
     await env.DB.prepare(
-      `UPDATE articles SET publicado = 1, programado_para = NULL, redes_destino = NULL, slug_congelado = 1, fecha_publicacion = datetime('now'), updated_at = datetime('now') WHERE id = ?`
+      `UPDATE articles SET publicado = 1, programado_para = NULL, slug_congelado = 1, fecha_publicacion = datetime('now'), updated_at = datetime('now') WHERE id = ?`
     ).bind(articulo.id).run();
     // El horario se evalúa en el momento real de publicación, no cuando se programó.
     await marcarFueraDeCalendario(env, articulo.id, { tipo: articulo.tipo, resultado_id: articulo.resultado_id });
@@ -7370,7 +7688,7 @@ async function publicarArticulosProgramados(env) {
     // Aviso a los buscadores (IndexNow); nunca lanza.
     await notificarIndexNow(env, [urlNoticia(articulo.categoria, articulo.slug)]);
 
-    const tipoLabel = { noticia: "Noticia", previa: "Previa", cronica: "Crónica", analisis: "Análisis", opinion: "Opinión", entrevista: "Entrevista" }[articulo.tipo] || "Artículo";
+    const tipoLabel = { noticia: "Noticia", previa: "Previa", cronica: "Crónica", analisis: "Análisis", opinion: "Opinión", entrevista: "Entrevista", uno_por_uno: "1x1 de jugadores" }[articulo.tipo] || "Artículo";
     const firmaAutores = articulo.coautor_nombre ? `${articulo.autor_nombre} y ${articulo.coautor_nombre}` : articulo.autor_nombre;
 
     await enviarEmailNotificacion(env, {
@@ -7392,6 +7710,9 @@ async function publicarArticulosProgramados(env) {
       accion: "publicar_articulo_programado", entidad: "articulo", entidad_id: articulo.slug,
       descripcion: `Se ha publicado automáticamente, tal y como estaba programada, "${tipoLabel.toLowerCase()}": "${articulo.titulo}"`,
     });
+
+    // La tarjeta de redes (X/Facebook/WhatsApp) se refresca nada más publicarse.
+    await refrescarTarjetaSocial(env, urlNoticia(articulo.categoria, articulo.slug));
   }
 }
 // ================================================================
@@ -9427,7 +9748,7 @@ async function notificarPushArticulo(env, articulo) {
 async function notificarPushPartido(env, resultadoId, tipo, evento = {}) {
   try {
     const r = await env.DB.prepare(
-      "SELECT equipo_local, equipo_visitante, goles_local, goles_visitante FROM results WHERE id = ?"
+      "SELECT equipo_local, equipo_visitante, goles_local, goles_visitante, estado FROM results WHERE id = ?"
     ).bind(resultadoId).first();
     if (!r) return;
     const marcador = `${r.equipo_local} ${r.goles_local ?? 0}-${r.goles_visitante ?? 0} ${r.equipo_visitante}`;
@@ -9435,6 +9756,20 @@ async function notificarPushPartido(env, resultadoId, tipo, evento = {}) {
     if (tipo === "fin_partido") {
       titulo = "\uD83C\uDFC1 Final";
       cuerpo = marcador;
+    } else if (tipo === "gol_var" || tipo === "correccion") {
+      // Anulaciones por VAR y correcciones de marcador: van en el mismo grupo
+      // de avisos que los goles (tema "partidos") y con la misma tag por
+      // partido, de modo que sustituyen al aviso de gol anterior en vez de
+      // apilarse. No se avisa de partidos que aun no han empezado.
+      if (r.estado === "programado") return;
+      if (tipo === "gol_var") {
+        const minuto = evento.minuto ? ` (${parseInt(evento.minuto, 10)}'${evento.minuto_extra ? "+" + parseInt(evento.minuto_extra, 10) : ""})` : "";
+        titulo = "\u274C Gol anulado (VAR)";
+        cuerpo = `${marcador}${minuto}`;
+      } else {
+        titulo = "\u270F\uFE0F Marcador corregido";
+        cuerpo = `${marcador}${evento.antes ? ` (antes ${evento.antes})` : ""}`;
+      }
     } else if (tipo === "gol" || tipo === "gol_pp") {
       const minuto = evento.minuto ? ` (${parseInt(evento.minuto, 10)}'${evento.minuto_extra ? "+" + parseInt(evento.minuto_extra, 10) : ""})` : "";
       titulo = tipo === "gol_pp" ? "\u26BD Gol en propia puerta" : "\u26BD \u00A1Gol!";
@@ -9688,7 +10023,7 @@ async function staffPushEnviar(env, categoria, mensaje, { excluirUid = null, sol
 async function notificarStaffArticulo(env, art, { excluirUid = null, borrador = false } = {}) {
   try {
     if (!art || !art.titulo) return;
-    const tipoLabel = { noticia: "Noticia", previa: "Previa", cronica: "Crónica", analisis: "Análisis", opinion: "Opinión", entrevista: "Entrevista" }[art.tipo] || "Artículo";
+    const tipoLabel = { noticia: "Noticia", previa: "Previa", cronica: "Crónica", analisis: "Análisis", opinion: "Opinión", entrevista: "Entrevista", uno_por_uno: "1x1 de jugadores" }[art.tipo] || "Artículo";
     const firma = art.coautor_nombre ? `${art.autor_nombre} y ${art.coautor_nombre}` : (art.autor_nombre || "");
     await staffPushEnviar(env, "noticias", {
       titulo: borrador ? `${tipoLabel}: borrador terminado` : `${tipoLabel} publicada`,
@@ -10176,6 +10511,51 @@ export default {
 
     /*
      * ============================================================
+     * SITEMAP DE JUGADORES Y PLANTILLAS
+     *
+     * GET /sitemap-jugadores.xml
+     *
+     * Una URL por ficha de jugador (/jugador?c=...&j=...) y por plantilla
+     * de club (/plantilla?c=...&club=...) de la temporada en curso, a
+     * partir de las mismas estadísticas calculadas que los tops (con las
+     * correcciones del panel: los ocultos no salen y las fusiones usan el
+     * enlace vigente). No se listan fichas que solo tienen dorsal. Si la
+     * base de datos falla se responde 503 (y NO un sitemap vacío): un
+     * sitemap vacío con 200 haría creer a los buscadores que se han
+     * borrado todas las fichas, mientras que con 503 reintentan y el
+     * Worker del sitio sigue sirviendo su última copia buena.
+     * ============================================================
+     */
+    if (path === "/sitemap-jugadores.xml" && method === "GET") {
+      try {
+        const fuentesSitemap = await Promise.all(STATS_COMPETICIONES.map((c) => statsFuenteCompeticion(env, c, false)));
+        const entradasSitemap = statsEntradasSitemapJugadores(fuentesSitemap, 40000);
+        const urlsJug = entradasSitemap.map((e) => {
+          const lastmod = e.lastmod ? fechaParaSitemap(e.lastmod) : null;
+          return [
+            "  <url>",
+            `    <loc>${escaparXml(SITIO_URL + e.ruta)}</loc>`,
+            lastmod ? `    <lastmod>${lastmod}</lastmod>` : null,
+            "    <changefreq>daily</changefreq>",
+            `    <priority>${e.ruta.startsWith("/plantilla") ? "0.6" : "0.5"}</priority>`,
+            "  </url>",
+          ].filter(Boolean).join("\n");
+        }).join("\n");
+        const xmlJug = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urlsJug}\n</urlset>\n`;
+        return cors(new Response(xmlJug, {
+          status: 200,
+          headers: { "Content-Type": "application/xml; charset=UTF-8", "Cache-Control": "public, max-age=3600" },
+        }), ORIGEN_PETICION_ACTUAL);
+      } catch (err) {
+        return cors(new Response("Servicio temporalmente no disponible", {
+          status: 503,
+          headers: { "Content-Type": "text/plain; charset=UTF-8", "Retry-After": "300", "Cache-Control": "no-store" },
+        }), ORIGEN_PETICION_ACTUAL);
+      }
+    }
+
+    /*
+     * ============================================================
      * FEED RSS
      *
      * GET /rss.xml
@@ -10540,7 +10920,7 @@ export default {
       if (!f) return json({ error: "Este formulario no está disponible" }, 404);
       const acc = comprobarAccesoFormulario(f, body.pin);
       if (!acc.ok) return json({ error: acc.error }, acc.status);
-      const campos = camposConAltaPorDefecto(f.slug, parsearCamposFormulario(f.campos));
+      const campos = await aplicarInvitadosFormulario(env, f, camposConAltaPorDefecto(f.slug, parsearCamposFormulario(f.campos)));
       const v = validarRespuestasFormulario(campos, body.respuestas);
       if (v.error) return json({ error: v.error }, 400);
       if (!Object.keys(v.datos).length) return json({ error: "No hay ninguna respuesta que enviar" }, 400);
@@ -10973,7 +11353,7 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
         const { results } = await env.DB.prepare(
           `SELECT id, competicion, jornada, equipo_local, equipo_visitante, autor_id, autor_nombre,
                   inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos,
-                  aviso_desatendido_mitad
+                  aviso_desatendido_mitad, anadido_minutos, anadido_parte
            FROM results WHERE estado = 'en_juego'`
         ).all();
         partidosEnJuego = results || [];
@@ -10989,6 +11369,7 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
         );
         await crearDescansoAutomaticoAlMinuto45(env, corriendo);
         await reanudarSegundaParteAutomatica(env, partidosEnJuego);
+        await cerrarPartidoAlTerminarAnadido(env, ctx, corriendo);
         await crearFinPartidoAutomaticoAlMinuto90(env, corriendo);
       }
 
@@ -11091,6 +11472,54 @@ const SYNC_VIVO_MAX_INTENTOS = 6;
 function syncSinAcentos(s) {
   return String(s ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
     .replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+// Alias de nombres de club -> nombre OFICIAL (el de public/js/clubs.js).
+// Cubre las formas con las que el mismo club llega desde otras fuentes
+// (TheSportsDB, textos pegados, redactores) y que ni la normalización ni
+// la clave "gruesa" emparejan solas. Las claves van normalizadas: sin
+// tildes, en minúsculas y con cualquier signo como un único espacio.
+// OJO: misma idea que ALIAS_NOMBRES_EQUIPO en
+// public/admin/js/importacion-rapida.js; si se añade uno aquí, añadirlo
+// allí también (y en la tabla equipo_alias_externo para la sincronización).
+const ALIAS_CLUBES_CANONICOS = {
+  // Celta Fortuna (el filial del Celta; en algunas fuentes "Celta B")
+  "celta b": "Celta Fortuna",
+  "celta de vigo b": "Celta Fortuna",
+  "celta vigo b": "Celta Fortuna",
+  "rc celta b": "Celta Fortuna",
+  "rc celta de vigo b": "Celta Fortuna",
+  "real club celta b": "Celta Fortuna",
+  "celta ii": "Celta Fortuna",
+  "rc celta fortuna": "Celta Fortuna",
+  "celta de vigo fortuna": "Celta Fortuna",
+  // Real Sporting
+  "sporting de gijon": "Real Sporting",
+  "sporting gijon": "Real Sporting",
+  "real sporting de gijon": "Real Sporting",
+  "real sporting gijon": "Real Sporting",
+  "r sporting de gijon": "Real Sporting",
+  // Arosa SC (Segunda RFEF, Grupo 1)
+  "arosa": "Arosa SC",
+  "arosa sc": "Arosa SC",
+  "sc arosa": "Arosa SC",
+  "arosa sociedad cultural": "Arosa SC",
+  "sociedad cultural arosa": "Arosa SC",
+  // RS Gimnástica de Torrelavega (Segunda RFEF, Grupo 1)
+  "gimnastica de torrelavega": "RS Gimnástica de Torrelavega",
+  "gimnastica torrelavega": "RS Gimnástica de Torrelavega",
+  "rs gimnastica": "RS Gimnástica de Torrelavega",
+  "r s gimnastica de torrelavega": "RS Gimnástica de Torrelavega",
+  "real sociedad gimnastica": "RS Gimnástica de Torrelavega",
+  "real sociedad gimnastica de torrelavega": "RS Gimnástica de Torrelavega",
+  "real sociedad gimnastica torrelavega": "RS Gimnástica de Torrelavega",
+};
+
+// Nombre oficial del club si el texto es un alias conocido; null si no.
+function canonicoClubPorAlias(nombre) {
+  const k = String(nombre ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ").trim();
+  return ALIAS_CLUBES_CANONICOS[k] || null;
 }
 
 // Clave "gruesa" de un equipo para emparejar variantes del mismo nombre
@@ -11197,16 +11626,33 @@ async function syncGuardarSetting(env, key, objeto) {
 }
 
 async function syncFetchJson(env, ruta, ctr) {
-  ctr.sub++;
-  ctr.api = (ctr.api || 0) + 1; // peticiones reales a TheSportsDB (se guarda en ultima_pasada)
-  const clave = env.THESPORTSDB_API_KEY || "3";
-  const resp = await fetch(`${SYNC_API_BASE}/${encodeURIComponent(clave)}/${ruta}`, {
-    headers: { Accept: "application/json" },
-    signal: AbortSignal.timeout(12000),
-  });
-  if (resp.status === 429) throw new Error("TheSportsDB: limite de peticiones alcanzado (429)");
-  if (!resp.ok) throw new Error(`TheSportsDB respondio ${resp.status} en ${ruta.split("?")[0]}`);
-  return resp.json();
+  // Clave: la premium si hay secreto; si no, las gratuitas publicas. "123" es
+  // la vigente; "3" es la antigua y a veces responde 403, por eso se reintenta.
+  const claveSecreto = String(env.THESPORTSDB_API_KEY || "").trim();
+  const claves = claveSecreto ? [claveSecreto] : ["123", "3"];
+  let ultima = null;
+  for (let i = 0; i < claves.length; i++) {
+    ctr.sub++;
+    ctr.api = (ctr.api || 0) + 1; // peticiones reales a TheSportsDB (se guarda en ultima_pasada)
+    const resp = await fetch(`${SYNC_API_BASE}/${encodeURIComponent(claves[i])}/${ruta}`, {
+      headers: {
+        Accept: "application/json",
+        // Sin User-Agent de navegador, la proteccion anti-bots de TheSportsDB
+        // puede devolver 403 a las peticiones que salen de un Worker.
+        "User-Agent": "Mozilla/5.0 (compatible; ElOtroFutbol/1.0; +https://elotrofutbol.com)",
+      },
+      signal: AbortSignal.timeout(12000),
+    });
+    if (resp.status === 429) throw new Error("TheSportsDB: limite de peticiones alcanzado (429)");
+    if (resp.status === 403 && i < claves.length - 1) { ultima = resp.status; continue; }
+    if (!resp.ok) {
+      const pista = claveSecreto && resp.status >= 400 && /eventsround/.test(ruta)
+        ? " (con clave premium se debe usar eventsseason.php)" : "";
+      throw new Error(`TheSportsDB respondio ${resp.status} en ${ruta.split("?")[0]}${pista}`);
+    }
+    return resp.json();
+  }
+  throw new Error(`TheSportsDB respondio ${ultima || 403} en ${ruta.split("?")[0]}`);
 }
 
 // Rangos de jornada definidos a mano en jornadas_calendario: tienen
@@ -11371,6 +11817,8 @@ async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cac
   const resolver = (nombreExt) => {
     const a = alias.get(syncSinAcentos(nombreExt));
     if (a) return { nombre: a, ok: true };
+    const canonico = canonicoClubPorAlias(nombreExt);
+    if (canonico) return { nombre: canonico, ok: true };
     if (conocidos.has(nombreExt)) return { nombre: nombreExt, ok: true };
     const candidatos = porClave.get(syncClaveEquipo(nombreExt));
     if (candidatos && candidatos.length === 1) return { nombre: candidatos[0], ok: true };
@@ -11634,8 +12082,15 @@ async function syncEjecutarPasada(env, { modo, reiniciar = false, forzar = false
         peticionesVivo++;
         intentos[g.clave] = { n: (previo && previo.firma === firma ? previo.n : 0) + 1, ultimo: new Date().toISOString(), firma };
         try {
-          const datos = await syncFetchJson(env, `eventsround.php?id=${g.liga.leagueId}&r=${g.jornada}&s=${encodeURIComponent(temporada)}`, ctr);
-          const resumen = await syncAplicarEventos(env, g.liga, datos?.events || [], g.jornada, temporada, ctr, cache);
+          let evsVivo;
+          if (premium) {
+            const datos = await syncFetchJson(env, `eventsseason.php?id=${g.liga.leagueId}&s=${encodeURIComponent(temporada)}`, ctr);
+            evsVivo = (datos?.events || []).filter((e) => String(e.intRound) === String(g.jornada));
+          } else {
+            const datos = await syncFetchJson(env, `eventsround.php?id=${g.liga.leagueId}&r=${g.jornada}&s=${encodeURIComponent(temporada)}`, ctr);
+            evsVivo = datos?.events || [];
+          }
+          const resumen = await syncAplicarEventos(env, g.liga, evsVivo, g.jornada, temporada, ctr, cache);
           syncSumarResumen(estado.informe, g.liga, resumen);
           if (resumen.error) errores.push(`${syncClaveLiga(g.liga)}: ${resumen.error}`);
         } catch (err) {
@@ -11722,6 +12177,37 @@ async function syncEliminarDuplicadosDeRedaccion(env) {
 }
 
 async function syncRutasAdmin(request, env, path, method, url) {
+  // Ingesta desde GitHub Actions: TheSportsDB bloquea (403) las peticiones que
+  // salen de Workers, asi que el Action descarga los eventos y los entrega aqui.
+  // Se autentica con el secreto SYNC_INGEST_TOKEN (no con sesion de admin).
+  if (path === "/api/admin/sync-partidos/ingestar") {
+    const token = String(env.SYNC_INGEST_TOKEN || "");
+    const dado = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
+    let iguales = token.length >= 16 && dado.length === token.length;
+    if (iguales) { let d = 0; for (let i = 0; i < token.length; i++) d |= token.charCodeAt(i) ^ dado.charCodeAt(i); iguales = d === 0; }
+    if (!iguales) return json({ error: "No autorizado" }, 401);
+    const { config } = await syncLeerConfigYEstado(env);
+    const temporada = config.temporada || syncTemporada();
+    if (method === "GET") {
+      return json({ temporada, ligas: config.ligas.map((l) => ({ clave: syncClaveLiga(l), leagueId: l.leagueId, rondas: l.rondas, nombre: l.nombre })) });
+    }
+    if (method === "POST") {
+      const body = await request.json().catch(() => null);
+      const liga = config.ligas.find((l) => syncClaveLiga(l) === body?.clave);
+      const ronda = parseInt(body?.ronda, 10);
+      if (!liga || !Number.isFinite(ronda) || !Array.isArray(body?.eventos)) return json({ error: "Cuerpo no valido" }, 400);
+      const ctr = { sub: 1, max: parseInt(env.SYNC_MAX_SUBREQUESTS, 10) || 40 };
+      const eventos = body.eventos.slice(0, 100).map((e) => ({ ...e, _ronda: ronda }));
+      const resumen = await syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, {});
+      try {
+        await env.DB.prepare("UPDATE sync_partidos_auto SET ultimo_sync_at = ?, ultimo_sync_ok = ?, ultimo_error = ? WHERE id = 1")
+          .bind(new Date().toISOString(), resumen.error ? 0 : 1, resumen.error ? String(resumen.error).slice(0, 500) : null).run();
+      } catch {}
+      return json({ ok: !resumen.error, resumen });
+    }
+    return json({ error: "Metodo no permitido" }, 405);
+  }
+
   const payload = await requireAuth(request, env);
   if (!payload) return json({ error: "No autorizado" }, 401);
   if (payload.rol !== "admin") return json({ error: "Solo un administrador puede gestionar el relleno automatico" }, 403);
@@ -12176,6 +12662,735 @@ async function fetchRailway(
  * ================================================================
  */
 
+// ---------- Estadísticas de jugadores (goleadores, asistentes, tarjetas) ----------
+// Se calculan al vuelo a partir de match_events y alineaciones, sin tablas
+// nuevas. El campo "jugador" de los eventos es TEXTO LIBRE ("9 · Rodrigo",
+// solo "9" o solo "Rodrigo"), así que lo difícil es saber que dos eventos
+// son el mismo jugador. Estrategia (de más a menos fiable):
+//   1) Dentro de un partido, el dorsal o el nombre del evento se completan
+//      con la alineación de ese equipo en ese partido (si existe).
+//   2) Dentro de un club, un nombre corto ("Rodrigo") se une a un único
+//      nombre más largo que lo contenga ("Rodrigo Martínez").
+//   3) Dentro de un club, un evento solo con dorsal se une al nombre que
+//      siempre lleva ese dorsal en el resto de eventos.
+// Si hay ambigüedad (dos candidatos) NO se une nada: es mejor un jugador
+// repartido en dos filas que goles atribuidos a quien no es.
+// La Fase 2 (tabla "jugadores" + fusión manual en el panel) resuelve el resto.
+
+function statsNormalizarNombre(texto) {
+  return String(texto || "")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/\(\s*\d+\s*['’′]?\s*\)/g, " ") // "(27')" pegado al nombre
+    .replace(/[^a-z0-9ñ\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// "9 · Rodrigo" -> { dorsal: 9, nombre: "Rodrigo" }; "9" -> { dorsal: 9, nombre: "" };
+// "Rodrigo" -> { dorsal: null, nombre: "Rodrigo" }. Acepta separadores · - – . : )
+function statsSepararJugador(raw) {
+  const t = String(raw || "").trim();
+  if (!t) return { dorsal: null, nombre: "" };
+  const m = t.match(/^#?\s*(\d{1,3})\s*(?:[·•\-–—.:)]\s*|\s+)(.*)$/);
+  if (m) return { dorsal: parseInt(m[1], 10), nombre: m[2].trim() };
+  if (/^#?\s*\d{1,3}$/.test(t)) return { dorsal: parseInt(t.replace("#", ""), 10), nombre: "" };
+  return { dorsal: null, nombre: t };
+}
+
+function statsTokens(nombreNormalizado) {
+  return nombreNormalizado ? nombreNormalizado.split(" ").filter(Boolean) : [];
+}
+
+// ¿Todos los tokens de "corto" están en "largo"? Una inicial suelta ("r")
+// vale para cualquier token que empiece por esa letra ("rodrigo").
+function statsTokensContenidos(corto, largo) {
+  if (!corto.length || corto.length > largo.length) return false;
+  return corto.every((t) => largo.some((l) => l === t || (t.length === 1 && l.startsWith(t))));
+}
+
+// Alineaciones de UN partido -> { local: [{dorsal, nombre, norm, tokens}], visitante: [...] }
+function statsAlineacionesDelPartido(filas, equipoLocal, equipoVisitante) {
+  const out = { local: [], visitante: [] };
+  const nl = statsNormalizarNombre(equipoLocal);
+  const nv = statsNormalizarNombre(equipoVisitante);
+  (filas || []).forEach((fila, i) => {
+    const ne = statsNormalizarNombre(fila.equipo);
+    let lado = null;
+    if (ne && ne === nl) lado = "local";
+    else if (ne && ne === nv) lado = "visitante";
+    else if (filas.length === 2) lado = i === 0 ? "local" : "visitante"; // último recurso
+    if (!lado) return;
+    let jugadores = [];
+    try { jugadores = JSON.parse(fila.jugadores || "[]"); } catch (_) { jugadores = []; }
+    if (!Array.isArray(jugadores)) return;
+    jugadores.forEach((j) => {
+      const nombre = String((j && j.nombre) || "").trim();
+      const dorsal = j && j.dorsal !== undefined && j.dorsal !== null && j.dorsal !== "" ? parseInt(j.dorsal, 10) : null;
+      if (!nombre) return;
+      const norm = statsNormalizarNombre(nombre);
+      out[lado].push({ dorsal: Number.isInteger(dorsal) ? dorsal : null, nombre, norm, tokens: statsTokens(norm), titular: !(j && j.titular === false) });
+    });
+  });
+  return out;
+}
+
+// Resuelve el texto libre de un evento contra la plantilla del partido.
+// Devuelve { dorsal, nombre } (nombre completo si lo encuentra).
+function statsResolverEnPartido(raw, plantilla) {
+  const sep = statsSepararJugador(raw);
+  const lista = plantilla || [];
+  if (sep.nombre) {
+    const norm = statsNormalizarNombre(sep.nombre);
+    const tok = statsTokens(norm);
+    // Coincidencia exacta primero, luego por tokens contenidos (única).
+    const exacta = lista.filter((p) => p.norm === norm);
+    if (exacta.length === 1) return { dorsal: sep.dorsal ?? exacta[0].dorsal, nombre: exacta[0].nombre };
+    const parciales = lista.filter((p) => statsTokensContenidos(tok, p.tokens));
+    if (parciales.length === 1) return { dorsal: sep.dorsal ?? parciales[0].dorsal, nombre: parciales[0].nombre };
+    return { dorsal: sep.dorsal, nombre: sep.nombre };
+  }
+  if (sep.dorsal !== null) {
+    const conDorsal = lista.filter((p) => p.dorsal === sep.dorsal);
+    if (conDorsal.length === 1) return { dorsal: sep.dorsal, nombre: conDorsal[0].nombre };
+    return { dorsal: sep.dorsal, nombre: "" };
+  }
+  return { dorsal: null, nombre: "" };
+}
+
+/**
+ * eventos: [{ resultado_id, tipo, lado, club, escudo_url, jugador, jugador_asistencia,
+ *             bajar_gol, minuto, minuto_extra }]
+ * alineaciones: [{ result_id, equipo, jugadores }]
+ * partidos: Map resultado_id -> { equipo_local, equipo_visitante, escudo_local_url, escudo_visitante_url, ... }
+ * Devuelve { jugadores: Map clave -> ficha, sin_resolver: n }
+ * Cada ficha lleva "slug" (identificador estable para su página /jugador) y
+ * "apariciones" (detalle por partido, solo para la ficha individual).
+ * Los jugadores de las alineaciones sin eventos también tienen ficha (con 0
+ * en todo) para que cualquiera pueda abrir la suya; los rankings solo
+ * cuentan a quien tiene datos > 0.
+ */
+function statsSlugTexto(t) {
+  return String(t || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+function statsSlugJugador(club, clave) {
+  const parte = String(clave || "").startsWith("#") ? "dorsal-" + String(clave).slice(1) : statsSlugTexto(clave);
+  return statsSlugTexto(club) + "~" + (parte || "jugador");
+}
+
+function statsAgregarJugadores(eventos, alineaciones, partidos) {
+  const filasPorPartido = new Map();
+  (alineaciones || []).forEach((a) => {
+    const id = Number(a.result_id);
+    if (!filasPorPartido.has(id)) filasPorPartido.set(id, []);
+    filasPorPartido.get(id).push(a);
+  });
+  const plantillas = new Map();
+  const plantillaDe = (resultadoId, lado) => {
+    const id = Number(resultadoId);
+    if (!plantillas.has(id)) {
+      const p = partidos.get(id) || {};
+      plantillas.set(id, statsAlineacionesDelPartido(filasPorPartido.get(id) || [], p.equipo_local, p.equipo_visitante));
+    }
+    return plantillas.get(id)[lado] || [];
+  };
+
+  // Paso 1: cada aparición (evento + papel) -> { club, dorsal, nombre }
+  const apariciones = []; // { club, escudo, dorsal, nombre, campo, delta, resultadoId, minuto, extra, presencia }
+  const anadir = (club, escudo, ident, campo, delta, resultadoId, minuto, extra, presencia) => {
+    apariciones.push({ club, escudo, dorsal: ident.dorsal, nombre: ident.nombre, campo, delta, resultadoId,
+      minuto: minuto ?? null, extra: extra ?? null, presencia: !!presencia });
+  };
+  (eventos || []).forEach((e) => {
+    if (!e.club) return;
+    const lado = e.lado; // "local" | "visitante" del equipo que actúa
+    const tipo = e.tipo;
+    if (tipo === "gol_pp") return; // gol en propia puerta: no es gol del jugador
+    if (["gol", "gol_var"].includes(tipo)) {
+      // gol_var con bajar_gol = gol ya contado que se anula -> resta.
+      const delta = tipo === "gol" ? 1 : (Number(e.bajar_gol) ? -1 : 0);
+      if (delta !== 0 && e.jugador) {
+        anadir(e.club, e.escudo_url, statsResolverEnPartido(e.jugador, plantillaDe(e.resultado_id, lado)), "goles", delta, e.resultado_id, e.minuto, e.minuto_extra);
+      }
+      if (delta !== 0 && e.jugador_asistencia) {
+        anadir(e.club, e.escudo_url, statsResolverEnPartido(e.jugador_asistencia, plantillaDe(e.resultado_id, lado)), "asistencias", delta, e.resultado_id, e.minuto, e.minuto_extra);
+      }
+      return;
+    }
+    const campoTarjeta = { amarilla: "amarillas", doble_amarilla: "dobles", roja: "rojas" }[tipo];
+    if (campoTarjeta && e.jugador) {
+      anadir(e.club, e.escudo_url, statsResolverEnPartido(e.jugador, plantillaDe(e.resultado_id, lado)), campoTarjeta, 1, e.resultado_id, e.minuto, e.minuto_extra);
+    }
+  });
+  // Presencias: titulares y suplentes de cada alineación guardada.
+  filasPorPartido.forEach((_filas, id) => {
+    const p = partidos.get(id);
+    if (!p) return;
+    ["local", "visitante"].forEach((lado) => {
+      const club = lado === "local" ? p.equipo_local : p.equipo_visitante;
+      const escudo = lado === "local" ? p.escudo_local_url : p.escudo_visitante_url;
+      if (!club) return;
+      plantillaDe(id, lado).forEach((j) => {
+        anadir(club, escudo, { dorsal: j.dorsal, nombre: j.nombre }, j.titular ? "titular" : "suplente", 1, id, null, null, true);
+      });
+    });
+  });
+
+  // MVP del partido (results.mvp_jugador + mvp_equipo): texto libre como los eventos.
+  partidos.forEach((p, id) => {
+    if (!p || !p.mvp_jugador || (p.mvp_equipo !== "local" && p.mvp_equipo !== "visitante")) return;
+    const lado = p.mvp_equipo;
+    const club = lado === "local" ? p.equipo_local : p.equipo_visitante;
+    if (!club) return;
+    const escudo = lado === "local" ? p.escudo_local_url : p.escudo_visitante_url;
+    anadir(club, escudo, statsResolverEnPartido(p.mvp_jugador, plantillaDe(id, lado)), "mvps", 1, id, null, null, false);
+  });
+
+  // Paso 2: unir identidades dentro de cada club.
+  const porClub = new Map();
+  apariciones.forEach((a) => {
+    if (!porClub.has(a.club)) porClub.set(a.club, []);
+    porClub.get(a.club).push(a);
+  });
+  const fichas = new Map();
+  let sinResolver = 0;
+
+  porClub.forEach((lista, club) => {
+    // Los nombres y dorsales "de referencia" salen SOLO de los eventos (como
+    // antes): las alineaciones no cambian cómo se unen los eventos entre sí.
+    const listaEv = lista.filter((a) => !a.presencia);
+    const nombres = new Map(); // norm -> { nombre, tokens, n }
+    listaEv.forEach((a) => {
+      if (!a.nombre) return;
+      const norm = statsNormalizarNombre(a.nombre);
+      if (!norm) return;
+      const x = nombres.get(norm) || { nombre: a.nombre, tokens: statsTokens(norm), n: 0 };
+      x.n++;
+      if (a.nombre.length > x.nombre.length) x.nombre = a.nombre;
+      nombres.set(norm, x);
+    });
+    // Unión de nombres cortos con UN único nombre más largo que los contenga.
+    const destino = new Map(); // norm -> norm canónico
+    nombres.forEach((x, norm) => {
+      const candidatos = [...nombres.entries()].filter(([n2, y]) =>
+        n2 !== norm && y.tokens.length >= x.tokens.length && statsTokensContenidos(x.tokens, y.tokens));
+      destino.set(norm, candidatos.length === 1 ? candidatos[0][0] : norm);
+    });
+    const canonico = (norm) => { let n = norm, guardia = 0; while (destino.get(n) && destino.get(n) !== n && guardia++ < 5) n = destino.get(n); return n; };
+
+    // Dorsal -> nombre canónico único (solo si ese dorsal siempre lleva el mismo nombre).
+    const dorsalNombres = new Map(); // dorsal -> Set(norm canónico)
+    listaEv.forEach((a) => {
+      if (a.dorsal === null || !a.nombre) return;
+      const c = canonico(statsNormalizarNombre(a.nombre));
+      if (!c) return;
+      if (!dorsalNombres.has(a.dorsal)) dorsalNombres.set(a.dorsal, new Set());
+      dorsalNombres.get(a.dorsal).add(c);
+    });
+
+    // Un jugador de la alineación se une a la ficha de un evento solo si el
+    // nombre coincide exacto o si el del evento es más completo (nunca al revés
+    // con nombres de una sola palabra: "Pablo" podría ser cualquiera de dos).
+    const resolverPresencia = (norm) => {
+      if (nombres.has(norm)) return canonico(norm);
+      const tok = statsTokens(norm);
+      const cand = new Set();
+      nombres.forEach((y, n2) => {
+        if (statsTokensContenidos(tok, y.tokens) || (y.tokens.length >= 2 && statsTokensContenidos(y.tokens, tok))) cand.add(canonico(n2));
+      });
+      return cand.size === 1 ? [...cand][0] : norm;
+    };
+
+    lista.forEach((a) => {
+      let clave, mostrar, dorsal = a.dorsal;
+      if (a.presencia) {
+        const norm = statsNormalizarNombre(a.nombre);
+        if (!norm) return;
+        clave = resolverPresencia(norm);
+        mostrar = (nombres.get(clave) || {}).nombre || a.nombre;
+      } else if (a.nombre) {
+        clave = canonico(statsNormalizarNombre(a.nombre));
+        mostrar = (nombres.get(clave) || nombres.get(statsNormalizarNombre(a.nombre)) || {}).nombre || a.nombre;
+      } else if (a.dorsal !== null && dorsalNombres.get(a.dorsal) && dorsalNombres.get(a.dorsal).size === 1) {
+        clave = [...dorsalNombres.get(a.dorsal)][0];
+        mostrar = (nombres.get(clave) || {}).nombre || "";
+      }
+      let sinNombre = false;
+      if (!clave && a.dorsal !== null) { clave = "#" + a.dorsal; mostrar = "Dorsal " + a.dorsal; sinNombre = true; }
+      if (!clave) { sinResolver++; return; }
+      if (sinNombre && !a.presencia) sinResolver++;
+      const k = club + "|" + clave;
+      let f = fichas.get(k);
+      if (!f) {
+        f = { jugador: mostrar, club, escudo_url: a.escudo || null, dorsal: dorsal, sin_nombre: sinNombre, clave,
+              goles: 0, asistencias: 0, amarillas: 0, dobles: 0, rojas: 0, titular: 0, suplente: 0, mvps: 0, apariciones: [] };
+        fichas.set(k, f);
+      }
+      if (!f.escudo_url && a.escudo) f.escudo_url = a.escudo;
+      if (f.dorsal === null && dorsal !== null) f.dorsal = dorsal;
+      if (!f.sin_nombre && mostrar && mostrar.length > String(f.jugador || "").length) f.jugador = mostrar;
+      f[a.campo] += a.delta;
+      f.apariciones.push({ r: a.resultadoId, c: a.campo, d: a.delta, m: a.minuto, x: a.extra });
+    });
+  });
+
+  fichas.forEach((f) => {
+    f.goles = Math.max(0, f.goles);
+    f.asistencias = Math.max(0, f.asistencias);
+    f.slug = statsSlugJugador(f.club, f.clave);
+  });
+  return { jugadores: fichas, sin_resolver: sinResolver };
+}
+
+// ---------- Correcciones manuales (tablas jugadores / jugador_alias) ----------
+// Un admin puede fundir varias fichas automáticas en un jugador real, ponerle
+// nombre/dorsal o ocultarlo (Funcionalidades > Jugadores). Aquí se aplican al
+// resultado del cálculo automático, sin tocar los eventos originales.
+//   correcciones: { jugadores: [{id, slug, club, nombre, dorsal, oculto}],
+//                   alias: [{jugador_id, club, clave}] }
+// Devuelve { jugadores, sin_resolver, alias_slugs }: alias_slugs relaciona el
+// slug automático antiguo de cada ficha fundida con el slug estable del
+// jugador corregido, para que los enlaces antiguos a su ficha sigan valiendo.
+function statsAplicarCorrecciones(agregado, correcciones) {
+  const jugs = (correcciones && correcciones.jugadores) || [];
+  const alias = (correcciones && correcciones.alias) || [];
+  const aliasSlugs = new Map();
+  if (!jugs.length || !alias.length) return { ...agregado, alias_slugs: aliasSlugs };
+  const porId = new Map(jugs.map((j) => [Number(j.id), j]));
+  const porClave = new Map();
+  alias.forEach((a) => { if (porId.has(Number(a.jugador_id))) porClave.set(a.club + "|" + a.clave, porId.get(Number(a.jugador_id))); });
+
+  const salida = new Map();
+  agregado.jugadores.forEach((f, k) => {
+    const j = porClave.get(k);
+    if (!j) { salida.set(k, f); return; }
+    if (Number(j.oculto)) { aliasSlugs.set(f.slug, null); return; } // oculto: ni ficha ni top
+    const kj = "J|" + j.id;
+    let t = salida.get(kj);
+    if (!t) {
+      t = { jugador: j.nombre, club: j.club || f.club, escudo_url: f.escudo_url || null,
+            dorsal: j.dorsal !== null && j.dorsal !== undefined ? Number(j.dorsal) : f.dorsal,
+            sin_nombre: false, clave: "jugador-" + j.id, corregido: true,
+            goles: 0, asistencias: 0, amarillas: 0, dobles: 0, rojas: 0, titular: 0, suplente: 0, mvps: 0, apariciones: [], slug: j.slug };
+      salida.set(kj, t);
+    }
+    if (!t.escudo_url && f.escudo_url) t.escudo_url = f.escudo_url;
+    if ((j.dorsal === null || j.dorsal === undefined) && t.dorsal === null && f.dorsal !== null) t.dorsal = f.dorsal;
+    ["goles", "asistencias", "amarillas", "dobles", "rojas", "titular", "suplente", "mvps"].forEach((c) => { t[c] += f[c] || 0; });
+    t.apariciones = t.apariciones.concat(f.apariciones || []);
+    if (f.slug && f.slug !== t.slug) aliasSlugs.set(f.slug, t.slug);
+  });
+  let quedanSinNombre = false;
+  salida.forEach((f) => { if (f.sin_nombre) quedanSinNombre = true; });
+  return { jugadores: salida, sin_resolver: quedanSinNombre ? agregado.sin_resolver : 0, alias_slugs: aliasSlugs };
+}
+
+async function statsLeerCorrecciones(env) {
+  try {
+    const { results: js } = await env.DB.prepare("SELECT id, slug, club, nombre, dorsal, oculto FROM jugadores").all();
+    if (!js || !js.length) return { jugadores: [], alias: [] };
+    const { results: al } = await env.DB.prepare("SELECT id, jugador_id, club, clave FROM jugador_alias").all();
+    return { jugadores: js, alias: al || [] };
+  } catch (_) {
+    return { jugadores: [], alias: [] }; // tablas aún sin migrar: solo cálculo automático
+  }
+}
+
+// Tops: solo los 10 primeros de cada ranking (límite máximo del sistema).
+const STATS_TOP_MAX = 10;
+function statsRankings(fichas, limite) {
+  const lista = Array.isArray(fichas) ? fichas : (fichas && typeof fichas.values === "function" ? [...fichas.values()] : []);
+  const cmpNombre = (a, b) => String(a.jugador).localeCompare(String(b.jugador), "es");
+  const limpiar = (x) => {
+    const { _k, apariciones, ...resto } = x;
+    return { ...resto, partidos: (x.titular || 0) + (x.suplente || 0) };
+  };
+  const conPos = (arr) => {
+    let pos = 0, prev = null, i = 0;
+    return arr.map((x) => { i++; const clave = JSON.stringify(x._k); if (clave !== prev) { pos = i; prev = clave; } return { pos, ...limpiar(x) }; });
+  };
+  const goleadores = lista.filter((f) => f.goles > 0)
+    .map((f) => ({ ...f, _k: [f.goles, f.asistencias] }))
+    .sort((a, b) => b.goles - a.goles || b.asistencias - a.asistencias || cmpNombre(a, b))
+    .slice(0, limite);
+  const asistentes = lista.filter((f) => f.asistencias > 0)
+    .map((f) => ({ ...f, _k: [f.asistencias, f.goles] }))
+    .sort((a, b) => b.asistencias - a.asistencias || b.goles - a.goles || cmpNombre(a, b))
+    .slice(0, limite);
+  const participacion = lista.filter((f) => f.goles + f.asistencias > 0)
+    .map((f) => ({ ...f, participacion: f.goles + f.asistencias, _k: [f.goles + f.asistencias, f.goles] }))
+    .sort((a, b) => b.participacion - a.participacion || b.goles - a.goles || cmpNombre(a, b))
+    .slice(0, limite);
+  const total = (f) => f.amarillas + f.dobles + f.rojas;
+  const tarjetas = lista.filter((f) => total(f) > 0)
+    .map((f) => ({ ...f, tarjetas: total(f), _k: [total(f), f.rojas + f.dobles] }))
+    .sort((a, b) => b.tarjetas - a.tarjetas || (b.rojas + b.dobles) - (a.rojas + a.dobles) || cmpNombre(a, b))
+    .slice(0, limite);
+  const mvps = lista.filter((f) => (f.mvps || 0) > 0)
+    .map((f) => ({ ...f, _k: [f.mvps, f.goles] }))
+    .sort((a, b) => b.mvps - a.mvps || b.goles - a.goles || cmpNombre(a, b))
+    .slice(0, limite);
+  const pj = (f) => (f.titular || 0) + (f.suplente || 0);
+  const masPartidos = lista.filter((f) => pj(f) > 0)
+    .map((f) => ({ ...f, _k: [pj(f), f.titular || 0] }))
+    .sort((a, b) => pj(b) - pj(a) || (b.titular || 0) - (a.titular || 0) || cmpNombre(a, b))
+    .slice(0, limite);
+  return { goleadores: conPos(goleadores), asistentes: conPos(asistentes), participacion: conPos(participacion), tarjetas: conPos(tarjetas), mvps: conPos(mvps), mas_partidos: conPos(masPartidos) };
+}
+
+// Lee de D1 todo lo necesario para agregar jugadores de una competición
+// (temporada en curso salvo todas=true) y devuelve el agregado + metadatos.
+async function statsCargarAgregado(env, { competicion, grupo, club, todas }) {
+  const desde = todas ? null : inicioTemporadaPartidazo(new Date());
+  let filtro = "r.competicion = ? AND r.finalizado_no_cubierto = 0 AND r.estado IN ('finalizado', 'en_juego')";
+  const binds = [competicion];
+  if (grupo) { filtro += " AND r.grupo = ?"; binds.push(grupo); }
+  const filtroSinClub = filtro + (desde ? " AND (r.fecha_partido >= ? OR r.fecha_partido IS NULL)" : "");
+  const bindsSinClub = binds.slice();
+  if (desde) bindsSinClub.push(desde);
+  if (club) { filtro += " AND (r.equipo_local = ? OR r.equipo_visitante = ?)"; binds.push(club, club); }
+  if (desde) { filtro += " AND (r.fecha_partido >= ? OR r.fecha_partido IS NULL)"; binds.push(desde); }
+
+  const { results: filasPartidos } = await env.DB.prepare(
+    `SELECT r.id, r.jornada, r.grupo, r.fecha_partido, r.equipo_local, r.equipo_visitante,
+            r.goles_local, r.goles_visitante, r.escudo_local_url, r.escudo_visitante_url,
+            r.mvp_jugador, r.mvp_equipo
+     FROM results r WHERE ${filtro}`
+  ).bind(...binds).all();
+  const { results: filasEventos } = await env.DB.prepare(
+    `SELECT e.resultado_id, e.tipo, e.equipo, e.jugador, e.jugador_asistencia, e.bajar_gol, e.minuto, e.minuto_extra,
+            r.equipo_local, r.equipo_visitante, r.escudo_local_url, r.escudo_visitante_url
+     FROM match_events e JOIN results r ON r.id = e.resultado_id
+     WHERE ${filtro}
+       AND e.tipo IN ('gol', 'gol_var', 'amarilla', 'doble_amarilla', 'roja')
+     ORDER BY e.resultado_id, e.minuto, e.orden`
+  ).bind(...binds).all();
+  const { results: alineaciones } = await env.DB.prepare(
+    `SELECT a.result_id, a.equipo, a.jugadores
+     FROM alineaciones a JOIN results r ON r.id = a.result_id
+     WHERE ${filtro}`
+  ).bind(...binds).all();
+
+  const partidos = new Map();
+  (filasPartidos || []).forEach((p) => { partidos.set(Number(p.id), p); });
+  const eventos = [];
+  (filasEventos || []).forEach((e) => {
+    const id = Number(e.resultado_id);
+    if (!partidos.has(id)) partidos.set(id, { equipo_local: e.equipo_local, equipo_visitante: e.equipo_visitante, escudo_local_url: e.escudo_local_url, escudo_visitante_url: e.escudo_visitante_url });
+    if (e.equipo !== "local" && e.equipo !== "visitante") return;
+    eventos.push({
+      resultado_id: id,
+      tipo: e.tipo,
+      lado: e.equipo,
+      club: e.equipo === "local" ? e.equipo_local : e.equipo_visitante,
+      escudo_url: e.equipo === "local" ? e.escudo_local_url : e.escudo_visitante_url,
+      jugador: e.jugador,
+      jugador_asistencia: e.jugador_asistencia,
+      bajar_gol: e.bajar_gol,
+      minuto: e.minuto,
+      minuto_extra: e.minuto_extra,
+    });
+  });
+  (alineaciones || []).forEach((a) => {
+    const id = Number(a.result_id);
+    if (!partidos.has(id)) partidos.set(id, {});
+  });
+  // Grupos de la competición en la temporada (para el desplegable), con
+  // independencia del grupo elegido en este momento.
+  let sqlGrupos = "SELECT DISTINCT r.grupo FROM results r WHERE r.competicion = ? AND r.grupo IS NOT NULL AND r.finalizado_no_cubierto = 0";
+  const bindsGrupos = [competicion];
+  if (desde) { sqlGrupos += " AND (r.fecha_partido >= ? OR r.fecha_partido IS NULL)"; bindsGrupos.push(desde); }
+  const { results: filasGrupos } = await env.DB.prepare(sqlGrupos).bind(...bindsGrupos).all();
+
+  // Clubes de la competición/grupo (para el desplegable), con independencia del club elegido.
+  const { results: filasClubes } = await env.DB.prepare(
+    `SELECT r.equipo_local AS club FROM results r WHERE ${filtroSinClub}
+     UNION SELECT r.equipo_visitante FROM results r WHERE ${filtroSinClub}`
+  ).bind(...bindsSinClub, ...bindsSinClub).all();
+  const agregadoCrudo = statsAgregarJugadores(eventos, alineaciones || [], partidos);
+  const correcciones = await statsLeerCorrecciones(env);
+  const agregado = statsAplicarCorrecciones(agregadoCrudo, correcciones);
+  return {
+    desde,
+    partidos,
+    eventos,
+    grupos: (filasGrupos || []).map((g) => g.grupo).filter(Boolean),
+    clubes: (filasClubes || []).map((c) => c.club).filter(Boolean).sort((a, b) => String(a).localeCompare(String(b), "es")),
+    agregado,
+    agregadoCrudo,
+    correcciones,
+  };
+}
+
+// ---------- Fuentes por competición con caché corta (buscador y sitemap, Fase 3) ----------
+// El buscador y el sitemap necesitan los jugadores de varias competiciones y
+// el buscador se llama con una consulta distinta cada vez (la caché de la
+// respuesta por URL apenas ayuda). Aquí se guarda 2 minutos el agregado ya
+// calculado de cada competición por isolate, así que escribir "rodri" y luego
+// "rodrigo" no vuelve a leer D1. Se vacía con cualquier escritura de la API
+// (ver handlePrimaryConCache), por lo que una fusión de jugadores en el panel
+// se nota al instante en ese isolate.
+const STATS_FUENTES_TTL_MS = 120000;
+const STATS_FUENTES_CACHE = new Map(); // "competicion|a" o "|t" -> { exp, valor }
+async function statsFuenteCompeticion(env, competicion, todas) {
+  const clave = competicion + "|" + (todas ? "t" : "a");
+  const ahora = Date.now();
+  const e = STATS_FUENTES_CACHE.get(clave);
+  if (e && e.exp > ahora) return e.valor;
+  const carga = await statsCargarAgregado(env, { competicion, grupo: null, club: null, todas: !!todas });
+  const valor = { competicion, agregado: carga.agregado, partidos: carga.partidos, clubes: carga.clubes };
+  if (STATS_FUENTES_CACHE.size >= 12) {
+    STATS_FUENTES_CACHE.forEach((v, k) => { if (v.exp <= ahora) STATS_FUENTES_CACHE.delete(k); });
+    if (STATS_FUENTES_CACHE.size >= 12) STATS_FUENTES_CACHE.clear();
+  }
+  STATS_FUENTES_CACHE.set(clave, { exp: ahora + STATS_FUENTES_TTL_MS, valor });
+  return valor;
+}
+
+// Ficha individual de un jugador: totales, puestos en los tops de su grupo,
+// goles por tramos de partido, detalle partido a partido y compañeros.
+function statsFichaJugador(ficha, carga) {
+  const NOMBRE_TIPO = { goles: "gol", asistencias: "asistencia", amarillas: "amarilla", dobles: "doble_amarilla", rojas: "roja" };
+  const porPartido = new Map();
+  ficha.apariciones.forEach((a) => {
+    if (!porPartido.has(a.r)) porPartido.set(a.r, { r: a.r, rol: null, goles: 0, asistencias: 0, amarillas: 0, dobles: 0, rojas: 0, eventos: [] });
+    const m = porPartido.get(a.r);
+    if (a.c === "titular" || a.c === "suplente") { m.rol = a.c; return; }
+    if (a.c === "mvps") { m.mvps = (m.mvps || 0) + a.d; return; }
+    m[a.c] += a.d;
+    const tipo = NOMBRE_TIPO[a.c];
+    if (a.d > 0) m.eventos.push({ tipo, minuto: a.m, extra: a.x });
+    else {
+      // Gol anulado por el VAR: quita el último evento del mismo tipo.
+      for (let i = m.eventos.length - 1; i >= 0; i--) { if (m.eventos[i].tipo === tipo) { m.eventos.splice(i, 1); break; } }
+    }
+  });
+
+  // Tramos de minuto en los que marca (gol anulado resta).
+  const tramos = [0, 0, 0, 0, 0, 0];
+  ficha.apariciones.forEach((a) => {
+    if (a.c !== "goles" || a.m === null || a.m === undefined) return;
+    const t = a.m <= 15 ? 0 : a.m <= 30 ? 1 : a.m <= 45 ? 2 : a.m <= 60 ? 3 : a.m <= 75 ? 4 : 5;
+    tramos[t] += a.d;
+  });
+  const etiquetasTramos = ["1-15", "16-30", "31-45", "46-60", "61-75", "76-90+"];
+
+  const partidos = [...porPartido.values()].map((m) => {
+    const p = carga.partidos.get(m.r) || {};
+    const local = p.equipo_local === ficha.club;
+    const rival = local ? p.equipo_visitante : p.equipo_local;
+    const gf = local ? p.goles_local : p.goles_visitante;
+    const gc = local ? p.goles_visitante : p.goles_local;
+    const tieneMarcador = gf !== null && gf !== undefined && gc !== null && gc !== undefined;
+    m.eventos.sort((x, y) => (x.minuto ?? 0) - (y.minuto ?? 0) || (x.extra ?? 0) - (y.extra ?? 0));
+    return {
+      resultado_id: m.r,
+      jornada: p.jornada ?? null,
+      fecha: p.fecha_partido || null,
+      local,
+      rival: rival || "",
+      escudo_rival: (local ? p.escudo_visitante_url : p.escudo_local_url) || null,
+      goles_favor: tieneMarcador ? gf : null,
+      goles_contra: tieneMarcador ? gc : null,
+      resultado: tieneMarcador ? (gf > gc ? "V" : gf < gc ? "D" : "E") : null,
+      rol: m.rol,
+      goles: Math.max(0, m.goles), asistencias: Math.max(0, m.asistencias),
+      amarillas: m.amarillas, dobles: m.dobles, rojas: m.rojas,
+      mvp: (m.mvps || 0) > 0,
+      eventos: m.eventos,
+    };
+  }).sort((a, b) => (a.jornada ?? 0) - (b.jornada ?? 0) || String(a.fecha || "").localeCompare(String(b.fecha || "")));
+
+  // Grupo del jugador (el más frecuente entre sus partidos) y su subconjunto de fichas.
+  const cuentaGrupos = new Map();
+  partidos.forEach((pt) => {
+    const g = (carga.partidos.get(pt.resultado_id) || {}).grupo;
+    if (g) cuentaGrupos.set(g, (cuentaGrupos.get(g) || 0) + 1);
+  });
+  const grupo = [...cuentaGrupos.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || null;
+  const todas = [...carga.agregado.jugadores.values()];
+  let universo = todas;
+  if (grupo) {
+    const clubesGrupo = new Set();
+    carga.partidos.forEach((p) => { if (p.grupo === grupo) { clubesGrupo.add(p.equipo_local); clubesGrupo.add(p.equipo_visitante); } });
+    universo = todas.filter((f) => clubesGrupo.has(f.club));
+  }
+  const rk = statsRankings(universo, 100000);
+  const puesto = (lista) => {
+    const x = lista.find((f) => f.slug === ficha.slug);
+    return x ? { pos: x.pos, de: lista.length } : null;
+  };
+  const posiciones = {
+    goleadores: puesto(rk.goleadores),
+    asistentes: puesto(rk.asistentes),
+    participacion: puesto(rk.participacion),
+    tarjetas: puesto(rk.tarjetas),
+    mvps: puesto(rk.mvps),
+    mas_partidos: puesto(rk.mas_partidos),
+  };
+
+  const companeros = todas
+    .filter((f) => f.club === ficha.club && f.slug !== ficha.slug && f.goles + f.asistencias > 0)
+    .sort((a, b) => (b.goles + b.asistencias) - (a.goles + a.asistencias) || b.goles - a.goles)
+    .slice(0, 6)
+    .map((f) => ({ jugador: f.jugador, slug: f.slug, dorsal: f.dorsal, goles: f.goles, asistencias: f.asistencias }));
+
+  return {
+    jugador: { nombre: ficha.jugador, slug: ficha.slug, club: ficha.club, escudo_url: ficha.escudo_url, dorsal: ficha.dorsal, sin_nombre: ficha.sin_nombre },
+    grupo,
+    desde_fecha: carga.desde,
+    totales: {
+      goles: ficha.goles, asistencias: ficha.asistencias, participacion: ficha.goles + ficha.asistencias,
+      amarillas: ficha.amarillas, dobles: ficha.dobles, rojas: ficha.rojas,
+      tarjetas: ficha.amarillas + ficha.dobles + ficha.rojas,
+      titular: ficha.titular, suplente: ficha.suplente, mvps: Math.max(0, ficha.mvps || 0),
+      partidos_registrados: partidos.length,
+    },
+    posiciones,
+    tramos_goles: etiquetasTramos.map((et, i) => ({ tramo: et, goles: Math.max(0, tramos[i]) })),
+    partidos,
+    companeros,
+  };
+}
+
+// ---------- Descubrimiento (Fase 3): buscador de jugadores y sitemap de fichas ----------
+const STATS_COMPETICIONES = ["hypermotion", "primera_federacion", "segunda_federacion"];
+const STATS_BUSCAR_MAX = 10;
+const STATS_BUSCAR_CLUBES_MAX = 5;
+
+// Busca jugadores (y clubes) por texto libre en una o varias competiciones.
+//   consulta: lo que escribe la persona ("rodrigo", "9 castellon", "r mart")
+//   fuentes:  [{ competicion, agregado: { jugadores: Map }, clubes: [nombre] }]
+// Reglas: se ignoran mayúsculas y tildes; cada palabra escrita tiene que
+// coincidir con el principio de una palabra del nombre (o del club); un número
+// solo vale como dorsal exacto y nunca basta por sí solo (el 9 lo llevan
+// todos los clubes). Las fichas que solo tienen dorsal («Dorsal 7») no se
+// ofrecen: no hay nombre que buscar. Orden: mejor coincidencia primero y, a
+// igualdad, quien más ha participado en goles.
+function statsBuscarJugadores(consulta, fuentes, limite) {
+  const vacio = { jugadores: [], clubes: [] };
+  const qNorm = statsNormalizarNombre(consulta);
+  if (qNorm.length < 2 || qNorm.length > 60) return vacio;
+  const tokens = statsTokens(qNorm);
+  const esNumero = (t) => /^\d+$/.test(t);
+  const textuales = tokens.filter((t) => !esNumero(t));
+  if (!textuales.length) return vacio;
+  const max = Number.isInteger(limite) && limite > 0 ? Math.min(limite, STATS_BUSCAR_MAX) : STATS_BUSCAR_MAX;
+
+  const encontrados = [];
+  const vistos = new Set();
+  (fuentes || []).forEach((src) => {
+    if (!src || !src.agregado || !src.agregado.jugadores) return;
+    src.agregado.jugadores.forEach((f) => {
+      if (!f || f.sin_nombre || !f.slug || !f.jugador) return;
+      const nombre = statsNormalizarNombre(f.jugador);
+      const palabras = statsTokens(nombre);
+      const palabrasClub = statsTokens(statsNormalizarNombre(f.club));
+      let puntos = 0;
+      for (const t of tokens) {
+        if (esNumero(t)) {
+          if (f.dorsal !== null && f.dorsal !== undefined && Number(f.dorsal) === Number(t)) puntos += 2;
+          else return;
+        } else if (palabras.includes(t)) puntos += 4;
+        else if (palabras.some((p) => p.startsWith(t))) puntos += 3;
+        else if (t.length >= 3 && nombre.includes(t)) puntos += 1;
+        else if (palabrasClub.some((p) => p.startsWith(t))) puntos += 1;
+        else return;
+      }
+      if (nombre === qNorm) puntos += 10;
+      else if (nombre.startsWith(qNorm)) puntos += 5;
+      const clave = src.competicion + "|" + f.slug;
+      if (vistos.has(clave)) return;
+      vistos.add(clave);
+      encontrados.push({
+        puntos,
+        jugador: f.jugador, slug: f.slug, club: f.club, escudo_url: f.escudo_url || null,
+        dorsal: f.dorsal === undefined ? null : f.dorsal, competicion: src.competicion,
+        goles: f.goles || 0, asistencias: f.asistencias || 0, partidos: (f.titular || 0) + (f.suplente || 0),
+      });
+    });
+  });
+  encontrados.sort((a, b) => b.puntos - a.puntos
+    || (b.goles + b.asistencias) - (a.goles + a.asistencias)
+    || b.partidos - a.partidos
+    || String(a.jugador).localeCompare(String(b.jugador), "es"));
+
+  // Clubes: solo si la consulta es puro texto (con un número se busca a un jugador).
+  const clubes = [];
+  if (textuales.length === tokens.length) {
+    const vistosClub = new Set();
+    (fuentes || []).forEach((src) => {
+      ((src && src.clubes) || []).forEach((club) => {
+        const norm = statsNormalizarNombre(club);
+        const palabras = statsTokens(norm);
+        if (!palabras.length) return;
+        if (!textuales.every((t) => palabras.some((p) => p.startsWith(t)) || (t.length >= 3 && norm.includes(t)))) return;
+        const clave = src.competicion + "|" + club;
+        if (vistosClub.has(clave)) return;
+        vistosClub.add(clave);
+        clubes.push({ club, competicion: src.competicion, _o: norm === qNorm ? 0 : norm.startsWith(qNorm) ? 1 : 2 });
+      });
+    });
+    clubes.sort((a, b) => a._o - b._o || String(a.club).localeCompare(String(b.club), "es"));
+  }
+  return {
+    jugadores: encontrados.slice(0, max).map(({ puntos, ...resto }) => resto),
+    clubes: clubes.slice(0, STATS_BUSCAR_CLUBES_MAX).map(({ _o, ...resto }) => resto),
+  };
+}
+
+// Entradas del sitemap de fichas: una por jugador con nombre y una por club
+// con algún jugador (su plantilla). "lastmod" es la fecha del último partido
+// registrado del jugador o del club (YYYY-MM-DD), o null si no hay fecha.
+// Si hubiera más de "max" URLs, se quedan las plantillas y los jugadores con
+// más peso (goles, asistencias, MVP, partidos). Los jugadores ocultos por un
+// admin no están: ya no existen en el agregado corregido.
+function statsEntradasSitemapJugadores(fuentes, max) {
+  const limite = Math.max(0, Math.min(Number.isInteger(max) ? max : 40000, 45000));
+  const fechaDe = (p) => {
+    const m = p && p.fecha_partido ? String(p.fecha_partido).match(/^\d{4}-\d{2}-\d{2}/) : null;
+    return m ? m[0] : null;
+  };
+  const plantillas = [];
+  const jugadores = [];
+  (fuentes || []).forEach((src) => {
+    if (!src || !src.agregado || !src.agregado.jugadores) return;
+    const comp = encodeURIComponent(src.competicion);
+    const partidos = src.partidos || new Map();
+    const ultimaClub = new Map();
+    partidos.forEach((p) => {
+      const f = fechaDe(p);
+      if (!f) return;
+      [p.equipo_local, p.equipo_visitante].forEach((club) => {
+        if (club && (!ultimaClub.get(club) || f > ultimaClub.get(club))) ultimaClub.set(club, f);
+      });
+    });
+    const clubesConJugadores = new Set();
+    src.agregado.jugadores.forEach((f) => {
+      if (!f || f.sin_nombre || !f.slug) return;
+      if (f.club) clubesConJugadores.add(f.club);
+      let ultima = null;
+      (f.apariciones || []).forEach((a) => {
+        const d = fechaDe(partidos.get(a.r));
+        if (d && (!ultima || d > ultima)) ultima = d;
+      });
+      jugadores.push({
+        ruta: `/jugador?c=${comp}&j=${encodeURIComponent(f.slug)}`,
+        lastmod: ultima,
+        peso: (f.goles || 0) * 3 + (f.asistencias || 0) * 2 + (f.mvps || 0) * 2 + (f.titular || 0) + (f.suplente || 0),
+      });
+    });
+    (src.clubes || []).forEach((club) => {
+      if (!clubesConJugadores.has(club)) return;
+      plantillas.push({ ruta: `/plantilla?c=${comp}&club=${encodeURIComponent(club)}`, lastmod: ultimaClub.get(club) || null });
+    });
+  });
+  plantillas.sort((a, b) => a.ruta.localeCompare(b.ruta));
+  jugadores.sort((a, b) => b.peso - a.peso || a.ruta.localeCompare(b.ruta));
+  return plantillas.concat(jugadores).slice(0, limite).map(({ ruta, lastmod }) => ({ ruta, lastmod }));
+}
+
 // ---------- Cache corta de GET publicos (por isolate) ----------
 // Los listados y fichas publicas (portada, categorias, noticia...) se piden
 // muchisimo mas de lo que cambian y cada peticion leia D1 entera. Aqui se
@@ -12192,6 +13407,10 @@ const CACHE_PUBLICA_TTL_MS = {
   "/api/articles": 15000,
   "/api/articles/banner-urgente": 10000,
   "/api/articles/ranking": 120000,
+  "/api/stats/jugadores": 120000,
+  "/api/stats/jugador": 120000,
+  "/api/stats/club": 120000,
+  "/api/stats/buscar": 60000,
   "/api/noticias-rapidas": 15000,
   "/api/polls/portada": 15000,
   "/api/settings": 60000,
@@ -12200,6 +13419,8 @@ const CACHE_PUBLICA_TTL_MS = {
   "/api/custom-clubs": 60000,
 };
 const CACHE_PUBLICA = new Map(); // clave -> { exp, texto }
+// Máximo de caracteres de "contenido" que devuelven los listados públicos de /api/articles.
+const LISTADO_CONTENIDO_MAX = 1500;
 
 // Capa 2: caché de BORDE (Cache API de Cloudflare), compartida por todos los
 // isolates de un mismo centro de datos. La capa 1 (el Map de arriba) vive en
@@ -12269,6 +13490,7 @@ async function handlePrimaryConCache(request, env, ctx) {
   if (!ttl) {
     if (request.method !== "GET" && request.method !== "HEAD" && url.pathname.startsWith("/api/") && !escrituraSinEfectoPublico(url.pathname)) {
       CACHE_PUBLICA.clear();
+      STATS_FUENTES_CACHE.clear(); // los buscadores/sitemap ven al instante una fusión de jugadores
     }
     return handlePrimary(request, env, ctx);
   }
@@ -14337,6 +15559,35 @@ async function handlePrimary(request, env, ctx) {
         return json({ ok: true, registrado: true });
       }
 
+      // ---------- FICHA TÉCNICA DE LA ÚLTIMA CRÓNICA DE UN PARTIDO ----------
+      // Cuando otro redactor escribe su crónica del mismo partido, el panel le precarga
+      // la ficha técnica de la ÚLTIMA crónica con ficha (publicada y con el id más alto),
+      // que es la que acaba mostrándose al fusionar (la última sustituye a las anteriores).
+      // Devuelve { ficha_tecnica, articulo } o
+      // { ficha_tecnica: null }. Solo lectura; exige sesión como el resto del panel.
+      if (path === "/api/ficha-partido" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const resultadoId = parseInt(url.searchParams.get("resultado_id"), 10);
+        if (!Number.isInteger(resultadoId) || resultadoId <= 0) return json({ ficha_tecnica: null });
+        const excluir = parseInt(url.searchParams.get("excluir"), 10);
+        const { results: candidatas } = await env.DB.prepare(
+          `SELECT a.id, a.titulo, a.ficha_tecnica, u.nombre AS autor_nombre
+           FROM articles a LEFT JOIN users u ON u.id = a.autor_id
+           WHERE a.resultado_id = ? AND a.tipo = 'cronica' AND a.id != ?
+             AND a.ficha_tecnica IS NOT NULL AND a.ficha_tecnica != ''
+           ORDER BY a.publicado DESC, a.id DESC LIMIT 10`
+        ).bind(resultadoId, Number.isInteger(excluir) ? excluir : 0).all();
+        for (const c of candidatas || []) {
+          let ficha = null;
+          try { ficha = typeof c.ficha_tecnica === "string" ? JSON.parse(c.ficha_tecnica) : c.ficha_tecnica; } catch { ficha = null; }
+          if (ficha && typeof ficha === "object" && !Array.isArray(ficha) && Object.keys(ficha).length) {
+            return json({ ficha_tecnica: ficha, articulo: { id: c.id, titulo: c.titulo, autor_nombre: c.autor_nombre || null } });
+          }
+        }
+        return json({ ficha_tecnica: null });
+      }
+
       // ---------- CALENDARIO DE CONTENIDO (Funcionalidades > Información > Horario) ----------
       // Lo puede consultar cualquier usuario con sesión; solo un admin lo modifica.
       if (path === "/api/calendario-contenido" && method === "GET") {
@@ -14704,6 +15955,28 @@ async function handlePrimary(request, env, ctx) {
         if (payload.rol !== "admin") return json({ error: "Solo un administrador puede gestionar las acreditaciones" }, 403);
         const id = Number(path.split("/").pop());
         const body = await request.json().catch(() => ({}));
+        // Solo indicaciones: envía el correo SIN tocar estado, nota ni revisión.
+        if (body.solo_indicaciones === true) {
+          const exIn = await env.DB.prepare("SELECT id, nombre, email, equipo, tipo_evento, tipo_acreditacion, jornada_partido, estado FROM acreditaciones WHERE id = ?").bind(id).first();
+          if (!exIn) return json({ error: "Solicitud no encontrada" }, 404);
+          const limpiarI = (v) => (typeof v === "string" ? v.replace(/\r/g, "").trim().slice(0, 800) : "");
+          const recogidaI = limpiarI(body.recogida), mensajeI = limpiarI(body.mensaje);
+          if (!recogidaI && !mensajeI) return json({ error: "Escribe alguna indicación (dónde recogerla o un mensaje)" }, 400);
+          if (!exIn.email) return json({ error: "La solicitud no tiene correo" }, 400);
+          let correoI = "no_enviado";
+          try {
+            correoI = (await enviarCorreoIndicacionesAcreditacion(env, exIn, { recogida: recogidaI, mensaje: mensajeI })) ? "enviado" : "no_enviado";
+          } catch (err) {
+            console.error("[acreditaciones/correo-indicaciones]", err);
+          }
+          await registrarActividad(env, request, payload, {
+            accion: "acreditacion_indicaciones",
+            entidad: "acreditacion",
+            entidad_id: id,
+            descripcion: `Indicaciones enviadas a ${exIn.nombre} (estado sin cambios: ${exIn.estado})`,
+          });
+          return json({ ok: true, correo: correoI, estado: exIn.estado });
+        }
         const editaDatos = !!(body.datos && typeof body.datos === "object");
         const estado = String(body.estado || "");
         if (!(editaDatos && !estado) && !["pendiente", "aprobada", "rechazada"].includes(estado)) {
@@ -14850,12 +16123,114 @@ async function handlePrimary(request, env, ctx) {
           const f = await env.DB.prepare("SELECT id, titulo FROM formularios WHERE id = ?").bind(id).first();
           if (!f) return json({ error: "Formulario no encontrado" }, 404);
           await env.DB.prepare("DELETE FROM formularios_respuestas WHERE formulario_id = ?").bind(id).run();
+          try { await env.DB.prepare("DELETE FROM formularios_invitados WHERE formulario_id = ?").bind(id).run(); }
+          catch (err) { console.error("[formularios/invitados]", err); }
           await env.DB.prepare("DELETE FROM formularios WHERE id = ?").bind(id).run();
           await registrarActividad(env, request, payload, {
             accion: "formulario_eliminado", entidad: "formulario", entidad_id: id,
             descripcion: `Eliminado el formulario "${f.titulo}" y sus respuestas`,
           });
           return json({ ok: true });
+        }
+
+        // ----- Invitaciones: personas añadidas al formulario sin editarlo (caducan a los 7 días por defecto) -----
+        if (path.match(/^\/api\/formularios\/\d+\/invitados$/) && (method === "GET" || method === "POST")) {
+          const id = Number(path.split("/")[3]);
+          const f = await env.DB.prepare("SELECT id, slug, titulo, campos FROM formularios WHERE id = ?").bind(id).first();
+          if (!f) return json({ error: "Formulario no encontrado" }, 404);
+          const campos = camposConAltaPorDefecto(f.slug, parsearCamposFormulario(f.campos));
+          if (method === "GET") {
+            try {
+              return json({ invitados: await listarInvitadosFormulario(env, f, campos), dias_defecto: FORMULARIO_INVITACION_DIAS_DEFECTO });
+            } catch (err) {
+              console.error("[formularios/invitados]", err);
+              return json({ error: "No se pudieron cargar las invitaciones (¿falta aplicar migracion_formularios_invitados.sql?)" }, 500);
+            }
+          }
+          const body = await request.json().catch(() => ({}));
+          const campo = campos.find((c) => c.id === String(body.campo_id || "") && campoAdmiteInvitaciones(c));
+          if (!campo) return json({ error: "Ese campo del formulario no admite invitaciones" }, 400);
+          const cd = normalizarDiasInvitacionFormulario(body.dias);
+          if (cd.error) return json({ error: cd.error }, 400);
+          const crudas = Array.isArray(body.personas) ? body.personas : String(body.personas || "").split("\n");
+          const personas = [];
+          const vistas = new Set();
+          for (const p of crudas) {
+            const t = formularioLimpiarTexto(p, 300);
+            const k = normalizarOpcionUnica(t);
+            if (t && !vistas.has(k)) { vistas.add(k); personas.push(t); }
+          }
+          if (!personas.length) return json({ error: "Escribe al menos un nombre" }, 400);
+          if (personas.length > FORMULARIO_INVITACION_MAX_POR_VEZ) return json({ error: `Como máximo ${FORMULARIO_INVITACION_MAX_POR_VEZ} personas de una vez` }, 400);
+          try {
+            const omitidas = [];
+            const validas = [];
+            for (const p of personas) {
+              // En los campos que crean usuario, una entrada sin nombre (p. ej. solo un teléfono entre paréntesis) se detecta ya, no cuando la persona responda.
+              if (campo.alta_usuario && !datosUsuarioDesdeOpcionFormulario(p).nombre) { omitidas.push({ opcion: p, motivo: "Falta el nombre" }); continue; }
+              validas.push(p);
+            }
+            const existentes = await listarInvitadosFormulario(env, f, campos);
+            const yaResponden = validas.length
+              ? ((await opcionesUsadasFormulario(env, f, [{ ...campo, unica: true, opciones: validas }])).get(campo.id) || new Set())
+              : new Set();
+            const expira = expiraInvitacionFormulario(cd.dias);
+            const ahora = ahoraSqlFormulario();
+            let anadidas = 0, renovadas = 0;
+            for (const p of validas) {
+              const k = normalizarOpcionUnica(p);
+              if (yaResponden.has(k)) { omitidas.push({ opcion: p, motivo: "Ya ha respondido este formulario" }); continue; }
+              if ((campo.opciones || []).some((o) => normalizarOpcionUnica(o) === k)) { omitidas.push({ opcion: p, motivo: "Ya está en la lista fija del formulario" }); continue; }
+              const ex = existentes.find((i) => i.campo_id === campo.id && normalizarOpcionUnica(i.opcion) === k);
+              if (ex && ex.estado === "activa") { omitidas.push({ opcion: p, motivo: "Ya está invitada" }); continue; }
+              if (ex) {
+                await env.DB.prepare("UPDATE formularios_invitados SET expira_at = ?, updated_at = ? WHERE id = ?").bind(expira, ahora, ex.id).run();
+                renovadas++;
+              } else {
+                await env.DB.prepare(
+                  "INSERT INTO formularios_invitados (formulario_id, campo_id, opcion, opcion_norm, expira_at, creado_por, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                ).bind(f.id, campo.id, p, k, expira, payload.nombre || null, ahora, ahora).run();
+                anadidas++;
+              }
+            }
+            if (anadidas || renovadas) {
+              await registrarActividad(env, request, payload, {
+                accion: "formulario_invitados_anadidos", entidad: "formulario", entidad_id: f.id,
+                descripcion: `Invitadas ${anadidas + renovadas} persona${anadidas + renovadas === 1 ? "" : "s"} al formulario "${f.titulo}"${expira ? ` (caducan el ${expira.slice(0, 10)})` : " (sin caducidad)"}`,
+              });
+            }
+            return json({ ok: true, anadidas, renovadas, omitidas, expira_at: expira });
+          } catch (err) {
+            console.error("[formularios/invitados]", err);
+            return json({ error: "No se pudieron guardar las invitaciones" }, 500);
+          }
+        }
+
+        if (path.match(/^\/api\/formularios\/invitados\/\d+$/) && (method === "PATCH" || method === "DELETE")) {
+          const id = idDe(path);
+          const inv = await env.DB.prepare(
+            "SELECT i.id, i.formulario_id, i.opcion, f.titulo FROM formularios_invitados i LEFT JOIN formularios f ON f.id = i.formulario_id WHERE i.id = ?"
+          ).bind(id).first();
+          if (!inv) return json({ error: "Invitación no encontrada" }, 404);
+          if (method === "DELETE") {
+            await env.DB.prepare("DELETE FROM formularios_invitados WHERE id = ?").bind(id).run();
+            await registrarActividad(env, request, payload, {
+              accion: "formulario_invitado_quitado", entidad: "formulario", entidad_id: inv.formulario_id,
+              descripcion: `Quitada la invitación de "${inv.opcion}" en el formulario "${inv.titulo || ""}"`,
+            });
+            return json({ ok: true });
+          }
+          // PATCH = renovar: vuelve a contar desde ahora (7 días por defecto; 0 = sin caducidad).
+          const body = await request.json().catch(() => ({}));
+          const cd = normalizarDiasInvitacionFormulario(body.dias);
+          if (cd.error) return json({ error: cd.error }, 400);
+          const expira = expiraInvitacionFormulario(cd.dias);
+          await env.DB.prepare("UPDATE formularios_invitados SET expira_at = ?, updated_at = ? WHERE id = ?").bind(expira, ahoraSqlFormulario(), id).run();
+          await registrarActividad(env, request, payload, {
+            accion: "formulario_invitado_renovado", entidad: "formulario", entidad_id: inv.formulario_id,
+            descripcion: `Renovada la invitación de "${inv.opcion}" en el formulario "${inv.titulo || ""}"${expira ? ` (hasta el ${expira.slice(0, 10)})` : " (sin caducidad)"}`,
+          });
+          return json({ ok: true, expira_at: expira });
         }
 
         if (path.match(/^\/api\/formularios\/\d+\/respuestas$/) && method === "GET") {
@@ -15211,18 +16586,16 @@ async function handlePrimary(request, env, ctx) {
         const hash = await hashPassword(passwordInicial, salt);
         const rol = normalizarRolColaborador(body.rol);
 
-        // Categoría(s) fija(s) (redactor "sin equipo, con categoría
-        // fija", p. ej. Arbitraje): si se asigna alguna, este redactor
-        // no tiene equipo, así que se ignora cualquier "equipo" recibido
-        // en ese caso.
+        // Categoría(s) complementaria(s) (p. ej. Arbitraje): se suman a los
+        // equipos del redactor, no los sustituyen ni limitan sus categorías.
         const { error: errorCategoriasFijas, categoriasFijas } = validarCategoriasFijas(body.categorias_fijas);
         if (errorCategoriasFijas) return json({ error: errorCategoriasFijas }, 400);
 
         // El equipo es opcional, pero si se manda alguno hay que elegir
-        // hasta 3 (ver validarEquipos). No aplica si tiene categoría(s) fija(s).
+        // hasta 3 (ver validarEquipos).
         const { error: errorEquipo, equipos: equiposNuevos } = validarEquipos(body.equipo);
         if (errorEquipo) return json({ error: errorEquipo }, 400);
-        const equipoNuevo = (!categoriasFijas.length && equiposNuevos.length) ? JSON.stringify(equiposNuevos) : null;
+        const equipoNuevo = equiposNuevos.length ? JSON.stringify(equiposNuevos) : null;
         const categoriasFijasNuevo = categoriasFijas.length ? JSON.stringify(categoriasFijas) : null;
 
         await env.DB.prepare(
@@ -15385,9 +16758,9 @@ async function handlePrimary(request, env, ctx) {
           return json({ error: "No puedes desactivar tu propia cuenta" }, 400);
         }
 
-        // Categoría(s) fija(s): solo las puede cambiar un admin (misma
-        // ruta). Si no se manda "categorias_fijas" en el body, se deja
-        // la lista que ya tuviera.
+        // Categoría(s) complementaria(s): solo las puede cambiar un admin
+        // (misma ruta). Si no se manda "categorias_fijas" en el body, se
+        // deja la lista que ya tuviera.
         let categoriasFijasActualizadas = parsearCategoriasFijas(user.categorias_fijas);
         if (body.categorias_fijas !== undefined) {
           const { error: errorCategoriasFijas, categoriasFijas } = validarCategoriasFijas(body.categorias_fijas);
@@ -15399,10 +16772,10 @@ async function handlePrimary(request, env, ctx) {
         // El equipo solo lo puede cambiar un admin (esta ruta ya exige
         // rol admin arriba). Si no se manda "equipo" en el body, se deja
         // el que ya tuviera; si se manda, se valida que no pase de 3. Un
-        // redactor con categoría(s) fija(s) no tiene equipo: si se le
-        // asigna alguna (aquí o ya la tuviera), el equipo se vacía.
-        let equipoActualizado = categoriasFijasActualizadas.length ? null : user.equipo;
-        if (!categoriasFijasActualizadas.length && body.equipo !== undefined) {
+        // redactor puede tener equipo(s) y, además, categoría(s)
+        // complementaria(s): ya no se vacía el equipo al asignarlas.
+        let equipoActualizado = user.equipo;
+        if (body.equipo !== undefined) {
           const { error: errorEquipo, equipos: equiposNuevos } = validarEquipos(body.equipo);
           if (errorEquipo) return json({ error: errorEquipo }, 400);
           equipoActualizado = equiposNuevos.length ? JSON.stringify(equiposNuevos) : null;
@@ -15537,6 +16910,9 @@ async function handlePrimary(request, env, ctx) {
           const nombreEnlace = (form.get("enlaceNombre") || "").toString().trim().slice(0, 200) || nombreServicioEnlace(enlace);
           const esFotoEnlace = (form.get("enlaceTipo") || "").toString() === "foto";
           const tamanoEnlace = Math.max(1, Math.round(Number(form.get("enlaceTamano")) || 0));
+          // Carpeta (el enlace externo siempre es privado, así que siempre aplica).
+          const carpetaEnlace = await resolverCarpetaMediaDeSubida(env, form.get("carpeta_id"), true);
+          if (carpetaEnlace.error) return json({ error: carpetaEnlace.error }, carpetaEnlace.status);
           let duplicadoEnlace = null;
           try {
             duplicadoEnlace = await env.DB.prepare("SELECT id, titulo, autor_nombre FROM media WHERE cloudinary_url = ?").bind(enlace).first();
@@ -15550,8 +16926,9 @@ async function handlePrimary(request, env, ctx) {
               mediaId: duplicadoEnlace.id,
             }, 409);
           }
+          let insertadoEnlace = null;
           try {
-            await env.DB.prepare(
+            insertadoEnlace = await env.DB.prepare(
               `INSERT INTO media (cloudinary_public_id, cloudinary_resource_type, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, visibilidad)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'privado')`
             ).bind(
@@ -15562,6 +16939,7 @@ async function handlePrimary(request, env, ctx) {
           } catch (err) {
             return json({ error: "No se pudo guardar el enlace. Inténtalo de nuevo (si persiste, falta ejecutar migracion_media_visibilidad.sql).", detail: err.message }, 500);
           }
+          await asignarCarpetaMedia(env, insertadoEnlace?.meta?.last_row_id, carpetaEnlace.id);
           if (!avisoEnLoteEnlace) {
             ctx.waitUntil(enviarEmailNotificacion(env, {
               asunto: `Nuevo enlace de contenido pesado: ${tituloEnlace}`,
@@ -15631,6 +17009,11 @@ async function handlePrimary(request, env, ctx) {
         if (titulo.length > 200) return json({ error: "El título es demasiado largo (máximo 200 caracteres)" }, 400);
         if (descripcion.length > 2000) return json({ error: "La descripción es demasiado larga (máximo 2000 caracteres)" }, 400);
         if (file.size === 0) return json({ error: "El archivo está vacío" }, 400);
+
+        // Carpeta: solo cuenta en contenido privado (en público se ignora).
+        // Se valida ANTES de subir a Cloudinary, como el partido.
+        const carpetaSubida = await resolverCarpetaMediaDeSubida(env, form.get("carpeta_id"), visibilidad === "privado");
+        if (carpetaSubida.error) return json({ error: carpetaSubida.error }, carpetaSubida.status);
 
         // Si se ha pedido vincular a un partido, se comprueba que existe
         // ANTES de subir nada a Cloudinary: así, si el id es inválido, se
@@ -15817,6 +17200,9 @@ async function handlePrimary(request, env, ctx) {
           }
         }
 
+        // Carpeta elegida (solo contenido privado): paso extra, sin tirar abajo la subida.
+        await asignarCarpetaMedia(env, mediaInsertado?.meta?.last_row_id, carpetaSubida.id);
+
         // Vinculación automática a la galería del partido elegido: se
         // intenta como un paso "extra" que no debe tirar abajo la subida
         // si algo falla (el archivo y su fila en "media" ya están
@@ -15963,6 +17349,176 @@ async function handlePrimary(request, env, ctx) {
 
       const mediaMatch = path.match(/^\/api\/media\/(\d+)$/);
 
+      // ---------- MEDIA: carpetas del contenido privado ----------
+      // GET: lista de carpetas (compartidas por todo el equipo). El contador
+      // sigue el mismo criterio que el listado de media: un admin cuenta todo
+      // lo que hay en la carpeta; el resto, solo lo que ha subido él.
+      if (path === "/api/media/carpetas" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        try {
+          const resultado = payload.rol === "admin"
+            ? await env.DB.prepare(
+                "SELECT c.id, c.nombre, c.created_at, (SELECT COUNT(*) FROM media m WHERE m.carpeta_id = c.id) AS total FROM media_carpetas c ORDER BY LOWER(c.nombre)"
+              ).all()
+            : await env.DB.prepare(
+                "SELECT c.id, c.nombre, c.created_at, (SELECT COUNT(*) FROM media m WHERE m.carpeta_id = c.id AND m.autor_id = ?) AS total FROM media_carpetas c ORDER BY LOWER(c.nombre)"
+              ).bind(payload.uid).all();
+          return json({ carpetas: resultado.results });
+        } catch (err) {
+          // Migración sin ejecutar: lista vacía para que "Subir contenido"
+          // siga funcionando como antes (sin carpetas).
+          if (/no such table|does not exist/i.test(err.message || "")) {
+            return json({ carpetas: [], migracion_pendiente: true });
+          }
+          return json({ error: "No se pudieron cargar las carpetas", detail: err.message }, 500);
+        }
+      }
+
+      // POST: crear carpeta. Si ya existe una con el mismo nombre (sin
+      // distinguir mayúsculas) se devuelve esa en vez de dar error.
+      if (path === "/api/media/carpetas" && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        let body;
+        try { body = await request.json(); } catch { return json({ error: "Petición no válida" }, 400); }
+        const nombre = normalizarNombreCarpetaMedia(body && body.nombre);
+        if (!nombre) return json({ error: "Escribe un nombre para la carpeta" }, 400);
+        if (nombre.length > CARPETA_MEDIA_NOMBRE_MAX) {
+          return json({ error: `El nombre de la carpeta es demasiado largo (máximo ${CARPETA_MEDIA_NOMBRE_MAX} caracteres)` }, 400);
+        }
+        try {
+          let carpeta = await buscarCarpetaMediaPorNombre(env, nombre);
+          if (carpeta) return json({ carpeta: { ...carpeta, total: 0 }, existente: true });
+          try {
+            await env.DB.prepare("INSERT INTO media_carpetas (nombre, creada_por_id) VALUES (?, ?)").bind(nombre, payload.uid).run();
+          } catch (err) {
+            // Dos personas crean la misma carpeta a la vez: gana la primera.
+            if (!/unique/i.test(err.message || "")) throw err;
+          }
+          carpeta = await buscarCarpetaMediaPorNombre(env, nombre);
+          if (!carpeta) return json({ error: "No se pudo crear la carpeta. Inténtalo de nuevo." }, 500);
+          ctx.waitUntil(registrarActividad(env, request, payload, {
+            accion: "crear_carpeta_media", entidad: "media_carpeta", entidad_id: String(carpeta.id),
+            descripcion: `Ha creado la carpeta de contenido: "${nombre}"`,
+          }));
+          return json({ carpeta: { ...carpeta, total: 0 }, existente: false }, 201);
+        } catch (err) {
+          if (/no such table|does not exist/i.test(err.message || "")) {
+            // 409 y no 5xx: ver resolverCarpetaMediaDeSubida (evita un failover falso).
+            return json({ error: "Las carpetas no están activadas todavía (falta ejecutar migracion_media_carpetas.sql)." }, 409);
+          }
+          return json({ error: "No se pudo crear la carpeta", detail: err.message }, 500);
+        }
+      }
+
+      // ---------- MEDIA: renombrar / eliminar carpeta (solo admins) ----------
+      // Eliminar una carpeta NUNCA borra archivos: primero se desvinculan
+      // (carpeta_id = NULL, "Sin carpeta") y después se borra la carpeta. Se
+      // hace explícito y no solo con ON DELETE SET NULL para no depender de
+      // que las claves foráneas estén activas en cada base de datos.
+      const carpetaMediaMatch = path.match(/^\/api\/media\/carpetas\/(\d+)$/);
+      if (carpetaMediaMatch && (method === "PUT" || method === "DELETE")) {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") {
+          return json({ error: "Solo un administrador puede renombrar o eliminar carpetas" }, 403);
+        }
+        const carpetaId = parseInt(carpetaMediaMatch[1]);
+        try {
+          const actual = await env.DB.prepare("SELECT id, nombre FROM media_carpetas WHERE id = ?").bind(carpetaId).first();
+          if (!actual) return json({ error: "La carpeta ya no existe" }, 404);
+
+          if (method === "PUT") {
+            let body;
+            try { body = await request.json(); } catch { return json({ error: "Petición no válida" }, 400); }
+            const nombre = normalizarNombreCarpetaMedia(body && body.nombre);
+            if (!nombre) return json({ error: "Escribe un nombre para la carpeta" }, 400);
+            if (nombre.length > CARPETA_MEDIA_NOMBRE_MAX) {
+              return json({ error: `El nombre de la carpeta es demasiado largo (máximo ${CARPETA_MEDIA_NOMBRE_MAX} caracteres)` }, 400);
+            }
+            const otra = await buscarCarpetaMediaPorNombre(env, nombre);
+            if (otra && otra.id !== carpetaId) {
+              return json({ error: "Ya existe otra carpeta con ese nombre" }, 409);
+            }
+            if (actual.nombre !== nombre) {
+              try {
+                await env.DB.prepare("UPDATE media_carpetas SET nombre = ? WHERE id = ?").bind(nombre, carpetaId).run();
+              } catch (err) {
+                if (/unique/i.test(err.message || "")) return json({ error: "Ya existe otra carpeta con ese nombre" }, 409);
+                throw err;
+              }
+              ctx.waitUntil(registrarActividad(env, request, payload, {
+                accion: "renombrar_carpeta_media", entidad: "media_carpeta", entidad_id: String(carpetaId),
+                descripcion: `Ha renombrado la carpeta de contenido "${actual.nombre}" a "${nombre}"`,
+              }));
+            }
+            return json({ ok: true, carpeta: { id: carpetaId, nombre } });
+          }
+
+          const contados = await env.DB.prepare("SELECT COUNT(*) AS n FROM media WHERE carpeta_id = ?").bind(carpetaId).first();
+          const liberados = Number(contados && contados.n) || 0;
+          await env.DB.prepare("UPDATE media SET carpeta_id = NULL WHERE carpeta_id = ?").bind(carpetaId).run();
+          await env.DB.prepare("DELETE FROM media_carpetas WHERE id = ?").bind(carpetaId).run();
+          ctx.waitUntil(registrarActividad(env, request, payload, {
+            accion: "eliminar_carpeta_media", entidad: "media_carpeta", entidad_id: String(carpetaId),
+            descripcion: `Ha eliminado la carpeta de contenido "${actual.nombre}" (${liberados} archivo(s) pasan a "Sin carpeta")`,
+          }));
+          return json({ ok: true, archivos_liberados: liberados });
+        } catch (err) {
+          if (/no such table|does not exist/i.test(err.message || "")) {
+            return json({ error: "Las carpetas no están activadas todavía (falta ejecutar migracion_media_carpetas.sql)." }, 409);
+          }
+          return json({ error: "No se pudo completar la operación con la carpeta", detail: err.message }, 500);
+        }
+      }
+
+      // ---------- MEDIA: mover varios archivos a una carpeta ----------
+      // Un admin mueve cualquier archivo; el resto, solo los suyos. Solo se
+      // mueve contenido PRIVADO (el público nunca tiene carpeta): lo demás se
+      // omite y se cuenta en "omitidos". carpeta_id vacío = "Sin carpeta".
+      if (path === "/api/media/mover" && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        let body;
+        try { body = await request.json(); } catch { return json({ error: "Petición no válida" }, 400); }
+        const ids = [...new Set((Array.isArray(body && body.ids) ? body.ids : []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+        if (!ids.length) return json({ error: "No has elegido ningún archivo" }, 400);
+        if (ids.length > 200) return json({ error: "Demasiados archivos a la vez (máximo 200)" }, 400);
+        const destinoRaw = body.carpeta_id === undefined || body.carpeta_id === null ? "" : String(body.carpeta_id).trim();
+        let destino = null;
+        if (destinoRaw) {
+          const r = await resolverCarpetaMediaDeSubida(env, destinoRaw, true);
+          if (r.error) return json({ error: r.error }, r.status);
+          destino = r.id;
+        }
+        try {
+          let movidos = 0;
+          for (let i = 0; i < ids.length; i += 50) {
+            const lote = ids.slice(i, i + 50);
+            const marcadores = lote.map(() => "?").join(",");
+            const soloMios = payload.rol === "admin" ? "" : " AND autor_id = ?";
+            const res = await env.DB.prepare(
+              `UPDATE media SET carpeta_id = ? WHERE id IN (${marcadores}) AND visibilidad = 'privado'${soloMios}`
+            ).bind(destino, ...lote, ...(payload.rol === "admin" ? [] : [payload.uid])).run();
+            movidos += Number(res && res.meta && res.meta.changes) || 0;
+          }
+          if (movidos) {
+            ctx.waitUntil(registrarActividad(env, request, payload, {
+              accion: "mover_media", entidad: "media_carpeta", entidad_id: destino ? String(destino) : "sin_carpeta",
+              descripcion: `Ha movido ${movidos} archivo(s) ${destino ? `a la carpeta de contenido (id ${destino})` : 'a "Sin carpeta"'}`,
+            }));
+          }
+          return json({ ok: true, movidos, omitidos: ids.length - movidos });
+        } catch (err) {
+          // 409 y no 5xx: ver resolverCarpetaMediaDeSubida (evita un failover falso).
+          if (/no such (table|column)|does not exist/i.test(err.message || "")) {
+            return json({ error: "Las carpetas no están activadas todavía (falta ejecutar migracion_media_carpetas.sql)." }, 409);
+          }
+          return json({ error: "No se pudieron mover los archivos", detail: err.message }, 500);
+        }
+      }
+
       // ---------- MEDIA: listado ----------
       // Los administradores ven todo lo subido por el equipo; un redactor
       // normal solo ve (y por tanto solo puede editar) lo que ha subido él.
@@ -15992,6 +17548,23 @@ async function handlePrimary(request, env, ctx) {
           }
         }
         const filas = resultadoMedia.results;
+        // Carpeta de cada archivo (solo contenido privado). Consulta aparte y
+        // tolerante a fallos a propósito: si aún no se ha ejecutado
+        // migracion_media_carpetas.sql, el listado sigue igual que antes (con
+        // visibilidad y foco) y todo aparece sin carpeta.
+        if (filas.length) {
+          try {
+            const conCarpeta = await selectPorLotesDeIds(
+              env,
+              filas.map((f) => f.id),
+              (marcadores) => `SELECT id, carpeta_id FROM media WHERE id IN (${marcadores})`
+            );
+            const carpetaPorId = new Map(conCarpeta.map((c) => [c.id, c.carpeta_id]));
+            for (const f of filas) f.carpeta_id = carpetaPorId.get(f.id) ?? null;
+          } catch (err) {
+            for (const f of filas) f.carpeta_id = null;
+          }
+        }
         // Se añade a cada foto/vídeo, si tiene, el partido al que está
         // vinculada en match_gallery (result_id + nombres de equipos +
         // de cuál de los dos es), para que el modal "Editar contenido"
@@ -16100,6 +17673,22 @@ async function handlePrimary(request, env, ctx) {
         // "publico".
         const visibilidadRaw = (body.visibilidad || "").toString().trim().toLowerCase();
         const visibilidad = visibilidadRaw === "privado" ? "privado" : "publico";
+        // Carpeta (solo contenido privado). undefined = no tocar la que tiene.
+        // Un archivo que pasa a público se desvincula de su carpeta (NULL). Se
+        // valida ANTES de guardar nada para no dejar la edición a medias.
+        let carpetaNueva;
+        if (visibilidad !== "privado") {
+          carpetaNueva = null;
+        } else if (body.carpeta_id !== undefined) {
+          const texto = body.carpeta_id === null ? "" : String(body.carpeta_id).trim();
+          if (!texto) {
+            carpetaNueva = null;
+          } else {
+            const r = await resolverCarpetaMediaDeSubida(env, texto, true);
+            if (r.error) return json({ error: r.error }, r.status);
+            carpetaNueva = r.id;
+          }
+        }
         try {
           await env.DB.prepare(
             "UPDATE media SET titulo = ?, descripcion = ?, club = ?, portada_segundo = ?, portada_foco = ?, visibilidad = ? WHERE id = ?"
@@ -16135,6 +17724,19 @@ async function handlePrimary(request, env, ctx) {
             console.error("No se pudo guardar portada_segundo/portada_foco (falta migración migracion_media_portada.sql):", err.message);
           } else {
             throw err;
+          }
+        }
+
+        // La carpeta va en un UPDATE aparte (igual que al subir) para no tocar la
+        // cadena de reintentos por columnas que puedan faltar. Antes de ejecutar
+        // la migración no hay columna carpeta_id: es normal y se ignora.
+        if (carpetaNueva !== undefined) {
+          try {
+            await env.DB.prepare("UPDATE media SET carpeta_id = ? WHERE id = ?").bind(carpetaNueva, id).run();
+          } catch (err) {
+            if (!/no such column|no column named|column .* does not exist/i.test(err.message || "")) {
+              console.error("No se pudo guardar la carpeta del contenido editado:", err.message);
+            }
           }
         }
 
@@ -16642,8 +18244,8 @@ async function handlePrimary(request, env, ctx) {
         for (const id of ids) {
           const fila = porId.get(id);
           if (!fila) { omitidas.push({ id, motivo: "No existe." }); continue; }
-          if (destino !== null && (fila.publicado || !fila.programado_para)) {
-            omitidas.push({ id, motivo: "Solo se pueden etiquetar noticias ya programadas." });
+          if (destino !== null && !fila.publicado && !fila.programado_para) {
+            omitidas.push({ id, motivo: "Solo se pueden etiquetar noticias programadas o ya publicadas." });
             continue;
           }
           validas.push(id);
@@ -16716,6 +18318,290 @@ async function handlePrimary(request, env, ctx) {
           descripcion: `Ha quitado el banner de última hora de la noticia #${id}.`,
         }));
         return json({ ok: true });
+      }
+
+      // ---------- Estadísticas públicas de jugadores ----------
+      // GET /api/stats/jugadores?competicion=segunda_federacion&grupo=Grupo 1
+      //   &club=...&temporada=todas&limit=10
+      // Devuelve { goleadores, asistentes, participacion, tarjetas, sin_resolver, partidos }.
+      // Los tops se limitan SIEMPRE a 10 (STATS_TOP_MAX), pida lo que pida el
+      // cliente. Se calcula al vuelo con match_events + alineaciones (ver
+      // statsAgregarJugadores): se actualiza solo con cada partido. Por
+      // defecto solo la temporada en curso (mismo criterio que la
+      // clasificación); "temporada=todas" quita ese filtro. Competición
+      // obligatoria para acotar la lectura. Solo partidos finalizados o en
+      // juego y visibles en la web pública. Respuesta cacheable (ver
+      // CACHE_PUBLICA_TTL_MS).
+      if (path === "/api/stats/jugadores" && method === "GET") {
+        const competicionStats = url.searchParams.get("competicion");
+        if (!competicionStats) return json({ error: "Falta el parámetro competicion" }, 400);
+        const grupoStats = url.searchParams.get("grupo");
+        const clubStats = url.searchParams.get("club");
+        const limitStatsPedido = parseInt(url.searchParams.get("limit") || String(STATS_TOP_MAX), 10);
+        const limitStats = Number.isInteger(limitStatsPedido) && limitStatsPedido > 0 ? Math.min(limitStatsPedido, STATS_TOP_MAX) : STATS_TOP_MAX;
+        const cargaStats = await statsCargarAgregado(env, {
+          competicion: competicionStats, grupo: grupoStats, club: clubStats,
+          todas: url.searchParams.get("temporada") === "todas",
+        });
+        // La carga por club trae también a los rivales de sus partidos: aquí se queda solo con los del club.
+        const fichasTops = clubStats ? [...cargaStats.agregado.jugadores.values()].filter((f) => f.club === clubStats) : cargaStats.agregado.jugadores;
+        const rankings = statsRankings(fichasTops, limitStats);
+        return json({
+          competicion: competicionStats,
+          grupo: grupoStats || null,
+          club: clubStats || null,
+          temporada: url.searchParams.get("temporada") === "todas" ? "todas" : "actual",
+          clubes: cargaStats.clubes,
+          desde_fecha: cargaStats.desde,
+          partidos_con_eventos: new Set(cargaStats.eventos.map((e) => e.resultado_id)).size,
+          grupos: cargaStats.grupos,
+          sin_resolver: cargaStats.agregado.sin_resolver,
+          limite: limitStats,
+          ...rankings,
+        });
+      }
+
+      // ---------- Admin: corrección manual de jugadores (estadísticas, Fase 1) ----------
+      // Funcionalidades > Jugadores. Solo administradores. Ver
+      // statsAplicarCorrecciones y worker/migracion_jugadores.sql.
+      if (path.startsWith("/api/admin/jugadores")) {
+        const plJug = await requireAuth(request, env);
+        if (!plJug) return json({ error: "No autorizado" }, 401);
+        if (!esAdmin(plJug)) return json({ error: "Solo un administrador puede corregir jugadores" }, 403);
+        const limpiarNombreJug = (t) => String(t || "").replace(/\s+/g, " ").trim();
+        const dorsalJug = (v) => {
+          if (v === null || v === undefined || v === "") return null;
+          const n = Number(v);
+          return Number.isInteger(n) && n >= 0 && n <= 999 ? n : undefined;
+        };
+        const slugUnicoJug = async (club, nombre) => {
+          const base = statsSlugJugador(club, statsSlugTexto(nombre));
+          for (let i = 0; i < 30; i++) {
+            const cand = i === 0 ? base : `${base}-${i + 1}`;
+            const ya = await env.DB.prepare("SELECT id FROM jugadores WHERE slug = ?").bind(cand).first();
+            if (!ya) return cand;
+          }
+          return `${base}-${Date.now()}`;
+        };
+
+        // GET /api/admin/jugadores?competicion=&grupo=&club=&q=&temporada=todas
+        if (path === "/api/admin/jugadores" && method === "GET") {
+          const competicionJug = url.searchParams.get("competicion");
+          if (!competicionJug) return json({ error: "Falta el parámetro competicion" }, 400);
+          const clubJug = url.searchParams.get("club") || null;
+          const cargaJug = await statsCargarAgregado(env, {
+            competicion: competicionJug, grupo: url.searchParams.get("grupo") || null, club: clubJug,
+            todas: url.searchParams.get("temporada") === "todas",
+          });
+          const aliasPorClaveJug = new Map();
+          const jugPorId = new Map(cargaJug.correcciones.jugadores.map((j) => [Number(j.id), j]));
+          cargaJug.correcciones.alias.forEach((a) => aliasPorClaveJug.set(a.club + "|" + a.clave, a));
+          const qJug = statsNormalizarNombre(url.searchParams.get("q") || "");
+          const clubes = new Set();
+          cargaJug.partidos.forEach((p) => { if (p.equipo_local) clubes.add(p.equipo_local); if (p.equipo_visitante) clubes.add(p.equipo_visitante); });
+          let filas = [...cargaJug.agregadoCrudo.jugadores.values()]
+            .filter((f) => !clubJug || f.club === clubJug)
+            .filter((f) => !qJug || statsNormalizarNombre(f.jugador).includes(qJug) || (f.dorsal !== null && String(f.dorsal) === qJug))
+            .map((f) => {
+              const al = aliasPorClaveJug.get(f.club + "|" + f.clave);
+              const j = al ? jugPorId.get(Number(al.jugador_id)) : null;
+              return {
+                club: f.club, clave: f.clave, nombre: f.jugador, dorsal: f.dorsal, sin_nombre: !!f.sin_nombre,
+                goles: f.goles, asistencias: f.asistencias, tarjetas: f.amarillas + f.dobles + f.rojas,
+                partidos: f.titular + f.suplente,
+                jugador_id: j ? Number(j.id) : null, corregido_como: j ? j.nombre : null,
+              };
+            })
+            .sort((a, b) => (b.sin_nombre - a.sin_nombre) || String(a.club).localeCompare(String(b.club), "es")
+              || (b.goles + b.asistencias) - (a.goles + a.asistencias) || String(a.nombre).localeCompare(String(b.nombre), "es"));
+          const total = filas.length;
+          filas = filas.slice(0, 300);
+          const corregidos = cargaJug.correcciones.jugadores
+            .filter((j) => !clubJug || j.club === clubJug)
+            .map((j) => ({
+              id: Number(j.id), slug: j.slug, club: j.club, nombre: j.nombre, dorsal: j.dorsal, oculto: !!Number(j.oculto),
+              claves: cargaJug.correcciones.alias.filter((a) => Number(a.jugador_id) === Number(j.id)).map((a) => ({ alias_id: Number(a.id), clave: a.clave })),
+            }))
+            .sort((a, b) => String(a.club).localeCompare(String(b.club), "es") || String(a.nombre).localeCompare(String(b.nombre), "es"));
+          return json({
+            competicion: competicionJug, grupos: cargaJug.grupos, clubes: [...clubes].sort((a, b) => a.localeCompare(b, "es")),
+            total, truncado: total > filas.length, jugadores: filas, corregidos,
+          });
+        }
+
+        // POST /api/admin/jugadores/fusionar { club, claves: [...], nombre, dorsal }
+        // Funde varias fichas automáticas (o jugadores ya corregidos) en uno.
+        // Con una sola clave sirve para renombrar o poner dorsal.
+        if (path === "/api/admin/jugadores/fusionar" && method === "POST") {
+          const body = await request.json().catch(() => null);
+          const club = limpiarNombreJug(body?.club).slice(0, 120);
+          const nombre = limpiarNombreJug(body?.nombre).slice(0, 80);
+          const claves = [...new Set((Array.isArray(body?.claves) ? body.claves : []).map((c) => String(c || "").trim().slice(0, 100)).filter(Boolean))];
+          const dorsal = dorsalJug(body?.dorsal);
+          if (!club || !claves.length || claves.length > 12) return json({ error: "Indica el club y entre 1 y 12 fichas" }, 400);
+          if (nombre.length < 2) return json({ error: "El nombre debe tener al menos 2 caracteres" }, 400);
+          if (dorsal === undefined) return json({ error: "El dorsal debe ser un número entre 0 y 999" }, 400);
+
+          // ¿Alguna ficha ya pertenece a un jugador corregido? Se reutiliza (y se unen si hay varios).
+          const existentes = new Set();
+          for (const clave of claves) {
+            const al = await env.DB.prepare("SELECT jugador_id FROM jugador_alias WHERE club = ? AND clave = ?").bind(club, clave).first();
+            if (al) existentes.add(Number(al.jugador_id));
+          }
+          let jugadorId;
+          let slug;
+          if (existentes.size) {
+            const ids = [...existentes].sort((a, b) => a - b);
+            jugadorId = ids[0];
+            for (const otro of ids.slice(1)) {
+              await env.DB.prepare("UPDATE jugador_alias SET jugador_id = ? WHERE jugador_id = ?").bind(jugadorId, otro).run();
+              await env.DB.prepare("DELETE FROM jugadores WHERE id = ?").bind(otro).run();
+            }
+            await env.DB.prepare("UPDATE jugadores SET nombre = ?, dorsal = ?, oculto = 0, updated_at = datetime('now') WHERE id = ?").bind(nombre, dorsal, jugadorId).run();
+            const fila = await env.DB.prepare("SELECT slug FROM jugadores WHERE id = ?").bind(jugadorId).first();
+            slug = fila?.slug;
+          } else {
+            slug = await slugUnicoJug(club, nombre);
+            const nuevo = await env.DB.prepare(
+              "INSERT INTO jugadores (slug, club, nombre, dorsal) VALUES (?, ?, ?, ?) RETURNING id"
+            ).bind(slug, club, nombre, dorsal).first();
+            jugadorId = Number(nuevo.id);
+          }
+          for (const clave of claves) {
+            await env.DB.prepare(
+              `INSERT INTO jugador_alias (jugador_id, club, clave) VALUES (?, ?, ?)
+               ON CONFLICT(club, clave) DO UPDATE SET jugador_id = excluded.jugador_id`
+            ).bind(jugadorId, club, clave).run();
+          }
+          ctx.waitUntil(registrarActividad(env, request, plJug, {
+            accion: "fusionar_jugadores", entidad: "jugador", entidad_id: jugadorId,
+            descripcion: `Ha fusionado ${claves.length} ficha(s) de ${club} en el jugador «${nombre}».`,
+          }));
+          return json({ ok: true, id: jugadorId, slug });
+        }
+
+        // PUT /api/admin/jugadores/:id { nombre?, dorsal?, oculto? }
+        const mPutJug = path.match(/^\/api\/admin\/jugadores\/(\d+)$/);
+        if (mPutJug && method === "PUT") {
+          const id = parseInt(mPutJug[1], 10);
+          const body = await request.json().catch(() => null);
+          const actual = await env.DB.prepare("SELECT id, nombre, dorsal, oculto FROM jugadores WHERE id = ?").bind(id).first();
+          if (!actual) return json({ error: "Jugador no encontrado" }, 404);
+          const nombre = body && body.nombre !== undefined ? limpiarNombreJug(body.nombre).slice(0, 80) : actual.nombre;
+          if (nombre.length < 2) return json({ error: "El nombre debe tener al menos 2 caracteres" }, 400);
+          const dorsal = body && body.dorsal !== undefined ? dorsalJug(body.dorsal) : actual.dorsal;
+          if (dorsal === undefined) return json({ error: "El dorsal debe ser un número entre 0 y 999" }, 400);
+          const oculto = body && body.oculto !== undefined ? (body.oculto ? 1 : 0) : Number(actual.oculto);
+          await env.DB.prepare("UPDATE jugadores SET nombre = ?, dorsal = ?, oculto = ?, updated_at = datetime('now') WHERE id = ?").bind(nombre, dorsal, oculto, id).run();
+          ctx.waitUntil(registrarActividad(env, request, plJug, {
+            accion: "editar_jugador", entidad: "jugador", entidad_id: id,
+            descripcion: `Ha editado al jugador «${nombre}»${oculto ? " (oculto)" : ""}.`,
+          }));
+          return json({ ok: true });
+        }
+
+        // DELETE /api/admin/jugadores/:id  -> deshace la corrección entera
+        // DELETE /api/admin/jugadores/alias/:aliasId -> separa una sola ficha
+        const mDelAlias = path.match(/^\/api\/admin\/jugadores\/alias\/(\d+)$/);
+        if (mDelAlias && method === "DELETE") {
+          const aliasId = parseInt(mDelAlias[1], 10);
+          const al = await env.DB.prepare("SELECT jugador_id FROM jugador_alias WHERE id = ?").bind(aliasId).first();
+          if (!al) return json({ error: "Ficha no encontrada" }, 404);
+          await env.DB.prepare("DELETE FROM jugador_alias WHERE id = ?").bind(aliasId).run();
+          const quedan = await env.DB.prepare("SELECT COUNT(*) AS n FROM jugador_alias WHERE jugador_id = ?").bind(al.jugador_id).first();
+          if (!Number(quedan?.n)) await env.DB.prepare("DELETE FROM jugadores WHERE id = ?").bind(al.jugador_id).run();
+          return json({ ok: true });
+        }
+        const mDelJug = path.match(/^\/api\/admin\/jugadores\/(\d+)$/);
+        if (mDelJug && method === "DELETE") {
+          const id = parseInt(mDelJug[1], 10);
+          await env.DB.prepare("DELETE FROM jugador_alias WHERE jugador_id = ?").bind(id).run();
+          await env.DB.prepare("DELETE FROM jugadores WHERE id = ?").bind(id).run();
+          ctx.waitUntil(registrarActividad(env, request, plJug, {
+            accion: "deshacer_jugador", entidad: "jugador", entidad_id: id,
+            descripcion: `Ha deshecho la corrección del jugador #${id}.`,
+          }));
+          return json({ ok: true });
+        }
+        return json({ error: "Ruta no encontrada" }, 404);
+      }
+
+      // GET /api/stats/jugador?competicion=segunda_federacion&j=cd-castellon~rodrigo-martinez
+      // Ficha individual de un jugador (el "j" es el slug que devuelven los
+      // tops). 404 si no existe en la temporada. Cacheable.
+      if (path === "/api/stats/jugador" && method === "GET") {
+        const competicionFicha = url.searchParams.get("competicion");
+        const slugFicha = (url.searchParams.get("j") || "").slice(0, 160);
+        if (!competicionFicha || !slugFicha) return json({ error: "Faltan los parámetros competicion y j" }, 400);
+        const cargaFicha = await statsCargarAgregado(env, {
+          competicion: competicionFicha, grupo: null, club: null,
+          todas: url.searchParams.get("temporada") === "todas",
+        });
+        const fichasFicha = [...cargaFicha.agregado.jugadores.values()];
+        // Si el slug era el automático de una ficha ya fundida/renombrada a mano, se sirve la corregida.
+        const slugVigente = cargaFicha.agregado.alias_slugs && cargaFicha.agregado.alias_slugs.has(slugFicha) ? cargaFicha.agregado.alias_slugs.get(slugFicha) : slugFicha;
+        const fichaJugador = slugVigente ? fichasFicha.find((f) => f.slug === slugVigente) : null; // null = jugador oculto por un admin
+        if (!fichaJugador) return json({ error: "Jugador no encontrado" }, 404);
+        return json({ competicion: competicionFicha, ...statsFichaJugador(fichaJugador, cargaFicha) });
+      }
+
+      // GET /api/stats/club?competicion=segunda_federacion&club=CD Castellón&temporada=todas
+      // Plantilla de un club: todos sus jugadores con ficha (goles, asistencias,
+      // tarjetas, MVP, partidos), totales del equipo y su top 3 de goleadores.
+      // Mismos datos y correcciones manuales que los tops. Cacheable.
+      if (path === "/api/stats/club" && method === "GET") {
+        const competicionClub = url.searchParams.get("competicion");
+        const clubPlantilla = (url.searchParams.get("club") || "").slice(0, 120);
+        if (!competicionClub || !clubPlantilla) return json({ error: "Faltan los parámetros competicion y club" }, 400);
+        const cargaClub = await statsCargarAgregado(env, {
+          competicion: competicionClub, grupo: null, club: clubPlantilla,
+          todas: url.searchParams.get("temporada") === "todas",
+        });
+        const fichasClub = [...cargaClub.agregado.jugadores.values()].filter((f) => f.club === clubPlantilla);
+        const jugadoresClub = fichasClub.map((f) => ({
+          jugador: f.jugador, slug: f.slug, dorsal: f.dorsal, sin_nombre: !!f.sin_nombre,
+          goles: f.goles, asistencias: f.asistencias, amarillas: f.amarillas, dobles: f.dobles, rojas: f.rojas,
+          mvps: f.mvps || 0, titular: f.titular, suplente: f.suplente, partidos: f.titular + f.suplente,
+        })).sort((a, b) => (a.dorsal === null) - (b.dorsal === null) || (a.dorsal ?? 0) - (b.dorsal ?? 0) || String(a.jugador).localeCompare(String(b.jugador), "es"));
+        const partidosClub = [...cargaClub.partidos.values()].filter((p) => p.goles_local !== undefined && (p.equipo_local === clubPlantilla || p.equipo_visitante === clubPlantilla));
+        const cuentaGruposClub = new Map();
+        partidosClub.forEach((p) => { if (p.grupo) cuentaGruposClub.set(p.grupo, (cuentaGruposClub.get(p.grupo) || 0) + 1); });
+        const topsClub = statsRankings(fichasClub, 3);
+        return json({
+          competicion: competicionClub,
+          club: clubPlantilla,
+          escudo_url: (fichasClub.find((f) => f.escudo_url) || {}).escudo_url || null,
+          grupo: [...cuentaGruposClub.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || null,
+          temporada: url.searchParams.get("temporada") === "todas" ? "todas" : "actual",
+          clubes: cargaClub.clubes,
+          partidos_equipo: partidosClub.length,
+          totales: {
+            goles: jugadoresClub.reduce((a, f) => a + f.goles, 0),
+            asistencias: jugadoresClub.reduce((a, f) => a + f.asistencias, 0),
+            amarillas: jugadoresClub.reduce((a, f) => a + f.amarillas, 0),
+            expulsiones: jugadoresClub.reduce((a, f) => a + f.dobles + f.rojas, 0),
+          },
+          goleadores: topsClub.goleadores, asistentes: topsClub.asistentes,
+          jugadores: jugadoresClub,
+        });
+      }
+
+      // GET /api/stats/buscar?q=rodrigo&competicion=segunda_federacion&temporada=todas
+      // Buscador de jugadores (y clubes) para /estadisticas, /plantilla y las
+      // fichas. "competicion" es opcional: sin ella se busca en las tres.
+      // Máximo 10 jugadores y 5 clubes, pida lo que pida el cliente. Mismas
+      // correcciones del panel que los tops (fusiones, renombrados, ocultos).
+      // Consultas de menos de 2 letras devuelven listas vacías sin tocar la
+      // base de datos. Cacheable (ver CACHE_PUBLICA_TTL_MS).
+      if (path === "/api/stats/buscar" && method === "GET") {
+        const qBuscar = (url.searchParams.get("q") || "").trim().slice(0, 80);
+        const compBuscar = url.searchParams.get("competicion") || null;
+        if (compBuscar && !STATS_COMPETICIONES.includes(compBuscar)) return json({ error: "Competición no válida" }, 400);
+        const todasBuscar = url.searchParams.get("temporada") === "todas";
+        const baseBuscar = { q: qBuscar, competicion: compBuscar, temporada: todasBuscar ? "todas" : "actual", limite: STATS_BUSCAR_MAX };
+        if (statsNormalizarNombre(qBuscar).length < 2) return json({ ...baseBuscar, jugadores: [], clubes: [] });
+        const fuentesBuscar = await Promise.all((compBuscar ? [compBuscar] : STATS_COMPETICIONES).map((c) => statsFuenteCompeticion(env, c, todasBuscar)));
+        return json({ ...baseBuscar, ...statsBuscarJugadores(qBuscar, fuentesBuscar, STATS_BUSCAR_MAX) });
       }
 
       // ---------- Ranking público de portada: más leídas y tendencias ----------
@@ -16836,7 +18722,9 @@ async function handlePrimary(request, env, ctx) {
         // con la LONGITUD del contenido traducido, no su texto: se pide
         // como "contenido_XX_len" y se traduce a un booleano equivalente
         // a tener contenido, sin transferir el HTML entero.
-        let query = `SELECT id, slug, titulo, subtitulo, contenido, tipo, categoria, categorias_adicionales, club, imagen_url, imagenes,
+        // Rendimiento: ver el mismo bloque en worker/src/index.js (listados públicos solo con el arranque del cuerpo).
+        const recortarCuerpo = !admin && !slugExacto;
+        let query = `SELECT id, slug, titulo, subtitulo, ${recortarCuerpo ? `substr(contenido, 1, ${LISTADO_CONTENIDO_MAX}) AS contenido` : "contenido"}, tipo, categoria, categorias_adicionales, club, imagen_url, imagenes,
             resultado_id, autor_id, autor_nombre, coautor_id, coautor_nombre, destacado, publicado,
             estado_borrador, programado_para, fecha_preferencia_desde, fecha_preferencia_hasta, slug_congelado, fecha_publicacion, created_at, updated_at,
             titulo_eu, LENGTH(contenido_eu) AS contenido_eu_len,
@@ -16844,7 +18732,7 @@ async function handlePrimary(request, env, ctx) {
             titulo_gl, LENGTH(contenido_gl) AS contenido_gl_len,
             titulo_en, LENGTH(contenido_en) AS contenido_en_len,
             ficha_tecnica, fuera_calendario, banner_urgente, banner_urgente_hasta,
-            ${admin ? "redes_destino" : "NULL"} AS redes_destino,
+            ${admin ? "CASE WHEN publicado = 1 AND (fecha_publicacion IS NULL OR fecha_publicacion < datetime('now', '-2 days')) THEN NULL ELSE redes_destino END" : "NULL"} AS redes_destino,
             ${admin
               ? `CASE WHEN publicado = 1 AND tipo IN ('previa', 'cronica') AND resultado_id IS NOT NULL
                    THEN (SELECT COUNT(*) FROM articles b WHERE b.resultado_id = articles.resultado_id AND b.tipo = articles.tipo AND b.publicado = 1)
@@ -16981,6 +18869,13 @@ async function handlePrimary(request, env, ctx) {
         const resultadosBD = hayMasArticulos ? resultadosBDConExtra.slice(0, limit) : resultadosBDConExtra;
         // Vista admin: se reevalúa el horario al leer (ver aplicarFueraCalendarioEnLectura).
         const results = admin ? await aplicarFueraCalendarioEnLectura(env, resultadosBD) : resultadosBD;
+        if (recortarCuerpo) {
+          for (const a of results) {
+            if (typeof a.contenido === "string" && a.contenido.length >= LISTADO_CONTENIDO_MAX) {
+              a.contenido = a.contenido.replace(/<[^>]*$/, "");
+            }
+          }
+        }
         // Reconstruye, a partir de las longitudes pedidas, los mismos
         // campos "contenido_XX" que espera conIdiomasDisponibles (solo le
         // importa si están vacíos o no), sin haber transferido el texto.
@@ -17081,8 +18976,12 @@ async function handlePrimary(request, env, ctx) {
         // esos límites solo aplican a lo que se publica o se marca como
         // borrador "terminado".
         const longitudContenido = longitudTextoPlano(body.contenido);
+        // Una noticia de "última hora" (PIN válido, o banner urgente activado
+        // por quien tiene permiso: admin o Nivel 2+) no necesita el mínimo.
+        const sinMinimoUltimaHora = esUltimaHora
+          || (body.banner_urgente === true && (payload.rol === "admin" || nivelUsuario >= 2));
         if (estadoBorrador !== "en_proceso") {
-          if (longitudContenido < CONTENIDO_MIN) {
+          if (longitudContenido < CONTENIDO_MIN && !sinMinimoUltimaHora) {
             return json({ error: `El contenido debe tener al menos ${CONTENIDO_MIN} caracteres (tiene ${longitudContenido}).` }, 400);
           }
           if (longitudContenido > CONTENIDO_MAX) {
@@ -17232,7 +19131,7 @@ async function handlePrimary(request, env, ctx) {
         }
 
         const publicado = body.publicado !== false;
-        const tipoLabel = { noticia: "Noticia", previa: "Previa", cronica: "Crónica", analisis: "Análisis", opinion: "Opinión", entrevista: "Entrevista" }[body.tipo] || "Artículo";
+        const tipoLabel = { noticia: "Noticia", previa: "Previa", cronica: "Crónica", analisis: "Análisis", opinion: "Opinión", entrevista: "Entrevista", uno_por_uno: "1x1 de jugadores" }[body.tipo] || "Artículo";
         const firmaAutores = coautorNombre ? `${autorNombre} y ${coautorNombre}` : autorNombre;
         if (programadoPara) {
           // No se manda aviso por email al programarla: se mandará el
@@ -17294,6 +19193,9 @@ async function handlePrimary(request, env, ctx) {
           ctx.waitUntil(notificarIndexNow(env, [urlNoticia(categoriaFinal, slug)]));
         }
 
+        precalentarVistaPreviaProgramada(ctx, programadoPara, imagenPortada, imagenes);
+        if (publicado && !programadoPara) ctx.waitUntil(refrescarTarjetaSocial(env, urlNoticia(categoriaFinal, slug)));
+
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: programadoPara ? "programar_articulo" : (publicado ? "crear_articulo" : "guardar_borrador"), entidad: "articulo", entidad_id: slug,
           descripcion: programadoPara
@@ -17342,11 +19244,20 @@ async function handlePrimary(request, env, ctx) {
           // 2) Es una noticia programada que todavía no ha llegado a su
           //    hora de publicación: se devuelve la info mínima para que
           //    la web pueda pintar un contador, sin publicado.
-          const redirect = await env.DB.prepare(
-            `SELECT a.slug FROM article_slug_redirects r
-             JOIN articles a ON a.id = r.article_id
-             WHERE r.slug_antiguo = ?`
-          ).bind(key).first();
+          // Las dos consultas (slug antiguo y programada) son independientes:
+          // se lanzan EN PARALELO (antes iban una tras otra, una ida y vuelta
+          // a D1 de más en cada petición de vista previa de un rastreador).
+          const [redirect, programada] = await Promise.all([
+            env.DB.prepare(
+              `SELECT a.slug FROM article_slug_redirects r
+               JOIN articles a ON a.id = r.article_id
+               WHERE r.slug_antiguo = ?`
+            ).bind(key).first(),
+            env.DB.prepare(
+              `SELECT slug, titulo, subtitulo, tipo, categoria, imagen_url, imagenes, programado_para
+               FROM articles WHERE slug = ?1 AND publicado = 0 AND programado_para IS NOT NULL`
+            ).bind(key).first(),
+          ]);
           if (redirect && redirect.slug !== key) {
             return json({ redirect: redirect.slug });
           }
@@ -17364,10 +19275,6 @@ async function handlePrimary(request, env, ctx) {
           // salía un 404 justo cuando el tuit programado a esa misma hora
           // pedía la tarjeta. Mientras siga con publicado = 0 y
           // programado_para informado, sigue siendo "programada".
-          const programada = await env.DB.prepare(
-            `SELECT slug, titulo, subtitulo, tipo, categoria, imagen_url, imagenes, programado_para
-             FROM articles WHERE slug = ?1 AND publicado = 0 AND programado_para IS NOT NULL`
-          ).bind(key).first();
           if (programada) {
             // Sin portada propia, la primera foto adicional (igual que hace el
             // worker del sitio con las noticias ya publicadas).
@@ -17379,6 +19286,7 @@ async function handlePrimary(request, env, ctx) {
                 if (primera) programada.imagen_url = primera.url;
               } catch { /* imagenes mal formadas: se queda sin imagen */ }
             }
+            programada.imagen_foco = focoDePortada(programada);
             delete programada.imagenes;
             return json({ programado: programada });
           }
@@ -17477,7 +19385,7 @@ async function handlePrimary(request, env, ctx) {
               // (goles, tarjetas, estadio...) directamente dentro de la
               // noticia, no solo el marcador.
               const { results: eventos } = await env.DB.prepare(
-                "SELECT * FROM match_events WHERE resultado_id = ? ORDER BY minuto ASC, minuto_extra ASC, orden ASC"
+                "SELECT * FROM match_events WHERE resultado_id = ? ORDER BY minuto ASC, CASE WHEN tipo = 'fin_descanso' THEN 1 ELSE 0 END ASC, COALESCE(minuto_extra, 0) ASC, orden ASC"
               ).bind(article.resultado_id).all();
               resultado.eventos = eventos || [];
             }
@@ -17773,10 +19681,11 @@ async function handlePrimary(request, env, ctx) {
         // redactor de Nivel 1 la haría desaparecer de la web sin querer
         // cada vez que la retocase.
         let nivelUsuario = payload.rol === "admin" ? NIVEL_MAXIMO : null;
+        let puedeUltimaHora = false;
         if (payload.rol !== "admin" && body.publicado !== false && !articuloParaPermiso.publicado) {
           nivelUsuario = await obtenerNivelUsuario(env, payload.uid);
           if (nivelUsuario < 2) {
-            const puedeUltimaHora = await comprobarUltimaHora(env, body.ultima_hora_pin);
+            puedeUltimaHora = await comprobarUltimaHora(env, body.ultima_hora_pin);
             if (!puedeUltimaHora) body.publicado = false;
           }
         }
@@ -17820,7 +19729,15 @@ async function handlePrimary(request, env, ctx) {
         // longitud todavía (ver mismo criterio al crear la noticia).
         if (body.contenido !== undefined && estadoBorrador !== "en_proceso") {
           const longitudContenido = longitudTextoPlano(body.contenido);
-          if (longitudContenido < CONTENIDO_MIN) {
+          // Última hora (PIN válido, o banner urgente pedido/ya activo y con
+          // permiso: admin o Nivel 2+): sin mínimo de caracteres.
+          if (nivelUsuario === null) nivelUsuario = await obtenerNivelUsuario(env, payload.uid);
+          const puedeBannerUH = payload.rol === "admin" || nivelUsuario >= 2;
+          const bannerUHSolicitado = Object.prototype.hasOwnProperty.call(body, "banner_urgente")
+            ? body.banner_urgente === true
+            : !!articuloParaPermiso.banner_urgente;
+          const sinMinimoUltimaHora = puedeUltimaHora || (bannerUHSolicitado && puedeBannerUH);
+          if (longitudContenido < CONTENIDO_MIN && !sinMinimoUltimaHora) {
             return json({ error: `El contenido debe tener al menos ${CONTENIDO_MIN} caracteres (tiene ${longitudContenido}).` }, 400);
           }
           if (longitudContenido > CONTENIDO_MAX) {
@@ -18061,9 +19978,11 @@ async function handlePrimary(request, env, ctx) {
         // ha publicado, o si sigue "en_proceso", tampoco se manda correo
         // aquí (al publicar de verdad ya llega el aviso de "Última hora"/
         // publicación por otro sitio del flujo).
+        // Título o foto cambiados en una noticia ya publicada: se refresca su tarjeta.
+        if (body.publicado !== false && !programadoPara) ctx.waitUntil(refrescarTarjetaSocial(env, urlNoticia(categoriaFinal, slug)));
         const yaEstabaTerminado = articuloParaPermiso.estado_borrador === "terminado";
         if (body.publicado === false && estadoBorrador === "terminado" && !yaEstabaTerminado) {
-          const tipoLabel = { noticia: "Noticia", previa: "Previa", cronica: "Crónica", analisis: "Análisis", opinion: "Opinión", entrevista: "Entrevista" }[body.tipo] || "Artículo";
+          const tipoLabel = { noticia: "Noticia", previa: "Previa", cronica: "Crónica", analisis: "Análisis", opinion: "Opinión", entrevista: "Entrevista", uno_por_uno: "1x1 de jugadores" }[body.tipo] || "Artículo";
           const firmaAutores = coautorNombre ? `${autorNombre} y ${coautorNombre}` : autorNombre;
           const textoPreferenciaFechas = formatearPreferenciaFechasEmail(preferenciaFechas);
           ctx.waitUntil(enviarEmailNotificacion(env, {
@@ -18102,10 +20021,11 @@ async function handlePrimary(request, env, ctx) {
           // Aviso a los buscadores (IndexNow) en el mismo momento de publicar.
           ctx.waitUntil(notificarIndexNow(env, [urlNoticia(categoriaFinal, slug)]));
         }
-        // Etiqueta de redes (carrusel / individual): solo tiene sentido mientras
-        // la noticia sigue programada. Si al guardar ya no lo está (se publica
-        // ahora, vuelve a borrador...), se quita para no dejar etiquetas huérfanas.
-        await env.DB.prepare("UPDATE articles SET redes_destino = NULL WHERE id = ? AND programado_para IS NULL AND redes_destino IS NOT NULL").bind(id).run();
+        // Etiqueta de redes (carrusel / individual): se conserva mientras la noticia
+        // esté programada o publicada (publicada se sigue viendo en su carrusel 48 h,
+        // para poder compartirlo). Solo se quita si vuelve a borrador.
+        await env.DB.prepare("UPDATE articles SET redes_destino = NULL WHERE id = ? AND publicado = 0 AND programado_para IS NULL AND redes_destino IS NOT NULL").bind(id).run();
+        precalentarVistaPreviaProgramada(ctx, programadoPara, imagenPortada, imagenes);
         ctx.waitUntil(indexarArticuloBusqueda(env, id));
         return json({ ok: true, slug, publicado: body.publicado === false ? 0 : 1, fuera_calendario: fueraCalendario, estado_borrador: estadoBorrador, programado_para: programadoPara, fecha_preferencia_desde: preferenciaFechas.desde, fecha_preferencia_hasta: preferenciaFechas.hasta, avisos_traduccion: avisosTraduccion });
       }
@@ -19746,6 +21666,17 @@ async function handlePrimary(request, env, ctx) {
           if (fechaCierre.getTime() <= Date.now()) return json({ error: "La fecha de cierre debe ser futura" }, 400);
         }
 
+        // Anti-duplicados: si la misma persona acaba de crear una encuesta con
+        // la misma pregunta (doble clic, reintento del navegador...), se
+        // devuelve la ya creada en vez de insertar otra.
+        const encuestaReciente = await env.DB.prepare(
+          `SELECT * FROM polls WHERE autor_id = ? AND pregunta = ? AND created_at >= datetime('now', '-2 minutes')
+           ORDER BY id DESC LIMIT 1`
+        ).bind(payload.uid, pregunta).first();
+        if (encuestaReciente) {
+          return json({ ok: true, duplicada: true, encuesta: await obtenerEncuestaConResultados(env, encuestaReciente, null) });
+        }
+
         const { meta } = await env.DB.prepare(
           `INSERT INTO polls (pregunta, article_id, en_portada, orden_portada, cierra_en, autor_id)
            VALUES (?, ?, ?, ?, ?, ?)`
@@ -20579,8 +22510,14 @@ async function handlePrimary(request, env, ctx) {
       };
       function grupoAutomaticoSegundaFederacion(competicion, equipoLocal, equipoVisitante) {
         if (competicion !== "segunda_federacion") return null;
-        return GRUPO_SEGUNDA_FEDERACION_POR_EQUIPO[equipoLocal]
-          || GRUPO_SEGUNDA_FEDERACION_POR_EQUIPO[equipoVisitante]
+        // Se resuelven antes los alias (p.ej. "Arosa" -> "Arosa SC",
+        // "Gimnástica de Torrelavega" -> "RS Gimnástica de Torrelavega",
+        // ambos Grupo 1) para que un nombre con otra grafía no se quede
+        // sin grupo.
+        const local = canonicoClubPorAlias(equipoLocal) || equipoLocal;
+        const visitante = canonicoClubPorAlias(equipoVisitante) || equipoVisitante;
+        return GRUPO_SEGUNDA_FEDERACION_POR_EQUIPO[local]
+          || GRUPO_SEGUNDA_FEDERACION_POR_EQUIPO[visitante]
           || null;
       }
 
@@ -20674,9 +22611,20 @@ async function handlePrimary(request, env, ctx) {
         // sobradamente cualquier vista razonable del panel; si algún caso
         // real necesita más, mejor paginar con desde_fecha que subir esto.
         const limit = Number.isInteger(limitParam) && limitParam > 0 && limitParam <= 500 ? limitParam : 100;
+        // Panel (sesión de staff): "?limit=0" = SIN límite de lectura, se
+        // devuelven todos los partidos que casen con los filtros. La web
+        // pública (sin sesión) conserva el tope de 100/500 para no
+        // escanear la tabla entera en cada visita.
+        const sinLimite = esStaff && limitParam === 0;
+        const clausulaLimite = sinLimite ? "" : ` LIMIT ${limit}`;
         let query = "SELECT * FROM results WHERE 1=1";
         const binds = [];
-        if (!esStaff) { query += " AND finalizado_no_cubierto = 0"; }
+        // "?con_no_cubiertos=1": la web pública (calendario, resultados, ficha de
+        // equipo) lo pide para enseñar los partidos finalizados sin cubrir con un
+        // aviso en vez de ocultarlos. Sin ese parámetro (clasificación, porras,
+        // portada, estadísticas...) siguen excluidos, así no cuentan en nada.
+        const verNoCubiertos = esStaff || url.searchParams.get("con_no_cubiertos") === "1";
+        if (!verNoCubiertos) { query += " AND finalizado_no_cubierto = 0"; }
         if (competicion) { query += " AND competicion = ?"; binds.push(competicion); }
         if (desdeFecha) { query += " AND (fecha_partido >= ? OR fecha_partido IS NULL)"; binds.push(desdeFecha); }
         if (estado) { query += " AND estado = ?"; binds.push(estado); }
@@ -20713,7 +22661,7 @@ async function handlePrimary(request, env, ctx) {
         // existe en PostgreSQL; aquí se trae por fecha_partido DESC y se
         // ordena en JS con el mismo criterio. Mantener ambos en sync a mano.
         const ordenCercania = url.searchParams.get("orden") === "cercania";
-        query += ` ORDER BY fecha_partido DESC LIMIT ${limit}`;
+        query += ` ORDER BY fecha_partido DESC${clausulaLimite}`;
         const { results } = await env.DB.prepare(query).bind(...binds).all();
         if (ordenCercania) {
           const pm = new Intl.DateTimeFormat("en-US", {
@@ -20790,7 +22738,10 @@ async function handlePrimary(request, env, ctx) {
       // otros tres solo avisan y se pueden confirmar con
       // "confirmar_duplicado: true", igual que antes.
       function normalizarEquipoDuplicado(nombre) {
-        let n = String(nombre || "")
+        // Un alias conocido ("Celta B", "Sporting de Gijón"...) se compara
+        // con su nombre oficial, para no crear el mismo partido dos veces
+        // con distinta grafía.
+        let n = String(canonicoClubPorAlias(nombre) || nombre || "")
           .normalize("NFD").replace(/[\u0300-\u036f]/g, "")  // quita acentos
           .toLowerCase()
           .replace(/[.\-_'"`]/g, " ")                          // puntuación como separador
@@ -20970,40 +22921,44 @@ async function handlePrimary(request, env, ctx) {
             (body.goles_local === undefined || body.goles_local === null || body.goles_visitante === undefined || body.goles_visitante === null)) {
           return json({ error: "Falta el marcador (goles de ambos equipos)" }, 400);
         }
-        // No se deja crear un resultado de una jornada que ya ha terminado.
-        // Se considera "pasada" cuando el calendario de jornadas
-        // (tabla jornadas_calendario) tiene registrada esa jornada para la
-        // competición/grupo y su fecha_fin es anterior al día de hoy
-        // (hora de Madrid; la fecha_fin es inclusiva, así que durante el
-        // último día de la jornada todavía se puede crear). Si el
-        // calendario no conoce esa jornada, o la competición no usa
-        // jornadas (amistoso), no hay forma de saber si está pasada y se
-        // deja crear como siempre. Solo aplica al crear (POST), no al editar.
+        // Tope de partidos por jornada (ya NO se bloquea por jornada pasada:
+        // se puede añadir un partido a cualquier jornada, también a una que
+        // ya terminó, mientras no se supere el máximo). Máximos:
+        //  - LaLiga Hypermotion: 11 por jornada (un único grupo).
+        //  - Primera Federación: 10 por jornada y grupo (2 grupos = 20).
+        //  - Segunda Federación: 9 por jornada y grupo (5 grupos = 45).
+        // Se cuentan todos los partidos de esa jornada (y grupo) que existan,
+        // sea cual sea su estado: para crear más hay que borrar alguno.
+        // Los amistosos no usan jornadas y no tienen tope. Solo aplica al
+        // crear (POST).
         {
-          if (body.competicion !== "amistoso") {
-            const jornadaNum = parseInt(body.jornada, 10);
-            if (Number.isInteger(jornadaNum)) {
-              const grupoJornada = body.competicion === "segunda_federacion"
-                ? (body.grupo || grupoAutomaticoSegundaFederacion(body.competicion, body.equipo_local, body.equipo_visitante))
-                : (body.grupo || null);
-              const filaJornada = await env.DB.prepare(
-                `SELECT MAX(fecha_fin) AS fecha_fin FROM jornadas_calendario
-                 WHERE competicion = ? AND (grupo IS ? OR grupo = ?) AND jornada = ?`
-              ).bind(body.competicion, grupoJornada, grupoJornada, jornadaNum).first();
-              if (filaJornada && filaJornada.fecha_fin) {
-                // "en-CA" formatea directamente como YYYY-MM-DD.
-                const hoyMadrid = new Intl.DateTimeFormat("en-CA", {
-                  timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit",
-                }).format(new Date());
-                if (String(filaJornada.fecha_fin) < hoyMadrid) {
-                  return json({
-                    error: `La jornada ${jornadaNum} ya ha pasado (terminó el ${filaJornada.fecha_fin}). No se pueden crear resultados de una jornada pasada.`,
-                    jornada_pasada: true,
-                    jornada: jornadaNum,
-                    fecha_fin_jornada: filaJornada.fecha_fin,
-                  }, 400);
-                }
-              }
+          const LIMITE_PARTIDOS_POR_JORNADA = { hypermotion: 11, primera_federacion: 10, segunda_federacion: 9 };
+          const limiteJornada = LIMITE_PARTIDOS_POR_JORNADA[body.competicion];
+          const jornadaNum = parseInt(body.jornada, 10);
+          if (limiteJornada && Number.isInteger(jornadaNum)) {
+            const conGrupos = body.competicion !== "hypermotion";
+            const grupoJornada = body.competicion === "segunda_federacion"
+              ? (body.grupo || grupoAutomaticoSegundaFederacion(body.competicion, body.equipo_local, body.equipo_visitante))
+              : (body.grupo || null);
+            const filaConteo = conGrupos
+              ? await env.DB.prepare(
+                  `SELECT COUNT(*) AS total FROM results
+                   WHERE competicion = ? AND jornada = ? AND (grupo IS ? OR grupo = ?)`
+                ).bind(body.competicion, jornadaNum, grupoJornada, grupoJornada).first()
+              : await env.DB.prepare(
+                  `SELECT COUNT(*) AS total FROM results WHERE competicion = ? AND jornada = ?`
+                ).bind(body.competicion, jornadaNum).first();
+            const existentes = Number(filaConteo?.total || 0);
+            if (existentes >= limiteJornada) {
+              const donde = conGrupos && grupoJornada ? ` del ${grupoJornada}` : "";
+              return json({
+                error: `La jornada ${jornadaNum}${donde} ya tiene el máximo de ${limiteJornada} partidos. Para crear otro hay que borrar antes uno de los existentes.`,
+                limite_jornada: true,
+                jornada: jornadaNum,
+                grupo: grupoJornada,
+                maximo: limiteJornada,
+                existentes,
+              }, 400);
             }
           }
         }
@@ -21091,9 +23046,10 @@ async function handlePrimary(request, env, ctx) {
         // finalizado automáticamente sin cubrir no debe poder consultarse
         // desde la web pública ni siquiera pidiendo su id directamente,
         // solo el panel (staff autenticado) puede verlo.
-        if (resultado.finalizado_no_cubierto && !(await requireAuth(request, env, url))) {
-          return json({ error: "Resultado no encontrado" }, 404);
-        }
+        // (Antes aquí se devolvía 404 a la web pública si el partido estaba
+        // finalizado sin cubrir. Ahora se devuelve normal, con
+        // finalizado_no_cubierto = 1, para que el modal de detalle pueda
+        // abrirse y avisar de que aún no se ha cubierto ni actualizado.)
         if (ligero) return json({ resultado });
         resultado.alineaciones = await obtenerAlineaciones(env, "result_id", id);
         // Si hay una (o varias) noticia ya publicada vinculada a este
@@ -21485,8 +23441,19 @@ async function handlePrimary(request, env, ctx) {
           // "minuto_inicial" permite retomar el cronómetro justo donde se
           // dejó (p. ej. al empezar la 2ª parte tras el descanso) en vez
           // de volver a contar desde 0.
-          const minutoInicial = Number.isInteger(body.minuto_inicial) && body.minuto_inicial > 0 ? body.minuto_inicial : 0;
-          await iniciarCronometroPartido(env, resultadoId, minutoInicial);
+          let minutoInicial = Number.isInteger(body.minuto_inicial) && body.minuto_inicial > 0 ? body.minuto_inicial : 0;
+          // Reanudar tras el descanso: siempre en el 45, aunque se pitara en 45+N.
+          // Se detecta por el flag del panel o, si el panel es antiguo, porque el
+          // último evento de descanso/reanudación es "descanso".
+          let segundaParte = body.segunda_parte === true;
+          if (!segundaParte && minutoInicial >= 45) {
+            const ultDescanso = await env.DB.prepare(
+              "SELECT tipo FROM match_events WHERE resultado_id = ? AND tipo IN ('descanso', 'fin_descanso') ORDER BY id DESC LIMIT 1"
+            ).bind(resultadoId).first();
+            segundaParte = ultDescanso?.tipo === "descanso";
+          }
+          if (segundaParte) minutoInicial = 45;
+          await iniciarCronometroPartido(env, resultadoId, minutoInicial, { segundaParte });
         } else if (body.accion === "pausar") {
           const minuto = Number.isInteger(body.minuto) ? body.minuto : 0;
           await env.DB.prepare(
@@ -21532,8 +23499,92 @@ async function handlePrimary(request, env, ctx) {
           } else {
             return json({ error: "El cronómetro no se ha iniciado todavía." }, 400);
           }
+        } else if (body.accion === "anadido") {
+          // Anuncia (o quita, con 0) el tiempo añadido de una parte SIN parar
+          // el reloj: el cron pone solo el descanso en 45+N / el final en
+          // 90+N (ver crearDescansoAutomaticoAlMinuto45 y
+          // cerrarPartidoAlTerminarAnadido). Se valida contra el reloj REAL
+          // (ignorando la pausa) para no aceptar un añadido que ya se agotó.
+          const parteAnadido = body.parte;
+          const minutosAnadido = body.minutos;
+          if (parteAnadido !== 1 && parteAnadido !== 2) {
+            return json({ error: "Parte no válida (1 o 2)." }, 400);
+          }
+          if (!Number.isInteger(minutosAnadido) || minutosAnadido < 0 || minutosAnadido > 15) {
+            return json({ error: "El tiempo añadido debe ser un número entero entre 0 y 15." }, 400);
+          }
+          const filaAnadido = await env.DB.prepare(
+            "SELECT estado, inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos FROM results WHERE id = ?"
+          ).bind(resultadoId).first();
+          if (!filaAnadido || filaAnadido.estado !== "en_juego" || !filaAnadido.inicio_cronometro_at) {
+            return json({ error: "Solo se puede anunciar el añadido con el partido en juego." }, 400);
+          }
+          if (minutosAnadido > 0) {
+            const relojReal = minutoEnVivoServidor({ ...filaAnadido, cronometro_pausado_en: null });
+            const segundaEmpezada = !!(await env.DB.prepare(
+              "SELECT id FROM match_events WHERE resultado_id = ? AND tipo = 'fin_descanso' LIMIT 1"
+            ).bind(resultadoId).first());
+            if (parteAnadido === 1) {
+              if (segundaEmpezada) {
+                return json({ error: "La 2ª parte ya ha empezado: no se puede anunciar el añadido de la 1ª." }, 400);
+              }
+              if (relojReal >= 45 + minutosAnadido) {
+                return json({ error: `El reloj ya ha pasado el 45+${minutosAnadido}. Pita el descanso a mano.` }, 400);
+              }
+              const pausado = filaAnadido.cronometro_pausado_en !== null && filaAnadido.cronometro_pausado_en !== undefined;
+              if (pausado) {
+                // Solo se admite si lo parado es el descanso AUTOMÁTICO recién
+                // puesto por el cron a los 45' (el árbitro dio añadido justo
+                // entonces): se retira y el reloj sigue corriendo.
+                const descanso = await env.DB.prepare(
+                  "SELECT id, var_motivo FROM match_events WHERE resultado_id = ? AND tipo = 'descanso' ORDER BY id DESC LIMIT 1"
+                ).bind(resultadoId).first();
+                if (!descanso || descanso.var_motivo !== "automatico") {
+                  return json({ error: "El reloj está parado (descanso o pausa pitados a mano): no se puede anunciar el añadido." }, 400);
+                }
+                await env.DB.prepare("DELETE FROM match_events WHERE id = ?").bind(descanso.id).run();
+                await env.DB.prepare("UPDATE results SET cronometro_pausado_en = NULL WHERE id = ?").bind(resultadoId).run();
+              }
+            } else {
+              if (!segundaEmpezada) {
+                return json({ error: "La 2ª parte todavía no ha empezado." }, 400);
+              }
+              if (relojReal >= 90 + minutosAnadido) {
+                return json({ error: `El reloj ya ha pasado el 90+${minutosAnadido}. Pita el final a mano.` }, 400);
+              }
+            }
+          }
+          // Evento visible en el timeline ("Tiempo añadido +3'"): minuto 45
+          // (1ª parte) o 90 (2ª), con los minutos en "jugador". Solo hay uno
+          // por parte: se reemplaza o se quita junto con el reloj.
+          const minutoBaseAnadido = parteAnadido === 1 ? 45 : 90;
+          await env.DB.prepare("DELETE FROM match_events WHERE resultado_id = ? AND tipo = 'anadido' AND minuto = ?")
+            .bind(resultadoId, minutoBaseAnadido).run();
+          if (minutosAnadido > 0) {
+            await env.DB.prepare(
+              "INSERT INTO match_events (resultado_id, tipo, equipo, jugador, minuto, orden) VALUES (?, 'anadido', 'ninguno', ?, ?, 0)"
+            ).bind(resultadoId, String(minutosAnadido), minutoBaseAnadido).run();
+          }
+          await env.DB.prepare("UPDATE results SET anadido_minutos = ?, anadido_parte = ? WHERE id = ?")
+            .bind(minutosAnadido > 0 ? minutosAnadido : null, minutosAnadido > 0 ? parteAnadido : null, resultadoId).run();
+          ctx.waitUntil(invalidarCacheArticuloPartido(env, resultadoId));
+        } else if (body.accion === "cerrar_anadido") {
+          // El panel avisa en cuanto SU reloj llega al final del añadido
+          // anunciado (45+N / 90+N) para no esperar al siguiente cron (que
+          // pasa solo una vez por minuto). Es idempotente y no se fía del
+          // cliente: se vuelve a comprobar contra el reloj REAL del servidor
+          // y se reutilizan las mismas funciones que el cron
+          // (crearDescansoAutomaticoAlMinuto45 / cerrarPartidoAlTerminarAnadido),
+          // que ya evitan duplicar el descanso o el final.
+          const filaCierre = await env.DB.prepare(
+            "SELECT id, estado, inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos, anadido_minutos, anadido_parte FROM results WHERE id = ?"
+          ).bind(resultadoId).first();
+          if (filaCierre && filaCierre.estado === "en_juego" && (filaCierre.cronometro_pausado_en === null || filaCierre.cronometro_pausado_en === undefined)) {
+            if (anadidoAnunciado(filaCierre, 1) > 0) await crearDescansoAutomaticoAlMinuto45(env, [filaCierre]);
+            if (anadidoAnunciado(filaCierre, 2) > 0) await cerrarPartidoAlTerminarAnadido(env, ctx, [filaCierre]);
+          }
         } else {
-          return json({ error: "Acción no válida (usa 'iniciar', 'pausar' o 'ajustar_minuto')" }, 400);
+          return json({ error: "Acción no válida (usa 'iniciar', 'pausar', 'ajustar_minuto', 'anadido' o 'cerrar_anadido')" }, 400);
         }
         // Nota: antes aquí se limpiaba un flag "aviso_desatendido_enviado"
         // con cada acción del cronómetro para permitir un nuevo aviso más
@@ -21907,13 +23958,13 @@ async function handlePrimary(request, env, ctx) {
         "pausa_hidratacion", "fin_pausa_hidratacion",
         "partido_retrasado", "partido_anulado",
         "penalti_marcado", "penalti_fallado_tanda",
-        "fin_partido", "otro",
+        "fin_partido", "otro", "anadido",
       ];
       const TIPOS_EVENTO_SIN_EQUIPO = [
         "inicio_partido", "descanso", "fin_descanso",
         "pausa_hidratacion", "fin_pausa_hidratacion",
         "partido_retrasado", "partido_anulado",
-        "fin_partido", "otro",
+        "fin_partido", "otro", "anadido",
       ];
 
       // Datos extra de la "Revisión VAR" (tipo "var"): sobre qué jugada
@@ -21969,11 +24020,19 @@ async function handlePrimary(request, env, ctx) {
           - eventos.filter((e) => e.tipo === "gol_var" && e.equipo === equipo && e.bajar_gol).length;
         const golesLocal = Math.max(0, contar("local"));
         const golesVisitante = Math.max(0, contar("visitante"));
+        const previo = await env.DB.prepare("SELECT goles_local, goles_visitante FROM results WHERE id = ?").bind(resultadoId).first();
         await env.DB.prepare(
           `UPDATE results SET goles_local = ?, goles_visitante = ?,
              estado = CASE WHEN estado = 'programado' THEN 'en_juego' ELSE estado END
            WHERE id = ?`
         ).bind(golesLocal, golesVisitante, resultadoId).run();
+        // Para avisar de correcciones: marcador anterior y si ha cambiado.
+        const antesL = previo ? (previo.goles_local ?? 0) : null;
+        const antesV = previo ? (previo.goles_visitante ?? 0) : null;
+        return {
+          antes: previo ? `${antesL}-${antesV}` : null,
+          cambio: !!previo && (golesLocal !== antesL || golesVisitante !== antesV),
+        };
       }
 
       // Recalcula penaltis_local/penaltis_visitante a partir de los
@@ -22000,7 +24059,7 @@ async function handlePrimary(request, env, ctx) {
         const { results: eventos } = await env.DB.prepare(
           `SELECT id, tipo, equipo, jugador, jugador_sale, jugador_asistencia, minuto, minuto_extra, orden, bajar_gol, var_motivo, var_decision
            FROM match_events WHERE resultado_id = ?
-           ORDER BY minuto ASC, minuto_extra ASC, orden ASC, id ASC`
+           ORDER BY minuto ASC, CASE WHEN tipo = 'fin_descanso' THEN 1 ELSE 0 END ASC, COALESCE(minuto_extra, 0) ASC, orden ASC, id ASC`
         ).bind(resultadoId).all();
         return json({ eventos });
       }
@@ -22074,8 +24133,13 @@ async function handlePrimary(request, env, ctx) {
         // hay que recalcular en este caso. Igual que un gol normal, de
         // paso confirma que el partido ya está en juego si seguía
         // "programado".
-        if (body.tipo === "gol" || body.tipo === "gol_var" || body.tipo === "gol_pp") await recalcularMarcadorDesdeEventos(env, resultadoId);
+        let recalcPost = null;
+        if (body.tipo === "gol" || body.tipo === "gol_var" || body.tipo === "gol_pp") recalcPost = await recalcularMarcadorDesdeEventos(env, resultadoId);
         if (body.tipo === "gol" || body.tipo === "gol_pp") ctx.waitUntil(notificarPushPartido(env, resultadoId, body.tipo, body));
+        // Gol anulado por VAR que resta del marcador: aviso dentro del grupo de goles.
+        if (body.tipo === "gol_var" && body.bajar_gol && recalcPost && recalcPost.cambio) {
+          ctx.waitUntil(notificarPushPartido(env, resultadoId, "gol_var", { ...body, antes: recalcPost.antes }));
+        }
         if (body.tipo === "penalti_marcado" || body.tipo === "penalti_fallado_tanda") await recalcularPenaltisDesdeEventos(env, resultadoId);
         if (body.tipo === "fin_partido") {
           // Se limpia también aquí aviso_desatendido_mitad: si este mismo
@@ -22151,8 +24215,10 @@ async function handlePrimary(request, env, ctx) {
           datosVar.motivo, datosVar.decision,
           eventoId, resultadoId
         ).run();
-        await recalcularMarcadorDesdeEventos(env, resultadoId);
+        const recalcCorr = await recalcularMarcadorDesdeEventos(env, resultadoId);
         await recalcularPenaltisDesdeEventos(env, resultadoId);
+        // Editar o borrar un evento que cambia el marcador = corrección de resultado.
+        if (recalcCorr && recalcCorr.cambio) ctx.waitUntil(notificarPushPartido(env, resultadoId, "correccion", { antes: recalcCorr.antes }));
         // Editar un evento existente también cuenta como "ya lo estoy
         // cubriendo" (ver mismo razonamiento en el POST de arriba).
         await env.DB.prepare("UPDATE results SET finalizado_no_cubierto = 0 WHERE id = ?").bind(resultadoId).run();
@@ -22173,9 +24239,17 @@ async function handlePrimary(request, env, ctx) {
         if (!(await puedeEditar(env, payload, "resultado", resultadoId, resultado.autor_id))) {
           return json({ error: "No puedes editar los eventos de este partido porque no es tuyo. Solicita permiso al autor o a un administrador." }, 403);
         }
+        const eventoABorrar = await env.DB.prepare("SELECT tipo, minuto FROM match_events WHERE id=? AND resultado_id=?").bind(eventoId, resultadoId).first();
         await env.DB.prepare("DELETE FROM match_events WHERE id=? AND resultado_id=?").bind(eventoId, resultadoId).run();
-        await recalcularMarcadorDesdeEventos(env, resultadoId);
+        if (eventoABorrar && eventoABorrar.tipo === "anadido") {
+          // Quitar el evento "Tiempo añadido" quita también el añadido del reloj.
+          await env.DB.prepare("UPDATE results SET anadido_minutos = NULL, anadido_parte = NULL WHERE id = ? AND anadido_parte = ?")
+            .bind(resultadoId, eventoABorrar.minuto === 45 ? 1 : 2).run();
+        }
+        const recalcCorr = await recalcularMarcadorDesdeEventos(env, resultadoId);
         await recalcularPenaltisDesdeEventos(env, resultadoId);
+        // Editar o borrar un evento que cambia el marcador = corrección de resultado.
+        if (recalcCorr && recalcCorr.cambio) ctx.waitUntil(notificarPushPartido(env, resultadoId, "correccion", { antes: recalcCorr.antes }));
         // Borrar un evento (p.ej. corrigiendo un dato mal metido) también
         // cuenta como "ya lo estoy cubriendo" (ver mismo razonamiento en
         // el POST de arriba).

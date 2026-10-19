@@ -70,6 +70,19 @@ export const TABLES = [
     deleteDetection: true,
   },
   {
+    // Carpetas del contenido privado (db/migrations/061_media_carpetas.sql).
+    // Va ANTES de media porque media.carpeta_id referencia esta tabla. Se
+    // crean y (en la Fase 2) se renombran/borran desde el panel, así que
+    // modo authoritative con detección de borrados, igual que media.
+    name: "media_carpetas",
+    pk: ["id"],
+    order: 4.9,
+    changeStrategy: "immutable",
+    cursorColumn: "created_at",
+    deleteDetection: true,
+    syncMode: "authoritative",
+  },
+  {
     name: "media",
     pk: ["id"],
     order: 5,
@@ -389,6 +402,15 @@ export const TABLES = [
     syncMode: "authoritative", // D1 es la autoridad; tabla pequeña
   },
   {
+    name: "formularios_invitados",
+    pk: ["id"],
+    order: 30.3,
+    changeStrategy: "updated_at",
+    cursorColumn: "updated_at",
+    deleteDetection: true, // el panel permite quitar invitaciones
+    syncMode: "authoritative", // D1 es la autoridad; tabla pequeña
+  },
+  {
     // ---------------------------------------------------------------
     // FASE 2 (paridad de datos del failover): push_subscriptions y las 5
     // tablas de votaciones internas. Esquema en db/migrations/036 y 039.
@@ -526,6 +548,24 @@ export const TABLES = [
     syncMode: "authoritative",
   },
   {
+    name: "jugadores",
+    pk: ["id"],
+    order: 3.7,
+    changeStrategy: "updated_at",
+    cursorColumn: "updated_at",
+    deleteDetection: true,
+    syncMode: "authoritative",
+  },
+  {
+    name: "jugador_alias",
+    pk: ["id"],
+    order: 3.8,
+    changeStrategy: "immutable",
+    cursorColumn: "created_at",
+    deleteDetection: true,
+    syncMode: "authoritative",
+  },
+  {
     name: "article_media",
     pk: ["id"],
     order: 5.7,
@@ -557,6 +597,7 @@ export const DEPENDENCIAS_FK = {
   match_events: ["results"],
   alineaciones: ["results"],
   article_media: ["articles", "media"],
+  media: ["media_carpetas"],
   porras: ["readers", "results"],
   article_slug_redirects: ["articles"],
   comments: ["articles", "users", "readers"],

@@ -3,11 +3,14 @@ name: Sincronizador D1 -> PostgreSQL
 # Sustituye al servicio permanente de Railway (npm run sync:scheduler).
 # Cada ejecución hace una sola pasada (npm run sync:once) y termina.
 # GitHub puede retrasar unos minutos los cron en horas de mucha carga.
+# API SECUNDARIA DESACTIVADA (oct-2026): la sincronización programada está
+# apagada (la réplica de Postgres ya no se usa; además deja de leer D1 cada
+# 10 min). Para reactivarla, descomenta el bloque "schedule".
 on:
-  schedule:
-    # Cada 10 minutos. Si el repo es privado y cada pasada tarda >20 s,
-    # pasar a */15 para no superar los 2.000 min/mes de GitHub Free.
-    - cron: "*/10 * * * *"
+  # schedule:
+  #   # Cada 10 minutos. Si el repo es privado y cada pasada tarda >20 s,
+  #   # pasar a */15 para no superar los 2.000 min/mes de GitHub Free.
+  #   - cron: "*/10 * * * *"
   workflow_dispatch:
 
 concurrency:

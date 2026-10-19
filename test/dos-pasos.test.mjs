@@ -144,7 +144,9 @@ test("la sesión con 2FA funciona; un token de admin SIN 2FA se rechaza", async 
   sqlite.prepare("INSERT INTO sessions (id, user_id) VALUES (?, ?)").run(sid, estado.adminId);
   const viejo = await jwtFalso({ uid: estado.adminId, username: "admin1", nombre: "N", rol: "admin", sid });
   assert.equal((await api("/api/me", { token: viejo })).status, 401);
-  const redactorViejo = await jwtFalso({ uid: 999, username: "r", nombre: "R", rol: "redactor" });
+  // El servidor exige que el usuario exista y esté activo, así que el redactor debe existir de verdad.
+  const redactorId = await crearUsuario("redactor-sin-2fa", "redactor");
+  const redactorViejo = await jwtFalso({ uid: redactorId, username: "redactor-sin-2fa", nombre: "R", rol: "redactor" });
   assert.equal((await api("/api/me", { token: redactorViejo })).status, 200, "el resto de roles no se ve afectado");
 });
 
