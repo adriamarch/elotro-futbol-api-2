@@ -11777,7 +11777,7 @@ async function syncCargarAlias(env, ctr, cache) {
 // Aplica los eventos de UNA liga: resuelve nombres, deduplica contra los
 // partidos existentes y escribe solo lo que cambia. Devuelve contadores.
 async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cache) {
-  const resumen = { version: "prioridad-v3", eventos: eventos.length, insertados: 0, actualizados: 0, cubiertos_redaccion: 0, sin_hora_api: 0, ejemplos: [], nuevos: [], cambios: [], sin_alias: [], omitidos: 0, error: null };
+  const resumen = { version: "prioridad-v3", eventos: eventos.length, insertados: 0, actualizados: 0, modificados: 0, cubiertos_redaccion: 0, sin_hora_api: 0, ejemplos: [], nuevos: [], cambios: [], sin_alias: [], omitidos: 0, error: null };
   if (!eventos.length) return resumen;
 
   const alias = await syncCargarAlias(env, ctr, cache);
@@ -11888,7 +11888,7 @@ async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cac
       const pk = `${syncClaveEquipo(local.nombre)}|${syncClaveEquipo(visitante.nombre)}`;
       porPareja.set(pk, [...(porPareja.get(pk) || []), { ...nuevo, equipo_local: local.nombre, equipo_visitante: visitante.nombre, fecha_partido: fechaLocal }]);
       resumen.insertados++;
-      if (resumen.nuevos.length < 30) resumen.nuevos.push(`${local.nombre} - ${visitante.nombre} (J${jornada}, ${fechaLocal || "sin fecha"})`);
+      if (resumen.nuevos.length < 30) resumen.nuevos.push(`${local.nombre} - ${visitante.nombre} (J${jornada}, ${syncFechaLegible(fechaLocal) || "sin fecha"}${estado === "finalizado" ? `, resultado ${golesL ?? "-"}-${golesV ?? "-"}` : ""})`);
       continue;
     }
 
@@ -11933,8 +11933,9 @@ async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cac
     const campos = Object.keys(cambios);
     if (!campos.length) continue;
     const visibles = campos.filter((c) => c !== "external_id");
+    if (visibles.length) resumen.modificados++;
     if (visibles.length && resumen.cambios.length < 30) {
-      resumen.cambios.push({ id: fila.id, partido: `${fila.equipo_local} - ${fila.equipo_visitante}`, campos: Object.fromEntries(visibles.map((c) => [c, [fila[c] ?? null, cambios[c]]])) });
+      resumen.cambios.push({ id: fila.id, partido: `${fila.equipo_local} - ${fila.equipo_visitante}`, campos: Object.fromEntries(visibles.map((c) => [c, [fila[c] ?? null, cambios[c]]])), texto: syncTextoCambio(fila, cambios, visibles) });
     }
     else if (!visibles.length) resumen.reenlazados = (resumen.reenlazados || 0) + 1;
     sentencias.push(env.DB.prepare(
@@ -11964,19 +11965,68 @@ async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cac
     await registrarActividad(env, null, { uid: null, nombre: "Relleno automático (TheSportsDB)", rol: "sistema" }, {
       accion: "relleno_automatico", entidad: "resultado",
       entidad_id: resumen.cambios.length === 1 && !resumen.insertados ? resumen.cambios[0].id : null,
-      descripcion: `Relleno automático ${claveLiga.replace("|", " ")} · jornada ${ronda ?? "?"}: ${resumen.insertados} nuevos, ${resumen.cambios.length} modificados`,
+      descripcion: syncDescripcionHistorial(liga, ronda, resumen),
       detalle: { liga: claveLiga, ronda, temporada, nuevos: resumen.nuevos, cambios: resumen.cambios },
     });
   }
   return resumen;
 }
 
-function syncSumarResumen(informe, liga, resumen) {
+// ---- Texto legible para el historial del panel (Funcionalidades > Historial) ----
+function syncFechaLegible(v) { return v ? String(v).replace("T", " ") : ""; }
+
+const SYNC_ETIQUETAS_CAMPO = { fecha_partido: "fecha", jornada: "jornada", ubicacion: "sede", equipo_local: "local", equipo_visitante: "visitante", estado: "estado" };
+
+// "fecha: 2026-10-18 16:15 → 2026-10-18 18:30; resultado: -- → 2-1"
+function syncTextoCambio(fila, cambios, visibles) {
+  const val = (c, v) => (v === null || v === undefined || v === "" ? "—" : (c === "fecha_partido" ? syncFechaLegible(v) : String(v)));
+  const partes = [];
+  for (const c of visibles) {
+    if (c === "goles_local" || c === "goles_visitante") continue;
+    partes.push(`${SYNC_ETIQUETAS_CAMPO[c] || c}: ${val(c, fila[c])} → ${val(c, cambios[c])}`);
+  }
+  if ("goles_local" in cambios || "goles_visitante" in cambios) {
+    const par = (a, b) => (a == null && b == null ? "sin resultado" : `${a ?? "-"}-${b ?? "-"}`);
+    const gl = "goles_local" in cambios ? cambios.goles_local : fila.goles_local;
+    const gv = "goles_visitante" in cambios ? cambios.goles_visitante : fila.goles_visitante;
+    partes.push(`resultado: ${par(fila.goles_local, fila.goles_visitante)} → ${par(gl, gv)}`);
+  }
+  return partes.join("; ");
+}
+
+// Una linea por partido creado y por partido modificado (sin "X nuevos, X actualizados").
+function syncDescripcionHistorial(liga, ronda, resumen) {
+  const lineas = [`Relleno automático ${syncClaveLiga(liga).replace("|", " ")} · jornada ${ronda ?? "?"}`];
+  const plural = (n) => (n === 1 ? "partido" : "partidos");
+  if (resumen.insertados) {
+    lineas.push(`Crea ${resumen.insertados} ${plural(resumen.insertados)}:`);
+    for (const t of resumen.nuevos) lineas.push(`• ${t}`);
+    const resto = resumen.insertados - resumen.nuevos.length;
+    if (resto > 0) lineas.push(`• …y ${resto} más`);
+  }
+  if (resumen.modificados) {
+    lineas.push(`Modifica ${resumen.modificados} ${plural(resumen.modificados)}:`);
+    for (const c of resumen.cambios) lineas.push(`• ${c.partido}${c.texto ? ` — ${c.texto}` : ""}`);
+    const resto = resumen.modificados - resumen.cambios.length;
+    if (resto > 0) lineas.push(`• …y ${resto} más`);
+  }
+  return lineas.join("\n").slice(0, 6000);
+}
+
+// "pasada" (opcional): acumulador {clave: {insertados, modificados}} de ESTA pasada,
+// para mostrar en el panel lo que hizo la ultima y no el total del ciclo.
+function syncSumarResumen(informe, liga, resumen, pasada = null) {
   const clave = syncClaveLiga(liga);
-  const acc = informe.ligas[clave] || { eventos: 0, insertados: 0, actualizados: 0, cubiertos_redaccion: 0, omitidos: 0, error: null };
-  for (const k of ["eventos", "insertados", "actualizados", "cubiertos_redaccion", "omitidos"]) acc[k] += resumen[k] || 0;
+  const acc = informe.ligas[clave] || { eventos: 0, insertados: 0, actualizados: 0, modificados: 0, cubiertos_redaccion: 0, omitidos: 0, error: null };
+  for (const k of ["eventos", "insertados", "actualizados", "modificados", "cubiertos_redaccion", "omitidos"]) acc[k] = (acc[k] || 0) + (resumen[k] || 0);
   if (resumen.error) acc.error = resumen.error;
   informe.ligas[clave] = acc;
+  if (pasada) {
+    const p = pasada[clave] || { insertados: 0, modificados: 0 };
+    p.insertados += resumen.insertados || 0;
+    p.modificados += resumen.modificados || 0;
+    pasada[clave] = p;
+  }
   const actuales = new Set(informe.sin_alias || []);
   for (const n of resumen.sin_alias || []) actuales.add(n);
   informe.sin_alias = [...actuales].slice(0, 80);
@@ -11999,6 +12049,7 @@ async function syncEjecutarPasada(env, { modo, reiniciar = false, forzar = false
   const temporada = config.temporada || syncTemporada();
   const premium = !!env.THESPORTSDB_API_KEY && env.THESPORTSDB_API_KEY !== "3";
   const errores = [];
+  const pasadaLigas = {}; // lo que hace ESTA pasada, por liga (chip «última pasada» del panel)
 
   if (modo === "ciclo") {
     if (reiniciar || !estado.ciclo_en_curso) {
@@ -12055,7 +12106,7 @@ async function syncEjecutarPasada(env, { modo, reiniciar = false, forzar = false
             // pasada; el ciclo sigue en curso y se retoma en la siguiente.
             limiteApi = true;
           } else {
-            syncSumarResumen(estado.informe, liga, { eventos: 0, error: err.message });
+            syncSumarResumen(estado.informe, liga, { eventos: 0, error: err.message }, pasadaLigas);
             // Se salta esta liga en este ciclo para no bloquear el resto.
             cursor = liga.rondas + 1;
           }
@@ -12067,7 +12118,7 @@ async function syncEjecutarPasada(env, { modo, reiniciar = false, forzar = false
           for (const e of eventos) porRonda.set(e._ronda ?? null, [...(porRonda.get(e._ronda ?? null) || []), e]);
           for (const [ronda, evs] of porRonda) {
             const resumen = await syncAplicarEventos(env, liga, evs, ronda, temporada, ctr, cache);
-            syncSumarResumen(estado.informe, liga, resumen);
+            syncSumarResumen(estado.informe, liga, resumen, pasadaLigas);
             if (resumen.error) errores.push(`${clave}: ${resumen.error}`);
           }
         }
@@ -12126,7 +12177,7 @@ async function syncEjecutarPasada(env, { modo, reiniciar = false, forzar = false
             evsVivo = datos?.events || [];
           }
           const resumen = await syncAplicarEventos(env, g.liga, evsVivo, g.jornada, temporada, ctr, cache);
-          syncSumarResumen(estado.informe, g.liga, resumen);
+          syncSumarResumen(estado.informe, g.liga, resumen, pasadaLigas);
           if (resumen.error) errores.push(`${syncClaveLiga(g.liga)}: ${resumen.error}`);
         } catch (err) {
           errores.push(`${syncClaveLiga(g.liga)}: ${err.message}`);
@@ -12144,6 +12195,13 @@ async function syncEjecutarPasada(env, { modo, reiniciar = false, forzar = false
   }
 
   estado.en_ejecucion_hasta = null;
+  {
+    const atPasada = new Date().toISOString();
+    estado.ultima_pasada_ligas = estado.ultima_pasada_ligas || {};
+    for (const [k, v] of Object.entries(pasadaLigas)) {
+      estado.ultima_pasada_ligas[k] = { insertados: v.insertados, modificados: v.modificados, at: atPasada, origen: modo };
+    }
+  }
   estado.ultima_pasada = {
     modo, at: new Date().toISOString(), ms: Date.now() - inicioMs, subrequests: ctr.sub,
     peticiones_api: ctr.api || 0, rondas_omitidas: ctr.omitidas || 0,
@@ -12234,6 +12292,25 @@ async function syncRutasAdmin(request, env, path, method, url) {
       const ctr = { sub: 1, max: parseInt(env.SYNC_MAX_SUBREQUESTS, 10) || 40 };
       const eventos = body.eventos.slice(0, 100).map((e) => ({ ...e, _ronda: ronda }));
       const resumen = await syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, {});
+      // «Última pasada» de la liga: la Action manda una peticion por jornada, asi que
+      // las peticiones seguidas (menos de 10 min entre ellas) se suman como una sola pasada.
+      try {
+        const { estado: estadoActual } = await syncLeerConfigYEstado(env);
+        const clave = syncClaveLiga(liga);
+        const ahoraMs = Date.now();
+        const mapa = estadoActual.ultima_pasada_ligas || {};
+        const previa = mapa[clave];
+        const seguida = !!previa && previa.origen === "action" && ahoraMs - Date.parse(previa.at) < 10 * 60 * 1000;
+        mapa[clave] = {
+          insertados: (seguida ? previa.insertados || 0 : 0) + (resumen.insertados || 0),
+          modificados: (seguida ? previa.modificados || 0 : 0) + (resumen.modificados || 0),
+          at: new Date(ahoraMs).toISOString(), origen: "action",
+        };
+        estadoActual.ultima_pasada_ligas = mapa;
+        await syncGuardarSetting(env, SYNC_ESTADO_KEY, estadoActual);
+      } catch (err) {
+        console.error("[sync-partidos] no se pudo guardar la ultima pasada de la ingesta:", err.message);
+      }
       try {
         await env.DB.prepare("UPDATE sync_partidos_auto SET ultimo_sync_at = ?, ultimo_sync_ok = ?, ultimo_error = ? WHERE id = 1")
           .bind(new Date().toISOString(), resumen.error ? 0 : 1, resumen.error ? String(resumen.error).slice(0, 500) : null).run();
