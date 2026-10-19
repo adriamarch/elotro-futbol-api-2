@@ -11889,24 +11889,34 @@ async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cac
       continue;
     }
 
-    // Existe: solo se toca si es automatico y nadie lo ha reclamado.
+    // Existe. El relleno automatico MANDA en horario, jornada y sede aunque un
+    // redactor haya editado el partido; en equipos y marcador solo manda si el
+    // partido nacio del relleno y nadie lo esta cubriendo en directo.
+    if (!fila.id) continue; // insertado hace un momento en este mismo lote
+    // Ya enlazado a OTRO evento de la API: no es el mismo partido.
+    if (fila.external_id && fila.external_id !== externalId) continue;
     const esAutomatico = String(fila.fuente || "").startsWith("auto");
-    if (!fila.id || !esAutomatico || fila.autor_id || fila.inicio_cronometro_at || !["programado", "finalizado"].includes(fila.estado)) {
-      if (!esAutomatico) resumen.cubiertos_redaccion++;
-      continue;
-    }
+    const origenAuto = esAutomatico || fila.external_id === externalId; // editado a mano pero nacido del relleno
+    const iniciado = !!fila.inicio_cronometro_at;
+    const enCurso = !["programado", "finalizado"].includes(fila.estado);
+    const enDirecto = !!fila.autor_id || iniciado || enCurso;
+    if (!origenAuto) resumen.cubiertos_redaccion++;
     const cambios = {};
-    if (!fila.external_id) cambios.external_id = externalId;
-    if (jornada !== null && jornada !== fila.jornada) cambios.jornada = jornada;
-    if (local.ok && local.nombre !== fila.equipo_local) cambios.equipo_local = local.nombre;
-    if (visitante.ok && visitante.nombre !== fila.equipo_visitante) cambios.equipo_visitante = visitante.nombre;
-    if (fechaLocal) {
-      // No se pierde una hora ya conocida si la API ahora solo da el dia.
-      const sustituyeHoraPorDia = fechaLocal.length === 10 && String(fila.fecha_partido || "").slice(0, 10) === fechaLocal && String(fila.fecha_partido || "").length === 16;
-      if (!sustituyeHoraPorDia && fechaLocal !== fila.fecha_partido) cambios.fecha_partido = fechaLocal;
+    if (!iniciado && !enCurso) {
+      if (origenAuto && !fila.external_id) cambios.external_id = externalId;
+      if (jornada !== null && jornada !== fila.jornada) cambios.jornada = jornada;
+      if (origenAuto && local.ok && local.nombre !== fila.equipo_local) cambios.equipo_local = local.nombre;
+      if (origenAuto && visitante.ok && visitante.nombre !== fila.equipo_visitante) cambios.equipo_visitante = visitante.nombre;
+      if (fechaLocal) {
+        // No se pierde una hora ya conocida si la API ahora solo da el dia.
+        const sustituyeHoraPorDia = fechaLocal.length === 10 && String(fila.fecha_partido || "").slice(0, 10) === fechaLocal && String(fila.fecha_partido || "").length === 16;
+        if (!sustituyeHoraPorDia && fechaLocal !== fila.fecha_partido) cambios.fecha_partido = fechaLocal;
+      }
+      const sedeApi = String(ev.strVenue || "").trim();
+      if (sedeApi && sedeApi !== fila.ubicacion) cambios.ubicacion = sedeApi;
+      else if (ubicacion && !fila.ubicacion) cambios.ubicacion = ubicacion;
     }
-    if (ubicacion && !fila.ubicacion) cambios.ubicacion = ubicacion;
-    if (estado === "finalizado") {
+    if (origenAuto && !enDirecto && estado === "finalizado") {
       if (fila.estado !== "finalizado") cambios.estado = "finalizado";
       if (golesL !== fila.goles_local) cambios.goles_local = golesL;
       if (golesV !== fila.goles_visitante) cambios.goles_visitante = golesV;
@@ -11914,7 +11924,7 @@ async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cac
     const campos = Object.keys(cambios);
     if (!campos.length) continue;
     sentencias.push(env.DB.prepare(
-      `UPDATE results SET ${campos.map((c) => `${c} = ?`).join(", ")} WHERE id = ? AND fuente LIKE 'auto%' AND autor_id IS NULL`
+      `UPDATE results SET ${campos.map((c) => `${c} = ?`).join(", ")} WHERE id = ?`
     ).bind(...campos.map((c) => cambios[c]), fila.id));
     resumen.actualizados++;
   }
@@ -12248,6 +12258,7 @@ async function syncRutasAdmin(request, env, path, method, url) {
       resumen_ligas: resumenLigas,
       partidos_automaticos: conteo?.n ?? 0,
       clave_premium: !!env.THESPORTSDB_API_KEY && env.THESPORTSDB_API_KEY !== "3",
+      action_configurada: !!(env.GITHUB_DISPATCH_TOKEN && env.GITHUB_REPO),
       temporada_actual: config.temporada || syncTemporada(),
     });
   }
@@ -12258,6 +12269,50 @@ async function syncRutasAdmin(request, env, path, method, url) {
     const config = syncNormalizarConfig(body);
     await syncGuardarSetting(env, SYNC_CONFIG_KEY, config);
     return json({ ok: true, config });
+  }
+
+  // ---- GitHub Action (TheSportsDB bloquea las IPs de Workers) ----
+  const ghCfg = () => {
+    const token = String(env.GITHUB_DISPATCH_TOKEN || "").trim();
+    const repo = String(env.GITHUB_REPO || "").trim();
+    if (!token || !/^[\w.-]+\/[\w.-]+$/.test(repo)) return null;
+    return { token, repo, wf: String(env.GITHUB_SYNC_WORKFLOW || "sync-partidos.yml"), ref: String(env.GITHUB_SYNC_REF || "main") };
+  };
+  const ghFetch = (cfg, ruta, init = {}) => fetch(`https://api.github.com/repos/${cfg.repo}/${ruta}`, {
+    ...init,
+    headers: {
+      Accept: "application/vnd.github+json", Authorization: `Bearer ${cfg.token}`,
+      "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "ElOtroFutbol-panel", ...(init.headers || {}),
+    },
+    signal: AbortSignal.timeout(12000),
+  });
+
+  if (path === "/api/admin/sync-partidos/lanzar-action" && method === "POST") {
+    const cfg = ghCfg();
+    if (!cfg) return json({ error: "Falta configurar GITHUB_DISPATCH_TOKEN y GITHUB_REPO (owner/repo) en el Worker" }, 400);
+    const desde = new Date(Date.now() - 15000).toISOString();
+    const r = await ghFetch(cfg, `actions/workflows/${encodeURIComponent(cfg.wf)}/dispatches`, {
+      method: "POST", body: JSON.stringify({ ref: cfg.ref }),
+    });
+    if (r.status !== 204) {
+      const t = await r.text().catch(() => "");
+      return json({ error: `GitHub respondio ${r.status}: ${t.slice(0, 200)}` }, 502);
+    }
+    return json({ ok: true, desde });
+  }
+
+  if (path === "/api/admin/sync-partidos/action-estado" && method === "GET") {
+    const cfg = ghCfg();
+    if (!cfg) return json({ configurada: false, run: null });
+    const r = await ghFetch(cfg, `actions/workflows/${encodeURIComponent(cfg.wf)}/runs?per_page=1`);
+    if (!r.ok) return json({ configurada: true, run: null, error: `GitHub respondio ${r.status}` });
+    const run = (await r.json().catch(() => ({})))?.workflow_runs?.[0] || null;
+    const desde = url.searchParams.get("desde");
+    if (run && desde && Date.parse(run.created_at) < Date.parse(desde)) return json({ configurada: true, run: null });
+    return json({
+      configurada: true,
+      run: run ? { estado: run.status, conclusion: run.conclusion, url: run.html_url, creado: run.created_at, actualizado: run.updated_at, origen: run.event } : null,
+    });
   }
 
   if (path === "/api/admin/sync-partidos/ejecutar" && method === "POST") {
