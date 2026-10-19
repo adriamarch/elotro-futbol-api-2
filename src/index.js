@@ -11777,7 +11777,7 @@ async function syncCargarAlias(env, ctr, cache) {
 // Aplica los eventos de UNA liga: resuelve nombres, deduplica contra los
 // partidos existentes y escribe solo lo que cambia. Devuelve contadores.
 async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cache) {
-  const resumen = { eventos: eventos.length, insertados: 0, actualizados: 0, cubiertos_redaccion: 0, sin_alias: [], omitidos: 0, error: null };
+  const resumen = { version: "prioridad-v2", eventos: eventos.length, insertados: 0, actualizados: 0, cubiertos_redaccion: 0, sin_hora_api: 0, ejemplos: [], sin_alias: [], omitidos: 0, error: null };
   if (!eventos.length) return resumen;
 
   const alias = await syncCargarAlias(env, ctr, cache);
@@ -11850,6 +11850,7 @@ async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cac
 
     const externalId = `tsdb:${ev.idEvent}`;
     const { fechaLocal, instanteMs } = syncFechaLocalEvento(ev);
+    if (fechaLocal && fechaLocal.length === 10) resumen.sin_hora_api++;
     const golesL = syncEnteroONull(ev.intHomeScore);
     const golesV = syncEnteroONull(ev.intAwayScore);
     const estado = syncEstadoEvento(ev, golesL, golesV, instanteMs);
@@ -11920,6 +11921,9 @@ async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cac
       if (fila.estado !== "finalizado") cambios.estado = "finalizado";
       if (golesL !== fila.goles_local) cambios.goles_local = golesL;
       if (golesV !== fila.goles_visitante) cambios.goles_visitante = golesV;
+    }
+    if (resumen.ejemplos.length < 3) {
+      resumen.ejemplos.push(`${local.nombre} - ${visitante.nombre}: API ${ev.dateEvent || "?"} ${ev.strTime || "sin hora"} => ${fechaLocal || "?"} | BD ${fila.fecha_partido || "?"}${cambios.fecha_partido ? " (CAMBIA)" : ""}${origenAuto ? "" : " [redaccion]"}`);
     }
     const campos = Object.keys(cambios);
     if (!campos.length) continue;
