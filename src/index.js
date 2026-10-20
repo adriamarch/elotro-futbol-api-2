@@ -3130,6 +3130,18 @@ function campoAdmiteInvitaciones(c) {
   return !!c && (c.tipo === "desplegable" || c.tipo === "opcion")
     && (c.invitaciones === true || FORMULARIO_ALTA_ROLES.includes(String(c.alta_usuario || "")));
 }
+// Deja la persona en el formato de siempre. En los campos que crean usuario: "Nombre - Equipo", "Nombre – Equipo"
+// o "Nombre—Equipo" pasan a "Nombre — Equipo", y los equipos se separan con " & " (no toca guiones de nombres como "Ana-María").
+function normalizarPersonaInvitacionFormulario(texto, campo) {
+  let t = String(texto || "").replace(/\s+/g, " ").trim();
+  if (!campo || !campo.alta_usuario) return t;
+  t = t.replace(/\s*[—–―]\s*|\s+-{1,2}\s+/, " — ");
+  const i = t.indexOf(" — ");
+  if (i < 0) return t;
+  const nombre = t.slice(0, i).trim();
+  const equipos = t.slice(i + 3).replace(/\s*&\s*/g, " & ").trim();
+  return equipos ? `${nombre} — ${equipos}` : nombre;
+}
 async function invitadosActivosFormulario(env, formularioId) {
   const { results } = await env.DB.prepare(
     "SELECT campo_id, opcion FROM formularios_invitados WHERE formulario_id = ? AND (expira_at IS NULL OR expira_at > ?) ORDER BY id"
@@ -3674,6 +3686,13 @@ async function obtenerConfigAcreditacion(env) {
   } catch {}
   return normalizarConfigAcreditacion(null);
 }
+// Estados de una solicitud: pendiente (llegó) -> solicitada (pedida al club) -> aprobada / rechazada;
+// cancelada = partido suspendido o la persona ya no va. Control interno: la concesión real la decide el club.
+const ACRED_ESTADOS_VALIDOS = ["pendiente", "solicitada", "aprobada", "rechazada", "cancelada"];
+function acredFechaPartidoValida(v) {
+  const t = String(v || "").trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(t) && !isNaN(Date.parse(t)) ? t : "";
+}
 // Limpieza y validación compartida por la edición y la importación del panel
 // (el formulario público tiene su propia validación, más estricta).
 function limpiarDatosAcreditacionAdmin(d, { estricto } = {}) {
@@ -3687,6 +3706,7 @@ function limpiarDatosAcreditacionAdmin(d, { estricto } = {}) {
     tipo_acreditacion: limpiar(d.tipo_acreditacion, 200),
     funciones: (d.funciones ? String(d.funciones) : "").trim().slice(0, 2000),
     jornada_partido: limpiar(d.jornada_partido, 500),
+    fecha_partido: acredFechaPartidoValida(d.fecha_partido),
   };
   if (!out.nombre) return { error: "Falta el nombre" };
   if (!emailValido(out.email)) return { error: "Correo no válido" };
@@ -11513,6 +11533,49 @@ const ALIAS_CLUBES_CANONICOS = {
   "real sociedad gimnastica": "RS Gimnástica de Torrelavega",
   "real sociedad gimnastica de torrelavega": "RS Gimnástica de Torrelavega",
   "real sociedad gimnastica torrelavega": "RS Gimnástica de Torrelavega",
+  // Club Portugalete (Segunda RFEF, Grupo 1)
+  "portugalete": "Club Portugalete",
+  "cd portugalete": "Club Portugalete",
+  "club deportivo portugalete": "Club Portugalete",
+  // Club Marino de Luanco (Segunda RFEF, Grupo 1)
+  "marino de luanco": "Club Marino de Luanco",
+  "marino luanco": "Club Marino de Luanco",
+  "cd marino de luanco": "Club Marino de Luanco",
+  "cd marino luanco": "Club Marino de Luanco",
+  "club deportivo marino de luanco": "Club Marino de Luanco",
+  // Atlético Osasuna B (Segunda RFEF, Grupo 2)
+  "osasuna b": "Atlético Osasuna B",
+  "ca osasuna b": "Atlético Osasuna B",
+  "osasuna ii": "Atlético Osasuna B",
+  "ca osasuna ii": "Atlético Osasuna B",
+  "osasuna promesas": "Atlético Osasuna B",
+  "ca osasuna promesas": "Atlético Osasuna B",
+  "atletico osasuna": "Atlético Osasuna B",
+  "club atletico osasuna b": "Atlético Osasuna B",
+  // SCR Peña Deportiva (Segunda RFEF, Grupo 3)
+  "pena deportiva": "SCR Peña Deportiva",
+  "penya deportiva": "SCR Peña Deportiva",
+  "scr penya deportiva": "SCR Peña Deportiva",
+  "pena deportiva rociera": "SCR Peña Deportiva",
+  "sociedad cultural recreativa pena deportiva": "SCR Peña Deportiva",
+  // CD Minera (Segunda RFEF, Grupo 3)
+  "deportiva minera": "CD Minera",
+  "cd deportiva minera": "CD Minera",
+  "minera": "CD Minera",
+  // CDA Navalcarnero (Segunda RFEF, Grupo 5)
+  "navalcarnero": "CDA Navalcarnero",
+  "cd navalcarnero": "CDA Navalcarnero",
+  "ad navalcarnero": "CDA Navalcarnero",
+  "club deportivo agrupacion navalcarnero": "CDA Navalcarnero",
+  // RSD Alcalá (Segunda RFEF, Grupo 5)
+  "alcala": "RSD Alcalá",
+  "real sociedad deportiva alcala": "RSD Alcalá",
+  "rs deportiva alcala": "RSD Alcalá",
+  // Atlético de Madrid C (Segunda RFEF, Grupo 5)
+  "atletico madrid c": "Atlético de Madrid C",
+  "atletico de madrid iii": "Atlético de Madrid C",
+  "atletico madrid iii": "Atlético de Madrid C",
+  "club atletico de madrid c": "Atlético de Madrid C",
 };
 
 // Nombre oficial del club si el texto es un alias conocido; null si no.
@@ -16087,7 +16150,7 @@ async function handlePrimary(request, env, ctx) {
           const v = limpiarDatosAcreditacionAdmin(f);
           if (v.error) { errores.push({ fila: i + 1, motivo: v.error }); continue; }
           const d = v.datos;
-          const estado = ["pendiente", "aprobada", "rechazada"].includes(String(f.estado || "").toLowerCase()) ? String(f.estado).toLowerCase() : "pendiente";
+          const estado = ACRED_ESTADOS_VALIDOS.includes(String(f.estado || "").toLowerCase()) ? String(f.estado).toLowerCase() : "pendiente";
           const nota = (f.nota_admin ? String(f.nota_admin) : "").trim().slice(0, 1000) || null;
           const fechaOk = typeof f.created_at === "string" && /^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?/.test(f.created_at.trim());
           const creada = fechaOk ? f.created_at.trim().replace("T", " ").slice(0, 19) : null;
@@ -16132,12 +16195,100 @@ async function handlePrimary(request, env, ctx) {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver las acreditaciones" }, 403);
-        const { results } = await env.DB.prepare(
-          `SELECT id, nombre, email, dni, equipo, tipo_evento, tipo_acreditacion, funciones,
-                  jornada_partido, estado, nota_admin, revisado_por, revisado_at, created_at
-           FROM acreditaciones ORDER BY created_at DESC, id DESC LIMIT 2000`
-        ).all();
-        return json({ acreditaciones: results || [] });
+        const colsBase = "id, nombre, email, dni, equipo, tipo_evento, tipo_acreditacion, funciones, jornada_partido, estado, nota_admin, revisado_por, revisado_at, created_at";
+        let res;
+        try {
+          res = await env.DB.prepare(
+            `SELECT ${colsBase}, fecha_partido, solicitada_at, solicitada_por, asignado_a
+             FROM acreditaciones ORDER BY created_at DESC, id DESC LIMIT 2000`
+          ).all();
+        } catch (err) {
+          // Migración v2 sin aplicar: la bandeja sigue funcionando con las columnas de siempre.
+          console.error("[acreditaciones/listar v2]", err && err.message);
+          res = await env.DB.prepare(`SELECT ${colsBase} FROM acreditaciones ORDER BY created_at DESC, id DESC LIMIT 2000`).all();
+        }
+        return json({ acreditaciones: res.results || [], v2: !!(res.results && res.results[0] ? "asignado_a" in res.results[0] : true) });
+      }
+
+      // Historial de una solicitud (se apoya en activity_log: sin tabla nueva). Se pide solo al abrirla.
+      if (path.match(/^\/api\/acreditaciones\/\d+\/historial$/) && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver las acreditaciones" }, 403);
+        const idH = Number(path.split("/")[3]);
+        const { results: filasH } = await env.DB.prepare(
+          `SELECT usuario_nombre, accion, descripcion, detalle, created_at FROM activity_log
+           WHERE entidad = 'acreditacion' AND entidad_id = ? ORDER BY created_at DESC, id DESC LIMIT 40`
+        ).bind(String(idH)).all();
+        return json({
+          historial: (filasH || []).map((r) => {
+            let det = null;
+            try { det = r.detalle ? JSON.parse(r.detalle) : null; } catch { det = null; }
+            return { usuario: r.usuario_nombre, accion: r.accion, descripcion: r.descripcion, detalle: det, fecha: r.created_at };
+          }),
+        });
+      }
+
+      // Cambio de estado en lote (varias solicitudes del mismo partido a la vez).
+      if (path === "/api/acreditaciones/lote" && method === "PATCH") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede gestionar las acreditaciones" }, 403);
+        const body = await request.json().catch(() => ({}));
+        const estadoL = String(body.estado || "");
+        if (!ACRED_ESTADOS_VALIDOS.includes(estadoL)) return json({ error: "Estado no válido" }, 400);
+        const ids = [...new Set((Array.isArray(body.ids) ? body.ids : []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+        if (!ids.length) return json({ error: "No hay solicitudes seleccionadas" }, 400);
+        const avisar = body.enviar_correo === true && (estadoL === "aprobada" || estadoL === "rechazada");
+        // Límite bajo para no pasarse de consultas/subpeticiones por invocación.
+        const maxLote = avisar ? 15 : 40;
+        if (ids.length > maxLote) return json({ error: `Máximo ${maxLote} solicitudes por vez${avisar ? " si se avisa por correo" : ""}` }, 400);
+        const marcas = ids.map(() => "?").join(",");
+        const { results: previas } = await env.DB.prepare(
+          `SELECT id, nombre, email, equipo, tipo_evento, tipo_acreditacion, jornada_partido, estado FROM acreditaciones WHERE id IN (${marcas})`
+        ).bind(...ids).all();
+        const cambiar = (previas || []).filter((r) => r.estado !== estadoL);
+        for (const r of cambiar) {
+          await env.DB.prepare(
+            `UPDATE acreditaciones SET estado = ?, revisado_por = ?, revisado_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`
+          ).bind(estadoL, payload.nombre || null, r.id).run();
+        }
+        if (cambiar.length && (estadoL === "solicitada" || estadoL === "pendiente")) {
+          try {
+            const marcasC = cambiar.map(() => "?").join(",");
+            if (estadoL === "solicitada") {
+              await env.DB.prepare(`UPDATE acreditaciones SET solicitada_at = datetime('now'), solicitada_por = ? WHERE id IN (${marcasC})`)
+                .bind(payload.nombre || null, ...cambiar.map((r) => r.id)).run();
+            } else {
+              await env.DB.prepare(`UPDATE acreditaciones SET solicitada_at = NULL, solicitada_por = NULL WHERE id IN (${marcasC})`)
+                .bind(...cambiar.map((r) => r.id)).run();
+            }
+          } catch (err) { console.error("[acreditaciones/lote solicitada]", err && err.message); }
+        }
+        let enviados = 0, fallidos = 0;
+        if (avisar) {
+          let cfgL = {};
+          try { cfgL = await obtenerConfigAcreditacion(env); } catch {}
+          for (const r of cambiar) {
+            try {
+              const ok = await enviarCorreoResolucionAcreditacion(env, r, estadoL, {
+                recogida: cfgL.recogida || "",
+                mensaje: estadoL === "aprobada" ? (cfgL.instrucciones_aprobada || "") : "",
+              });
+              if (ok) enviados++; else fallidos++;
+            } catch (err) { console.error("[acreditaciones/lote correo]", err); fallidos++; }
+          }
+        }
+        for (const r of cambiar) {
+          await registrarActividad(env, request, payload, {
+            accion: "acreditacion_" + estadoL,
+            entidad: "acreditacion",
+            entidad_id: r.id,
+            descripcion: `Acreditación de ${r.nombre} marcada como ${estadoL} (en lote)`,
+            detalle: { estado_anterior: r.estado, estado: estadoL, lote: true },
+          });
+        }
+        return json({ ok: true, cambiadas: cambiar.length, sin_cambios: ids.length - cambiar.length, correos_enviados: enviados, correos_fallidos: fallidos });
       }
 
       if (path.match(/^\/api\/acreditaciones\/\d+$/) && method === "PATCH") {
@@ -16168,9 +16319,40 @@ async function handlePrimary(request, env, ctx) {
           });
           return json({ ok: true, correo: correoI, estado: exIn.estado });
         }
+        // Solo metadatos de gestión: fecha del partido y/o quién se encarga (no toca estado ni nota).
+        if (body.meta && typeof body.meta === "object" && !body.estado && !body.datos) {
+          const sets = [], vals = [], partesLog = [];
+          if ("fecha_partido" in body.meta) {
+            const f = acredFechaPartidoValida(body.meta.fecha_partido);
+            sets.push("fecha_partido = ?"); vals.push(f || null);
+            partesLog.push(f ? `fecha del partido ${f}` : "fecha del partido quitada");
+          }
+          if ("asignado_a" in body.meta) {
+            const quien = String(body.meta.asignado_a || "").replace(/\s+/g, " ").trim().slice(0, 100);
+            sets.push("asignado_a = ?"); vals.push(quien || null);
+            partesLog.push(quien ? `asignada a ${quien}` : "sin asignar");
+          }
+          if (!sets.length) return json({ error: "Nada que actualizar" }, 400);
+          const exM = await env.DB.prepare("SELECT id, nombre FROM acreditaciones WHERE id = ?").bind(id).first();
+          if (!exM) return json({ error: "Solicitud no encontrada" }, 404);
+          try {
+            await env.DB.prepare(`UPDATE acreditaciones SET ${sets.join(", ")}, updated_at = datetime('now') WHERE id = ?`).bind(...vals, id).run();
+          } catch (err) {
+            console.error("[acreditaciones/meta]", err && err.message);
+            return json({ error: "Falta aplicar la migración migracion_acreditaciones_v2.sql" }, 500);
+          }
+          await registrarActividad(env, request, payload, {
+            accion: "acreditacion_gestion",
+            entidad: "acreditacion",
+            entidad_id: id,
+            descripcion: `Acreditación de ${exM.nombre}: ${partesLog.join(", ")}`,
+            detalle: { meta: body.meta },
+          });
+          return json({ ok: true });
+        }
         const editaDatos = !!(body.datos && typeof body.datos === "object");
         const estado = String(body.estado || "");
-        if (!(editaDatos && !estado) && !["pendiente", "aprobada", "rechazada"].includes(estado)) {
+        if (!(editaDatos && !estado) && !ACRED_ESTADOS_VALIDOS.includes(estado)) {
           return json({ error: "Estado no válido" }, 400);
         }
         const nota = (body.nota_admin ? String(body.nota_admin) : "").trim().slice(0, 1000);
@@ -16185,6 +16367,11 @@ async function handlePrimary(request, env, ctx) {
                SET nombre = ?, email = ?, dni = ?, equipo = ?, tipo_evento = ?, tipo_acreditacion = ?, funciones = ?, jornada_partido = ?, updated_at = datetime('now')
              WHERE id = ?`
           ).bind(d.nombre, d.email, d.dni, d.equipo, d.tipo_evento, d.tipo_acreditacion, d.funciones, d.jornada_partido, id).run();
+          if (body.datos && "fecha_partido" in body.datos) {
+            try {
+              await env.DB.prepare("UPDATE acreditaciones SET fecha_partido = ? WHERE id = ?").bind(d.fecha_partido || null, id).run();
+            } catch (err) { console.error("[acreditaciones/fecha_partido]", err && err.message); }
+          }
           await registrarActividad(env, request, payload, {
             accion: "acreditacion_editada",
             entidad: "acreditacion",
@@ -16198,11 +16385,24 @@ async function handlePrimary(request, env, ctx) {
              SET estado = ?, nota_admin = ?, revisado_por = ?, revisado_at = datetime('now'), updated_at = datetime('now')
            WHERE id = ?`
         ).bind(estado, nota || null, payload.nombre || null, id).run();
+        if (estado === "solicitada" && existente.estado !== "solicitada") {
+          try {
+            await env.DB.prepare("UPDATE acreditaciones SET solicitada_at = datetime('now'), solicitada_por = ? WHERE id = ?").bind(payload.nombre || null, id).run();
+          } catch (err) { console.error("[acreditaciones/solicitada]", err && err.message); }
+        } else if (estado === "pendiente" && existente.estado !== "pendiente") {
+          try {
+            await env.DB.prepare("UPDATE acreditaciones SET solicitada_at = NULL, solicitada_por = NULL WHERE id = ?").bind(id).run();
+          } catch (err) { console.error("[acreditaciones/solicitada]", err && err.message); }
+        }
+        const cambioEstado = existente.estado !== estado;
         await registrarActividad(env, request, payload, {
-          accion: "acreditacion_" + estado,
+          accion: cambioEstado ? "acreditacion_" + estado : "acreditacion_nota",
           entidad: "acreditacion",
           entidad_id: id,
-          descripcion: `Acreditación de ${existente.nombre} marcada como ${estado}`,
+          descripcion: cambioEstado
+            ? `Acreditación de ${existente.nombre} marcada como ${estado}`
+            : `Nota guardada en la acreditación de ${existente.nombre}`,
+          detalle: { estado_anterior: existente.estado, estado, nota: nota || null },
         });
         // Correo al solicitante: solo si de verdad cambia a aprobada/rechazada
         // (guardar solo la nota no reenvía nada) y el admin no lo desactiva.
@@ -16347,7 +16547,7 @@ async function handlePrimary(request, env, ctx) {
           const personas = [];
           const vistas = new Set();
           for (const p of crudas) {
-            const t = formularioLimpiarTexto(p, 300);
+            const t = normalizarPersonaInvitacionFormulario(formularioLimpiarTexto(p, 300), campo);
             const k = normalizarOpcionUnica(t);
             if (t && !vistas.has(k)) { vistas.add(k); personas.push(t); }
           }

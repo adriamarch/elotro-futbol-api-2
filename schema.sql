@@ -813,11 +813,16 @@ CREATE TABLE IF NOT EXISTS acreditaciones (
   nota_admin TEXT,
   revisado_por TEXT,
   revisado_at TEXT,
+  solicitada_at TEXT,
+  solicitada_por TEXT,
+  fecha_partido TEXT,
+  asignado_a TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_acreditaciones_created ON acreditaciones(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_acreditaciones_estado ON acreditaciones(estado);
+CREATE INDEX IF NOT EXISTS idx_acreditaciones_fecha_partido ON acreditaciones(fecha_partido);
 
 -- Formularios personalizados (Solicitudes > Formularios). Ver worker/migracion_formularios.sql.
 CREATE TABLE IF NOT EXISTS formularios (
