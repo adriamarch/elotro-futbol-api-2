@@ -5739,7 +5739,9 @@ function fusionarGrupoDePartido(base, otros, nombres) {
   // Las "al inicio" de las secciones que no abren la página pasan a ir justo
   // tras su <h2>. Los collages de cada sección cambian de grupo para no
   // mezclarse con los de otra.
-  const vistas = new Set([claveImagenFusion(base.imagen_url)].filter(Boolean));
+  // La portada NO se siembra aquí: si también está dentro de una sección se conserva
+  // la de la sección y el navegador quita la de la cabecera (noticia.html, esFusion).
+  const vistas = new Set();
   const todas = [];
   let portada = base.imagen_url || null;
   const ultima = secciones.length - 1;
@@ -16238,6 +16240,49 @@ async function handlePrimary(request, env, ctx) {
           reciente = Number.isFinite(ms) ? Math.abs(Date.now() - ms) < 4000 : true;
         }
         return json({ huella: `${Number(f && f.n) || 0}|${Number(f && f.max_id) || 0}|${ultimo}`, reciente });
+      }
+
+      // ---------- NOTICIAS Y RESULTADOS: huella ligera para el "en vivo" del panel ----------
+      // Igual que /api/acreditaciones/huella: el panel la consulta cada pocos segundos (solo con la pestaña a la vista
+      // y la lista abierta) y descarga la lista completa únicamente si la huella ha cambiado. Basta con tener sesión.
+      // Si falta alguna columna (migración sin aplicar) se prueba con una consulta más simple en vez de fallar.
+      if ((path === "/api/articles/huella" || path === "/api/results/huella") && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const consultas = path === "/api/articles/huella"
+          ? [
+              "SELECT COUNT(*) AS n, MAX(id) AS max_id, MAX(updated_at) AS ultimo, COALESCE(SUM(publicado), 0) AS a FROM articles",
+              "SELECT COUNT(*) AS n, MAX(id) AS max_id, MAX(updated_at) AS ultimo FROM articles",
+              "SELECT COUNT(*) AS n, MAX(id) AS max_id FROM articles",
+            ]
+          : [
+              "SELECT COUNT(*) AS n, MAX(id) AS max_id, MAX(updated_at) AS ultimo," +
+                " COALESCE(SUM(COALESCE(goles_local, 0) * 31 + COALESCE(goles_visitante, 0) * 17), 0) AS a," +
+                " COALESCE(SUM(id * CASE estado WHEN 'en_juego' THEN 3 WHEN 'finalizado' THEN 5 ELSE 1 END), 0) AS b," +
+                " COALESCE(SUM(id * COALESCE(finalizado_no_cubierto, 0)), 0) AS c," +
+                " COALESCE(SUM(COALESCE(anadido_minutos, 0) * 13 + COALESCE(ajuste_cronometro_minutos, 0) * 7 + CASE WHEN cronometro_pausado_en IS NULL THEN 0 ELSE id END), 0) AS d FROM results",
+              "SELECT COUNT(*) AS n, MAX(id) AS max_id, MAX(updated_at) AS ultimo," +
+                " COALESCE(SUM(COALESCE(goles_local, 0) * 31 + COALESCE(goles_visitante, 0) * 17), 0) AS a," +
+                " COALESCE(SUM(id * CASE estado WHEN 'en_juego' THEN 3 WHEN 'finalizado' THEN 5 ELSE 1 END), 0) AS b FROM results",
+              "SELECT COUNT(*) AS n, MAX(id) AS max_id," +
+                " COALESCE(SUM(COALESCE(goles_local, 0) * 31 + COALESCE(goles_visitante, 0) * 17), 0) AS a," +
+                " COALESCE(SUM(id * CASE estado WHEN 'en_juego' THEN 3 WHEN 'finalizado' THEN 5 ELSE 1 END), 0) AS b FROM results",
+              "SELECT COUNT(*) AS n, MAX(id) AS max_id FROM results",
+            ];
+        let f = null;
+        for (const sql of consultas) {
+          try { f = await env.DB.prepare(sql).first(); break; } catch (e) { /* prueba la siguiente */ }
+        }
+        if (!f) return json({ error: "No se pudo calcular la huella" }, 500);
+        const partes = [f.n, f.max_id, f.ultimo || "", f.a, f.b, f.c, f.d].map((v) => (v === null || v === undefined ? "" : String(v)));
+        if (path === "/api/results/huella") {
+          // Los goles, tarjetas y demás eventos del minuto a minuto también cuentan como cambio.
+          try {
+            const ev = await env.DB.prepare("SELECT COUNT(*) AS n, MAX(id) AS max_id FROM match_events").first();
+            partes.push(String(ev && ev.n || 0), String(ev && ev.max_id || 0));
+          } catch (e) { /* sin tabla de eventos: se ignora */ }
+        }
+        return json({ huella: partes.join("|") });
       }
 
       if (path === "/api/acreditaciones" && method === "GET") {
