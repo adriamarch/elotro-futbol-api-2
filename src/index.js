@@ -1616,6 +1616,7 @@ function categoriaLabelEmail(cat) {
     hypermotion: "LaLiga Hypermotion",
     primera_federacion: "Primera Federación",
     segunda_federacion: "Segunda Federación",
+    tercera_federacion: "Tercera Federación",
     copa_del_rey: "Copa del Rey",
     copa_federacion: "Copa Federación",
     general: "General",
@@ -2314,7 +2315,7 @@ function validarCategoriaSegunAutor(_categoriasComplementariasAutor, categoriaRe
 // (solo llegan a través de las categorías fijas de un redactor de ese
 // tipo). "copa_del_rey" y "copa_federacion" solo valen como categoría
 // principal, NO como adicionales (por eso no están en esta lista).
-const CATEGORIAS_ARTICULO_VALIDAS = ["hypermotion", "primera_federacion", "segunda_federacion", "general", "amistoso", "arbitraje", "jurisdiccion"];
+const CATEGORIAS_ARTICULO_VALIDAS = ["hypermotion", "primera_federacion", "segunda_federacion", "tercera_federacion", "general", "amistoso", "arbitraje", "jurisdiccion"];
 const MAX_CATEGORIAS_ADICIONALES = 4;
 
 // Igual que parsearEquipos()/parsearCategoriasFijas(): convierte el JSON
