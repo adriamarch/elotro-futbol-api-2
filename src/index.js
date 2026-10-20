@@ -3584,6 +3584,34 @@ async function enviarCorreoIndicacionesAcreditacion(env, a, { recogida, mensaje 
   return enviarEmailNotificacion(env, { asunto, texto, html }, { destinatario: a.email, replyTo: EMAIL_NOTIFICACIONES });
 }
 
+// Correo OPCIONAL a la persona cuando su solicitud pasa a "Solicitada": ya se ha pedido al club.
+// Solo informa; no cambia el estado ni promete nada. Es un extra: si falla, el cambio ya está guardado.
+async function enviarCorreoSolicitadaAcreditacion(env, a) {
+  if (!a || !a.email) return false;
+  const filas = [
+    ["Nombre", a.nombre], ["Equipo", a.equipo], ["Evento", a.tipo_evento],
+    ["Acreditación", a.tipo_acreditacion], ["Jornada y partido", a.jornada_partido],
+  ].filter(([, v]) => v);
+  const asunto = `Hemos pedido tu acreditación al club: ${a.equipo || "ElOtroFútbol"}${a.jornada_partido ? " · " + a.jornada_partido : ""}`;
+  const intro = `Hola ${a.nombre || ""}, ya hemos pedido tu acreditación al club.`;
+  const cierre = "Ahora estamos a la espera de su respuesta y te avisaremos en cuanto la tengamos. Recuerda que la concesión final de la acreditación corresponde siempre al club organizador.";
+  const texto = [
+    intro, "",
+    ...filas.map(([k, v]) => `${k}: ${v}`),
+    "", cierre, "", "Equipo de ElOtroFútbol",
+  ].join("\n");
+  const html = plantillaEmail({
+    etiqueta: "Acreditaciones",
+    titulo: "Hemos pedido tu acreditación al club",
+    preheader: intro,
+    parrafo: intro,
+    filas: filas.map(([k, v]) => ({ etiqueta: k, valor: v })),
+    bloqueHtml: `<p style="margin:4px 0 0;font-size:14px;line-height:1.6;color:#5a6270;">${escapeHtmlEmail(cierre)}</p>`,
+    pieHtml: "Equipo de ElOtroFútbol. Puedes responder a este correo si tienes cualquier duda.",
+  });
+  return enviarEmailNotificacion(env, { asunto, texto, html }, { destinatario: a.email, replyTo: EMAIL_NOTIFICACIONES });
+}
+
 // ---------- Configuración editable del formulario de acreditaciones ----------
 // Un admin puede cambiar textos y listas desde Solicitudes > Formularios > Acreditaciones.
 // Se guarda como JSON en settings (clave "acreditacion_config"); sin nada
@@ -16191,6 +16219,27 @@ async function handlePrimary(request, env, ctx) {
       }
 
       // ---------- ACREDITACIONES: bandeja del panel (solo admins) ----------
+      // Huella ligera de la bandeja: el panel la consulta cada pocos segundos y solo pide la lista
+      // completa si ha cambiado (así varias personas ven los cambios de las demás casi al instante).
+      // "reciente" avisa de que el último cambio es de hace nada: el panel no se fía de esa huella
+      // todavía, porque otro cambio en el mismo segundo no la alteraría.
+      if (path === "/api/acreditaciones/huella" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver las acreditaciones" }, 403);
+        const f = await env.DB.prepare("SELECT COUNT(*) AS n, MAX(updated_at) AS ultimo, MAX(id) AS max_id FROM acreditaciones").first();
+        const ultimo = f && f.ultimo ? String(f.ultimo) : "";
+        let reciente = false;
+        if (ultimo) {
+          let t = ultimo.trim().replace(" ", "T");
+          if (/[+-]\d\d$/.test(t)) t += ":00";
+          else if (!/(Z|[+-]\d\d:?\d\d)$/.test(t)) t += "Z";
+          const ms = Date.parse(t);
+          reciente = Number.isFinite(ms) ? Math.abs(Date.now() - ms) < 4000 : true;
+        }
+        return json({ huella: `${Number(f && f.n) || 0}|${Number(f && f.max_id) || 0}|${ultimo}`, reciente });
+      }
+
       if (path === "/api/acreditaciones" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
@@ -16239,7 +16288,8 @@ async function handlePrimary(request, env, ctx) {
         if (!ACRED_ESTADOS_VALIDOS.includes(estadoL)) return json({ error: "Estado no válido" }, 400);
         const ids = [...new Set((Array.isArray(body.ids) ? body.ids : []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
         if (!ids.length) return json({ error: "No hay solicitudes seleccionadas" }, 400);
-        const avisar = body.enviar_correo === true && (estadoL === "aprobada" || estadoL === "rechazada");
+        const avisarSol = body.avisar_solicitada === true && estadoL === "solicitada";
+        const avisar = (body.enviar_correo === true && (estadoL === "aprobada" || estadoL === "rechazada")) || avisarSol;
         // Límite bajo para no pasarse de consultas/subpeticiones por invocación.
         const maxLote = avisar ? 15 : 40;
         if (ids.length > maxLote) return json({ error: `Máximo ${maxLote} solicitudes por vez${avisar ? " si se avisa por correo" : ""}` }, 400);
@@ -16247,11 +16297,21 @@ async function handlePrimary(request, env, ctx) {
         const { results: previas } = await env.DB.prepare(
           `SELECT id, nombre, email, equipo, tipo_evento, tipo_acreditacion, jornada_partido, estado FROM acreditaciones WHERE id IN (${marcas})`
         ).bind(...ids).all();
-        const cambiar = (previas || []).filter((r) => r.estado !== estadoL);
-        for (const r of cambiar) {
-          await env.DB.prepare(
-            `UPDATE acreditaciones SET estado = ?, revisado_por = ?, revisado_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`
-          ).bind(estadoL, payload.nombre || null, r.id).run();
+        // Varias personas pueden estar trabajando a la vez: si otra ya cambió una solicitud desde que
+        // este panel la cargó (esperados = estado que veía cada una), no se pisa su trabajo ni se
+        // reenvía su correo. El UPDATE solo se aplica si el estado sigue siendo el que acabamos de leer.
+        const esperados = body.esperados && typeof body.esperados === "object" ? body.esperados : {};
+        const conflictos = [];
+        const cambiar = [];
+        for (const r of (previas || [])) {
+          if (r.estado === estadoL) continue;
+          const esp = esperados[r.id];
+          if (typeof esp === "string" && esp !== r.estado) { conflictos.push(r.id); continue; }
+          const ru = await env.DB.prepare(
+            `UPDATE acreditaciones SET estado = ?, revisado_por = ?, revisado_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND estado = ?`
+          ).bind(estadoL, payload.nombre || null, r.id, r.estado).run();
+          if (ru && ru.meta && ru.meta.changes === 0) { conflictos.push(r.id); continue; }
+          cambiar.push(r);
         }
         if (cambiar.length && (estadoL === "solicitada" || estadoL === "pendiente")) {
           try {
@@ -16271,10 +16331,12 @@ async function handlePrimary(request, env, ctx) {
           try { cfgL = await obtenerConfigAcreditacion(env); } catch {}
           for (const r of cambiar) {
             try {
-              const ok = await enviarCorreoResolucionAcreditacion(env, r, estadoL, {
-                recogida: cfgL.recogida || "",
-                mensaje: estadoL === "aprobada" ? (cfgL.instrucciones_aprobada || "") : "",
-              });
+              const ok = estadoL === "solicitada"
+                ? await enviarCorreoSolicitadaAcreditacion(env, r)
+                : await enviarCorreoResolucionAcreditacion(env, r, estadoL, {
+                  recogida: cfgL.recogida || "",
+                  mensaje: estadoL === "aprobada" ? (cfgL.instrucciones_aprobada || "") : "",
+                });
               if (ok) enviados++; else fallidos++;
             } catch (err) { console.error("[acreditaciones/lote correo]", err); fallidos++; }
           }
@@ -16288,7 +16350,7 @@ async function handlePrimary(request, env, ctx) {
             detalle: { estado_anterior: r.estado, estado: estadoL, lote: true },
           });
         }
-        return json({ ok: true, cambiadas: cambiar.length, sin_cambios: ids.length - cambiar.length, correos_enviados: enviados, correos_fallidos: fallidos });
+        return json({ ok: true, cambiadas: cambiar.length, sin_cambios: ids.length - cambiar.length - conflictos.length, conflictos, correos_enviados: enviados, correos_fallidos: fallidos });
       }
 
       if (path.match(/^\/api\/acreditaciones\/\d+$/) && method === "PATCH") {
@@ -16335,6 +16397,18 @@ async function handlePrimary(request, env, ctx) {
           if (!sets.length) return json({ error: "Nada que actualizar" }, 400);
           const exM = await env.DB.prepare("SELECT id, nombre FROM acreditaciones WHERE id = ?").bind(id).first();
           if (!exM) return json({ error: "Solicitud no encontrada" }, 404);
+          // Si el panel dice quién la tenía asignada y ya no es así (otra persona se la quedó o la soltó
+          // mientras tanto), no se pisa: se avisa y el panel se actualiza.
+          if ("asignado_a" in body.meta && "asignado_esperado" in body.meta) {
+            try {
+              const cur = await env.DB.prepare("SELECT asignado_a FROM acreditaciones WHERE id = ?").bind(id).first();
+              const norm = (v) => String(v || "").replace(/\s+/g, " ").trim();
+              const actual = norm(cur && cur.asignado_a), esperadoA = norm(body.meta.asignado_esperado), destino = norm(body.meta.asignado_a);
+              if (actual !== esperadoA && actual !== destino) {
+                return json({ error: actual ? `Ya la tiene asignada ${actual}. He actualizado el panel.` : "Acaban de soltarla. He actualizado el panel.", conflicto: true, asignado_a: actual || null }, 409);
+              }
+            } catch (err) { console.error("[acreditaciones/meta conflicto]", err && err.message); }
+          }
           try {
             await env.DB.prepare(`UPDATE acreditaciones SET ${sets.join(", ")}, updated_at = datetime('now') WHERE id = ?`).bind(...vals, id).run();
           } catch (err) {
@@ -16356,8 +16430,16 @@ async function handlePrimary(request, env, ctx) {
           return json({ error: "Estado no válido" }, 400);
         }
         const nota = (body.nota_admin ? String(body.nota_admin) : "").trim().slice(0, 1000);
-        const existente = await env.DB.prepare("SELECT id, nombre, email, equipo, tipo_evento, tipo_acreditacion, jornada_partido, estado FROM acreditaciones WHERE id = ?").bind(id).first();
+        const existente = await env.DB.prepare("SELECT id, nombre, email, equipo, tipo_evento, tipo_acreditacion, jornada_partido, estado, revisado_por FROM acreditaciones WHERE id = ?").bind(id).first();
         if (!existente) return json({ error: "Solicitud no encontrada" }, 404);
+        // Varias personas a la vez: si el panel dice qué estado veía (estado_esperado) y otra persona ya
+        // la ha movido a otro distinto del que se pide, no se pisa su decisión ni se reenvía ningún correo.
+        // Si ya está justo en el estado pedido, no hay conflicto: simplemente no se repite nada.
+        const esperado = typeof body.estado_esperado === "string" ? body.estado_esperado : "";
+        const mensajeConflicto = `Otra persona ya la ha pasado a ${existente.estado}${existente.revisado_por ? " (" + existente.revisado_por + ")" : ""}. He actualizado el panel.`;
+        if (estado && esperado && ACRED_ESTADOS_VALIDOS.includes(esperado) && esperado !== existente.estado && estado !== existente.estado) {
+          return json({ error: mensajeConflicto, conflicto: true, estado_actual: existente.estado }, 409);
+        }
         if (editaDatos) {
           const v = limpiarDatosAcreditacionAdmin(body.datos);
           if (v.error) return json({ error: v.error }, 400);
@@ -16380,11 +16462,17 @@ async function handlePrimary(request, env, ctx) {
           });
           if (!estado) return json({ ok: true });
         }
-        await env.DB.prepare(
+        // Con estado_esperado el UPDATE solo se aplica si sigue en el estado que acabamos de leer
+        // (por si otra persona la ha tocado en estos milisegundos).
+        const casEstado = !!(esperado && estado !== existente.estado);
+        const resUpd = await env.DB.prepare(
           `UPDATE acreditaciones
              SET estado = ?, nota_admin = ?, revisado_por = ?, revisado_at = datetime('now'), updated_at = datetime('now')
-           WHERE id = ?`
-        ).bind(estado, nota || null, payload.nombre || null, id).run();
+           WHERE id = ?${casEstado ? " AND estado = ?" : ""}`
+        ).bind(...[estado, nota || null, payload.nombre || null, id], ...(casEstado ? [existente.estado] : [])).run();
+        if (casEstado && resUpd && resUpd.meta && resUpd.meta.changes === 0) {
+          return json({ error: "Otra persona la acaba de cambiar. He actualizado el panel.", conflicto: true }, 409);
+        }
         if (estado === "solicitada" && existente.estado !== "solicitada") {
           try {
             await env.DB.prepare("UPDATE acreditaciones SET solicitada_at = datetime('now'), solicitada_por = ? WHERE id = ?").bind(payload.nombre || null, id).run();
@@ -16418,6 +16506,16 @@ async function handlePrimary(request, env, ctx) {
             correo = ok ? "enviado" : "no_enviado";
           } catch (err) {
             console.error("[acreditaciones/correo-resolucion]", err);
+            correo = "no_enviado";
+          }
+        }
+        // Correo OPCIONAL al pasar a "Solicitada" (ya lo hemos pedido al club). Solo si el panel lo pide
+        // expresamente y de verdad cambia de estado (no se repite si otra persona ya la había solicitado).
+        if (estado === "solicitada" && existente.estado !== "solicitada" && body.avisar_solicitada === true) {
+          try {
+            correo = (await enviarCorreoSolicitadaAcreditacion(env, existente)) ? "enviado" : "no_enviado";
+          } catch (err) {
+            console.error("[acreditaciones/correo-solicitada]", err);
             correo = "no_enviado";
           }
         }

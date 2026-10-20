@@ -823,6 +823,7 @@ CREATE TABLE IF NOT EXISTS acreditaciones (
 CREATE INDEX IF NOT EXISTS idx_acreditaciones_created ON acreditaciones(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_acreditaciones_estado ON acreditaciones(estado);
 CREATE INDEX IF NOT EXISTS idx_acreditaciones_fecha_partido ON acreditaciones(fecha_partido);
+CREATE INDEX IF NOT EXISTS idx_acreditaciones_updated ON acreditaciones(updated_at);
 
 -- Formularios personalizados (Solicitudes > Formularios). Ver worker/migracion_formularios.sql.
 CREATE TABLE IF NOT EXISTS formularios (
